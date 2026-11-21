@@ -29,6 +29,7 @@ export async function GET(request: Request) {
 			prefix: apiKeys.prefix,
 			kind: apiKeys.kind,
 			mailboxScopeEnabled: apiKeys.mailboxScopeEnabled,
+			canApproveOwnSends: apiKeys.canApproveOwnSends,
 			scopes: apiKeys.scopes,
 			createdAt: apiKeys.createdAt,
 			lastUsedAt: apiKeys.lastUsedAt,
