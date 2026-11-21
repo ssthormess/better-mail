@@ -519,6 +519,13 @@
       "when": 1793260800003,
       "tag": "0053_add_navigation_cover_index",
       "breakpoints": true
+    },
+    {
+      "idx": 74,
+      "version": "6",
+      "when": 1795287897749,
+      "tag": "0080_approve_own_sends",
+      "breakpoints": true
     }
   ]
 }
