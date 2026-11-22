@@ -74,6 +74,7 @@ export async function updateMailboxAutoReply(
 	mailboxId: string,
 	settings: MailboxAutoReplySettings,
 	previous: MailboxAutoReplySettings,
+	stored: Pick<MailboxOption, "autoReplyStartAt" | "autoReplyEndAt">,
 ): Promise<MailboxAutoReplySaved> {
 	const body: Record<string, unknown> = {
 		autoReplyEnabled: settings.enabled,
@@ -95,13 +96,17 @@ export async function updateMailboxAutoReply(
 		throw new Error(typeof data.error === "string" ? data.error : "Failed to update auto-reply");
 	}
 	clearMailboxesCache();
+	// The echo is canonical where present; an absent key keeps the previously
+	// stored instant instead of being written into the provider as undefined.
+	const autoReplyStartAt = data.mailbox.autoReplyStartAt !== undefined ? data.mailbox.autoReplyStartAt : stored.autoReplyStartAt ?? null;
+	const autoReplyEndAt = data.mailbox.autoReplyEndAt !== undefined ? data.mailbox.autoReplyEndAt : stored.autoReplyEndAt ?? null;
 	return {
 		enabled: data.mailbox.autoReplyEnabled,
 		subject: data.mailbox.autoReplySubject,
 		body: data.mailbox.autoReplyBody,
-		autoReplyStartAt: data.mailbox.autoReplyStartAt,
-		autoReplyEndAt: data.mailbox.autoReplyEndAt,
-		...autoReplyWindowFromIso(data.mailbox.autoReplyStartAt, data.mailbox.autoReplyEndAt),
+		autoReplyStartAt,
+		autoReplyEndAt,
+		...autoReplyWindowFromIso(autoReplyStartAt, autoReplyEndAt),
 	};
 }
 

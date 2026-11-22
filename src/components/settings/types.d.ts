@@ -80,8 +80,8 @@ export type MailboxAutoReplyResponse = {
 		autoReplyEnabled: boolean;
 		autoReplySubject: string;
 		autoReplyBody: string;
-		autoReplyStartAt: string | null;
-		autoReplyEndAt: string | null;
+		autoReplyStartAt?: string | null;
+		autoReplyEndAt?: string | null;
 	};
 	error?: unknown;
 };

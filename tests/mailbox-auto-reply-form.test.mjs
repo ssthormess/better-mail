@@ -347,3 +347,55 @@ test("an edited overlap wall time resolves to the earlier repeated hour", async 
     },
   }]);
 });
+
+test("a save that changes one bound keeps the other's stored instant", async t => {
+  // This response carries only what the PATCH sent, so the untouched end has
+  // no key at all. It must be carried forward from what the provider last
+  // knew, not written back as undefined and blanked.
+  const { container, updates } = await renderForm(t, {
+    enabled: true, subject: "Out of office", body: "Back on Monday.",
+    startAt: "2026-07-01T09:00:00.000Z", endAt: "2026-07-10T17:00:00.000Z",
+  });
+  const realFetch = globalThis.__autoReplyTestFetch;
+  globalThis.__autoReplyTestFetch = async (url, options = {}) => {
+    requests.push({ url, method: options.method || "GET", payload: options.body ? JSON.parse(options.body) : null });
+    return response({ mailbox: { id: "mailbox-1", ...(options.body ? JSON.parse(options.body) : {}) } });
+  };
+  t.after(() => { globalThis.__autoReplyTestFetch = realFetch; });
+
+  await type(container.querySelector("#autoReplyStartAt"), "2026-07-05T09:00");
+  await click(container.querySelector('button[type="submit"]'));
+  assert.equal("autoReplyEndAt" in requests[0].payload, false, "the untouched end is not sent");
+  assert.equal(updates.at(-1)?.autoReplyStartAt, "2026-07-05T09:00:00.000Z", "the new start is saved");
+  assert.equal(updates.at(-1)?.autoReplyEndAt, "2026-07-10T17:00:00.000Z", "the stored end is carried forward");
+  assert.equal(container.querySelector("#autoReplyEndAt").value, "2026-07-10T17:00", "the end control still shows it");
+});
+
+test("an explicit null clears a bound while an absent key is kept", async t => {
+  // Same response, two signals: no autoReplyStartAt key at all and an explicit
+  // autoReplyEndAt: null. The first keeps the stored instant, the second clears
+  // the control. Asserting both pins the absent-vs-null distinction.
+  const { container, updates } = await renderForm(t, {
+    enabled: true, subject: "Out of office", body: "Back on Monday.",
+    startAt: "2026-07-01T09:00:00.000Z", endAt: "2026-07-10T17:00:00.000Z",
+  });
+  const realFetch = globalThis.__autoReplyTestFetch;
+  globalThis.__autoReplyTestFetch = async (url, options = {}) => {
+    requests.push({ url, method: options.method || "GET", payload: options.body ? JSON.parse(options.body) : null });
+    return response({ mailbox: {
+      id: "mailbox-1",
+      autoReplyEnabled: true, autoReplySubject: "Out of office", autoReplyBody: "Back on Monday.",
+      autoReplyEndAt: null,
+    } });
+  };
+  t.after(() => { globalThis.__autoReplyTestFetch = realFetch; });
+
+  await type(container.querySelector("#autoReplyEndAt"), "");
+  await click(container.querySelector('button[type="submit"]'));
+  assert.equal(requests[0]?.payload.autoReplyEndAt, null, "the cleared end is sent as null");
+  assert.equal("autoReplyStartAt" in requests[0].payload, false, "the untouched start is not sent");
+  assert.equal(updates.at(-1)?.autoReplyStartAt, "2026-07-01T09:00:00.000Z", "the absent key keeps the stored start");
+  assert.equal(updates.at(-1)?.autoReplyEndAt, null, "the explicit null clears the end");
+  assert.equal(container.querySelector("#autoReplyStartAt").value, "2026-07-01T09:00", "the start control still shows it");
+  assert.equal(container.querySelector("#autoReplyEndAt").value, "", "the end control is blank");
+});

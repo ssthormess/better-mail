@@ -69,7 +69,7 @@ export function MailboxAutoReplyForm() {
     setSaving(true);
     setStatus(null);
     try {
-      const saved = await updateMailboxAutoReply(selectedMailbox.id, settings, savedSettings);
+      const saved = await updateMailboxAutoReply(selectedMailbox.id, settings, savedSettings, selectedMailbox);
       setSettings(saved);
       setSavedSettings(saved);
       setSelectedMailbox({
