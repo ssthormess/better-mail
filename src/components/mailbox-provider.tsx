@@ -152,7 +152,10 @@ export function MailboxProvider({ children }: { children: ReactNode }) {
 	}, []);
 
 	const setSelectedMailbox = useCallback((mb: MailboxOption | null) => {
-		setSelectedMailboxState((current) => (current?.id === mb?.id ? current : mb));
+		// React already bails on an identical reference; anything else is a real
+		// update callers expect to land (a fresh object can carry new fields for
+		// the same mailbox, e.g. a settings save).
+		setSelectedMailboxState(mb);
 		if (mb) {
 			setMailboxes((items) => items.map((item) => (item.id === mb.id && item !== mb ? mb : item)));
 			localStorage.setItem(SELECTED_MAILBOX_STORAGE_KEY, mb.id);

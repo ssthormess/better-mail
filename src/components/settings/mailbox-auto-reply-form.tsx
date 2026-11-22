@@ -51,7 +51,9 @@ export function MailboxAutoReplyForm() {
     setSyncedMailbox(mailboxKey);
     setSettings(mailboxSettings);
     setSavedSettings(mailboxSettings);
-    setStatus(null);
+    // Field updates on the same mailbox (our own save landing in the provider)
+    // keep the status line; only a real switch clears it.
+    if (syncedMailbox.id !== mailboxKey.id) setStatus(null);
   }
 
   async function onSubmit(event: React.FormEvent<HTMLFormElement>) {

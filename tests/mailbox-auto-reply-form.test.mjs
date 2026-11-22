@@ -136,7 +136,13 @@ async function renderForm(t, autoReply) {
     autoReplyStartAt: autoReply.startAt ?? null, autoReplyEndAt: autoReply.endAt ?? null,
   };
   const updates = [];
-  globalThis.__autoReplyTestMailbox = { selectedMailbox: mailbox, setSelectedMailbox(next) { updates.push(next); }, isLoading: false };
+  // Like the real provider: setSelectedMailbox replaces the stored mailbox, so
+  // the next render (and the next save's carry-forward) sees the update.
+  globalThis.__autoReplyTestMailbox = {
+    selectedMailbox: mailbox,
+    setSelectedMailbox(next) { updates.push(next); globalThis.__autoReplyTestMailbox.selectedMailbox = next; },
+    isLoading: false,
+  };
   const container = document.createElement("div");
   document.body.appendChild(container);
   const reactRoot = createRoot(container);
@@ -398,4 +404,40 @@ test("an explicit null clears a bound while an absent key is kept", async t => {
   assert.equal(updates.at(-1)?.autoReplyEndAt, null, "the explicit null clears the end");
   assert.equal(container.querySelector("#autoReplyStartAt").value, "2026-07-01T09:00", "the start control still shows it");
   assert.equal(container.querySelector("#autoReplyEndAt").value, "", "the end control is blank");
+});
+
+test("a message-only save after a bound change keeps both stored bounds", async t => {
+  // The sequence that broke: save 1 changes the start, and the provider must
+  // reflect the response so save 2 (message only, both bounds omitted) resolves
+  // the absent keys against the post-save stored values, not stale ones.
+  const { container } = await renderForm(t, {
+    enabled: true, subject: "Out of office", body: "Back on Monday.",
+    startAt: "2026-07-01T09:00:00.000Z", endAt: "2026-07-10T17:00:00.000Z",
+  });
+  const realFetch = globalThis.__autoReplyTestFetch;
+  globalThis.__autoReplyTestFetch = async (url, options = {}) => {
+    requests.push({ url, method: options.method || "GET", payload: options.body ? JSON.parse(options.body) : null });
+    return response({ mailbox: { id: "mailbox-1", ...(options.body ? JSON.parse(options.body) : {}) } });
+  };
+  t.after(() => { globalThis.__autoReplyTestFetch = realFetch; });
+
+  // Save 1: change only the start. The provider keeps the untouched end and
+  // records the new start, so the next save can trust what it sees.
+  await type(container.querySelector("#autoReplyStartAt"), "2026-07-05T09:00");
+  await click(container.querySelector('button[type="submit"]'));
+  const provider = () => globalThis.__autoReplyTestMailbox.selectedMailbox;
+  assert.equal(provider().autoReplyStartAt, "2026-07-05T09:00:00.000Z", "provider reflects the first save");
+  assert.equal(provider().autoReplyEndAt, "2026-07-10T17:00:00.000Z", "provider keeps the stored end");
+
+  // Save 2: change only the message. Both bounds are left out of the request...
+  await type(container.querySelector("#autoReplyBody"), "Still away.");
+  await click(container.querySelector('button[type="submit"]'));
+  assert.equal("autoReplyStartAt" in requests[1].payload, false, "the start is not re-sent");
+  assert.equal("autoReplyEndAt" in requests[1].payload, false, "the end is not re-sent");
+  // ...so the absent keys fall back to the provider, where nothing is blanked
+  // and the first save's start is not reverted.
+  assert.equal(provider().autoReplyStartAt, "2026-07-05T09:00:00.000Z", "the saved start is kept");
+  assert.equal(provider().autoReplyEndAt, "2026-07-10T17:00:00.000Z", "the stored end is kept");
+  assert.equal(container.querySelector("#autoReplyStartAt").value, "2026-07-05T09:00");
+  assert.equal(container.querySelector("#autoReplyEndAt").value, "2026-07-10T17:00");
 });
