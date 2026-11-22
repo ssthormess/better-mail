@@ -1158,6 +1158,7 @@ export const schema = {
 	mailboxAccess,
 	contacts,
 	folders,
+	smartFolders,
 	apiKeys,
 	messages,
 	spamTokenStats,

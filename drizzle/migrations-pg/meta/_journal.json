@@ -34,7 +34,14 @@
       "idx": 4,
       "version": "7",
       "when": 1795287899282,
-      "tag": "0004_approve_own_sends",
+      "tag": "0032_approve_own_sends",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1795326992000,
+      "tag": "0033_add_smart_folders",
       "breakpoints": true
     }
   ]

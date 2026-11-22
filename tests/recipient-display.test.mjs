@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -133,5 +133,6 @@ test("migration adds the user column off by default and the journal lists it", (
 
 	const journal = JSON.parse(readFileSync(join(root, "drizzle/migrations/meta/_journal.json"), "utf8"));
 	const entry = journal.entries.find((item) => item.tag === "0050_add_show_full_recipient_addresses");
-	assert.equal(entry?.idx, 42);
+	const files = readdirSync(join(root, "drizzle/migrations")).filter((name) => name.endsWith(".sql")).sort();
+	assert.equal(entry?.idx, files.indexOf("0050_add_show_full_recipient_addresses.sql"));
 });
