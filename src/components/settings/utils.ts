@@ -2,6 +2,7 @@ import type { MailboxOption } from "@/components/mailbox-provider";
 import { clearMailboxesCache } from "@/components/mailbox-provider-utils";
 import { authFetch } from "@/lib/auth/client";
 import { requestError } from "@/lib/http/client-error";
+import { autoReplyWindowFromIso, autoReplyWindowToIso } from "./mailbox-auto-reply-utils";
 import type {
 	CurrentMailboxFormResponse,
 	MailboxAutoReplyResponse,
@@ -79,6 +80,7 @@ export async function updateMailboxAutoReply(
 			autoReplyEnabled: settings.enabled,
 			autoReplySubject: settings.subject,
 			autoReplyBody: settings.body,
+			...autoReplyWindowToIso(settings),
 		}),
 	});
 	const data = (await res.json()) as MailboxAutoReplyResponse;
@@ -90,6 +92,7 @@ export async function updateMailboxAutoReply(
 		enabled: data.mailbox.autoReplyEnabled,
 		subject: data.mailbox.autoReplySubject,
 		body: data.mailbox.autoReplyBody,
+		...autoReplyWindowFromIso(data.mailbox.autoReplyStartAt, data.mailbox.autoReplyEndAt),
 	};
 }
 

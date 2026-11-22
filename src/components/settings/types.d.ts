@@ -64,6 +64,9 @@ export type MailboxAutoReplySettings = {
 	enabled: boolean;
 	subject: string;
 	body: string;
+	/** `datetime-local` wall times in the user's zone; "" means open-ended. */
+	startAt: string;
+	endAt: string;
 };
 
 export type MailboxAutoReplyResponse = {
@@ -71,6 +74,8 @@ export type MailboxAutoReplyResponse = {
 		autoReplyEnabled: boolean;
 		autoReplySubject: string;
 		autoReplyBody: string;
+		autoReplyStartAt: string | null;
+		autoReplyEndAt: string | null;
 	};
 	error?: unknown;
 };

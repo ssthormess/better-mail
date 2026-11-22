@@ -17,6 +17,9 @@ for (const key of ["window", "document", "HTMLElement", "Element", "Node", "Even
   globalThis[key] = key === "window" ? dom.window : dom.window[key];
 }
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
+// The datetime-local fields convert through the saved user timezone; pin it to UTC
+// so the expected ISO strings do not depend on the machine the test runs on.
+dom.window.localStorage.setItem("mailflare-user-time-zone", JSON.stringify({ timeZone: "UTC" }));
 
 const mock = new Map([
   ["@/components/language-provider", `export function useLanguage() { return { t(key) { return key; } }; }`],
@@ -88,6 +91,7 @@ async function renderForm(t, autoReply) {
   const mailbox = {
     id: "mailbox-1", localPart: "tester", hostname: "example.com", permission: "full_access",
     autoReplyEnabled: autoReply.enabled, autoReplySubject: autoReply.subject, autoReplyBody: autoReply.body,
+    autoReplyStartAt: autoReply.startAt ?? null, autoReplyEndAt: autoReply.endAt ?? null,
   };
   const updates = [];
   globalThis.__autoReplyTestMailbox = { selectedMailbox: mailbox, setSelectedMailbox(next) { updates.push(next); }, isLoading: false };
@@ -109,6 +113,14 @@ async function click(element) {
   });
 }
 
+async function type(element, value) {
+  await act(async () => {
+    const proto = element.tagName === "TEXTAREA" ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+    Object.getOwnPropertyDescriptor(proto, "value").set.call(element, value);
+    element.dispatchEvent(new window.Event("input", { bubbles: true }));
+  });
+}
+
 test("auto-reply that is switched off can be saved", async t => {
   const { container, updates } = await renderForm(t, { enabled: true, subject: "Out of office", body: "Back on Monday." });
   const toggle = container.querySelector('[role="switch"]');
@@ -124,7 +136,7 @@ test("auto-reply that is switched off can be saved", async t => {
   assert.deepEqual(requests, [{
     url: "/api/mailboxes/mailbox-1",
     method: "PATCH",
-    payload: { autoReplyEnabled: false, autoReplySubject: "Out of office", autoReplyBody: "Back on Monday." },
+    payload: { autoReplyEnabled: false, autoReplySubject: "Out of office", autoReplyBody: "Back on Monday.", autoReplyStartAt: null, autoReplyEndAt: null },
   }]);
   assert.equal(updates.at(-1)?.autoReplyEnabled, false, "the mailbox is updated");
   assert.match(container.textContent, /common\.saved/, "the form says it saved");
@@ -142,4 +154,76 @@ test("switching auto-reply on shows its fields and still asks for a message", as
   await click(container.querySelector('button[type="submit"]'));
   assert.deepEqual(requests, [], "nothing is saved without a message");
   assert.match(container.textContent, /settings\.autoReply\.needMessage/);
+});
+
+test("the window fields stay hidden while off and prefill from the mailbox when on", async t => {
+  const { container } = await renderForm(t, {
+    enabled: false, subject: "Out of office", body: "Back on Monday.",
+    startAt: "2026-07-01T09:00:00.000Z", endAt: "2026-07-10T17:00:00.000Z",
+  });
+  assert.equal(container.querySelector("#autoReplyStartAt"), null, "no start field while off");
+  assert.equal(container.querySelector("#autoReplyEndAt"), null, "no end field while off");
+  assert.match(container.textContent, /settings\.autoReply\.state\.off/, "the line says the responder is off");
+
+  await click(container.querySelector('[role="switch"]'));
+  assert.equal(container.querySelector("#autoReplyStartAt").value, "2026-07-01T09:00", "the stored start shows in local time");
+  assert.equal(container.querySelector("#autoReplyEndAt").value, "2026-07-10T17:00", "the stored end shows in local time");
+});
+
+test("the window is sent as UTC ISO and an empty end stays open", async t => {
+  const { container, updates } = await renderForm(t, { enabled: true, subject: "Out of office", body: "Back on Monday." });
+  assert.equal(container.querySelector("#autoReplyStartAt").value, "", "no start is set");
+
+  await type(container.querySelector("#autoReplyStartAt"), "2026-07-01T09:00");
+  await click(container.querySelector('button[type="submit"]'));
+  assert.deepEqual(requests, [{
+    url: "/api/mailboxes/mailbox-1",
+    method: "PATCH",
+    payload: {
+      autoReplyEnabled: true, autoReplySubject: "Out of office", autoReplyBody: "Back on Monday.",
+      autoReplyStartAt: "2026-07-01T09:00:00.000Z", autoReplyEndAt: null,
+    },
+  }]);
+  assert.equal(updates.at(-1)?.autoReplyStartAt, "2026-07-01T09:00:00.000Z", "the mailbox carries the ISO window");
+  assert.equal(updates.at(-1)?.autoReplyEndAt, null);
+});
+
+test("an end before the start is rejected before any request", async t => {
+  const { container } = await renderForm(t, { enabled: true, subject: "Out of office", body: "Back on Monday." });
+  await type(container.querySelector("#autoReplyStartAt"), "2026-07-10T09:00");
+  await type(container.querySelector("#autoReplyEndAt"), "2026-07-01T09:00");
+
+  await click(container.querySelector('button[type="submit"]'));
+  assert.deepEqual(requests, [], "nothing is sent for an invalid window");
+  assert.match(container.textContent, /settings\.autoReply\.invalidWindow/);
+});
+
+test("a rejected save surfaces the server's error message", async t => {
+  const { container } = await renderForm(t, { enabled: true, subject: "Out of office", body: "Back on Monday." });
+  const realFetch = globalThis.__autoReplyTestFetch;
+  globalThis.__autoReplyTestFetch = async () => response({ error: "The auto-reply end must be after its start" }, 400);
+  t.after(() => { globalThis.__autoReplyTestFetch = realFetch; });
+
+  await type(container.querySelector("#autoReplyBody"), "Still away.");
+  await click(container.querySelector('button[type="submit"]'));
+  assert.match(container.textContent, /The auto-reply end must be after its start/, "the 400 message is shown");
+});
+
+test("the state line follows the configured window", async t => {
+  const future = (days) => new Date(Date.now() + days * 86400e3).toISOString();
+  const past = (days) => new Date(Date.now() - days * 86400e3).toISOString();
+  const base = { enabled: true, subject: "Out of office", body: "Back on Monday." };
+  const stateLine = (container) => container.querySelector("label + p")?.textContent;
+
+  let rendered = await renderForm(t, { ...base, startAt: future(2), endAt: future(10) });
+  assert.equal(stateLine(rendered.container), "settings.autoReply.state.scheduledRange", "a future window reads as scheduled");
+
+  rendered = await renderForm(t, { ...base, startAt: past(2), endAt: future(10) });
+  assert.equal(stateLine(rendered.container), "settings.autoReply.state.activeUntil", "a running window reads as active");
+
+  rendered = await renderForm(t, { ...base });
+  assert.equal(stateLine(rendered.container), "settings.autoReply.state.active", "no window reads as active");
+
+  rendered = await renderForm(t, { ...base, endAt: past(1) });
+  assert.equal(stateLine(rendered.container), "settings.autoReply.state.expired", "a past end reads as expired");
 });

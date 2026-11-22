@@ -4,10 +4,11 @@ import { useState } from "react";
 import { useLanguage } from "@/components/language-provider";
 import { useSelectedMailbox } from "@/components/mailbox-provider";
 import { Button } from "@/components/ui/button";
-import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
+import { getUserTimeZone } from "@/lib/time/utils";
+import { autoReplyWindowFromIso, autoReplyWindowToIso, describeAutoReplyWindow, parseAutoReplyWindow } from "./mailbox-auto-reply-utils";
 import type { MailboxAutoReplySettings } from "./types";
 import { updateMailboxAutoReply } from "./utils";
 import { Switch } from "../ui/switch";
@@ -20,12 +21,18 @@ export function MailboxAutoReplyForm() {
     enabled: selectedMailbox?.autoReplyEnabled ?? false,
     subject: selectedMailbox?.autoReplySubject ?? "Out of office",
     body: selectedMailbox?.autoReplyBody ?? "",
+    ...autoReplyWindowFromIso(
+      selectedMailbox?.autoReplyStartAt,
+      selectedMailbox?.autoReplyEndAt,
+    ),
   };
   const mailboxKey = {
     id: selectedMailbox?.id,
     enabled: selectedMailbox?.autoReplyEnabled,
     subject: selectedMailbox?.autoReplySubject,
     body: selectedMailbox?.autoReplyBody,
+    startAt: selectedMailbox?.autoReplyStartAt,
+    endAt: selectedMailbox?.autoReplyEndAt,
   };
   const [settings, setSettings] = useState(mailboxSettings);
   const [savedSettings, setSavedSettings] = useState(mailboxSettings);
@@ -37,7 +44,9 @@ export function MailboxAutoReplyForm() {
     syncedMailbox.id !== mailboxKey.id ||
     syncedMailbox.enabled !== mailboxKey.enabled ||
     syncedMailbox.subject !== mailboxKey.subject ||
-    syncedMailbox.body !== mailboxKey.body
+    syncedMailbox.body !== mailboxKey.body ||
+    syncedMailbox.startAt !== mailboxKey.startAt ||
+    syncedMailbox.endAt !== mailboxKey.endAt
   ) {
     setSyncedMailbox(mailboxKey);
     setSettings(mailboxSettings);
@@ -48,6 +57,11 @@ export function MailboxAutoReplyForm() {
   async function onSubmit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!selectedMailbox) return;
+    const { start, end } = parseAutoReplyWindow(settings);
+    if (start && end && start >= end) {
+      setStatus(t("settings.autoReply.invalidWindow"));
+      return;
+    }
     if (settings.enabled && !settings.body.trim()) {
       setStatus(t("settings.autoReply.needMessage"));
       return;
@@ -63,6 +77,7 @@ export function MailboxAutoReplyForm() {
         autoReplyEnabled: saved.enabled,
         autoReplySubject: saved.subject,
         autoReplyBody: saved.body,
+        ...autoReplyWindowToIso(saved),
       });
       setStatus(t("common.saved"));
     } catch (error) {
@@ -105,8 +120,38 @@ export function MailboxAutoReplyForm() {
           disabled={!canManage || saving}
         />
       </label>
+      <p className="text-sm text-neutral-500">{describeAutoReplyWindow(settings, t)}</p>
       {settings.enabled && (
         <>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <div className="space-y-2">
+              <Label htmlFor="autoReplyStartAt">{t("settings.autoReply.start")}</Label>
+              <Input
+                id="autoReplyStartAt"
+                type="datetime-local"
+                value={settings.startAt}
+                onChange={(event) =>
+                  setSettings({ ...settings, startAt: event.target.value })
+                }
+                disabled={!canManage || saving}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="autoReplyEndAt">{t("settings.autoReply.end")}</Label>
+              <Input
+                id="autoReplyEndAt"
+                type="datetime-local"
+                value={settings.endAt}
+                onChange={(event) =>
+                  setSettings({ ...settings, endAt: event.target.value })
+                }
+                disabled={!canManage || saving}
+              />
+            </div>
+          </div>
+          <p className="text-sm text-neutral-500">
+            {t("settings.autoReply.scheduleHint", { timeZone: getUserTimeZone() })}
+          </p>
           <div className="space-y-2">
             <Label htmlFor="autoReplySubject">{t("settings.autoReply.subject")}</Label>
             <Input
