@@ -8,7 +8,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { getUserTimeZone } from "@/lib/time/utils";
-import { autoReplyWindowFromIso, autoReplyWindowToIso, describeAutoReplyWindow, parseAutoReplyWindow } from "./mailbox-auto-reply-utils";
+import { autoReplyWindowFromIso, describeAutoReplyWindow, parseAutoReplyWindow } from "./mailbox-auto-reply-utils";
 import type { MailboxAutoReplySettings } from "./types";
 import { updateMailboxAutoReply } from "./utils";
 import { Switch } from "../ui/switch";
@@ -69,7 +69,7 @@ export function MailboxAutoReplyForm() {
     setSaving(true);
     setStatus(null);
     try {
-      const saved = await updateMailboxAutoReply(selectedMailbox.id, settings);
+      const saved = await updateMailboxAutoReply(selectedMailbox.id, settings, savedSettings);
       setSettings(saved);
       setSavedSettings(saved);
       setSelectedMailbox({
@@ -77,7 +77,8 @@ export function MailboxAutoReplyForm() {
         autoReplyEnabled: saved.enabled,
         autoReplySubject: saved.subject,
         autoReplyBody: saved.body,
-        ...autoReplyWindowToIso(saved),
+        autoReplyStartAt: saved.autoReplyStartAt,
+        autoReplyEndAt: saved.autoReplyEndAt,
       });
       setStatus(t("common.saved"));
     } catch (error) {

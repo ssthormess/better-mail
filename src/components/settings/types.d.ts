@@ -69,6 +69,12 @@ export type MailboxAutoReplySettings = {
 	endAt: string;
 };
 
+export type MailboxAutoReplySaved = MailboxAutoReplySettings & {
+	/** The stored window instants echoed by the API, for the mailbox provider. */
+	autoReplyStartAt: string | null;
+	autoReplyEndAt: string | null;
+};
+
 export type MailboxAutoReplyResponse = {
 	mailbox?: {
 		autoReplyEnabled: boolean;

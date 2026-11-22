@@ -2,10 +2,11 @@ import type { MailboxOption } from "@/components/mailbox-provider";
 import { clearMailboxesCache } from "@/components/mailbox-provider-utils";
 import { authFetch } from "@/lib/auth/client";
 import { requestError } from "@/lib/http/client-error";
-import { autoReplyWindowFromIso, autoReplyWindowToIso } from "./mailbox-auto-reply-utils";
+import { autoReplyLocalToIso, autoReplyWindowFromIso } from "./mailbox-auto-reply-utils";
 import type {
 	CurrentMailboxFormResponse,
 	MailboxAutoReplyResponse,
+	MailboxAutoReplySaved,
 	MailboxAutoReplySettings,
 	MailboxSignatureResponse,
 } from "./types";
@@ -72,16 +73,22 @@ export async function updateMailboxSignature(mailboxId: string, signature: strin
 export async function updateMailboxAutoReply(
 	mailboxId: string,
 	settings: MailboxAutoReplySettings,
-): Promise<MailboxAutoReplySettings> {
+	previous: MailboxAutoReplySettings,
+): Promise<MailboxAutoReplySaved> {
+	const body: Record<string, unknown> = {
+		autoReplyEnabled: settings.enabled,
+		autoReplySubject: settings.subject,
+		autoReplyBody: settings.body,
+	};
+	// Untouched bounds are left out: serializing them back through datetime-local
+	// is lossy (DST overlap picks one repeated hour, seconds are dropped) and would
+	// clobber a concurrent change.
+	if (settings.startAt !== previous.startAt) body.autoReplyStartAt = autoReplyLocalToIso(settings.startAt);
+	if (settings.endAt !== previous.endAt) body.autoReplyEndAt = autoReplyLocalToIso(settings.endAt);
 	const res = await authFetch(`/api/mailboxes/${mailboxId}`, {
 		method: "PATCH",
 		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({
-			autoReplyEnabled: settings.enabled,
-			autoReplySubject: settings.subject,
-			autoReplyBody: settings.body,
-			...autoReplyWindowToIso(settings),
-		}),
+		body: JSON.stringify(body),
 	});
 	const data = (await res.json()) as MailboxAutoReplyResponse;
 	if (!res.ok || !data.mailbox) {
@@ -92,6 +99,8 @@ export async function updateMailboxAutoReply(
 		enabled: data.mailbox.autoReplyEnabled,
 		subject: data.mailbox.autoReplySubject,
 		body: data.mailbox.autoReplyBody,
+		autoReplyStartAt: data.mailbox.autoReplyStartAt,
+		autoReplyEndAt: data.mailbox.autoReplyEndAt,
 		...autoReplyWindowFromIso(data.mailbox.autoReplyStartAt, data.mailbox.autoReplyEndAt),
 	};
 }

@@ -10,12 +10,9 @@ const WINDOW_DATE_FORMAT: Intl.DateTimeFormatOptions = {
 	minute: "2-digit",
 };
 
-/** The window as the API stores it: UTC ISO strings or null for open-ended. */
-export function autoReplyWindowToIso(settings: Pick<MailboxAutoReplySettings, "startAt" | "endAt">): { autoReplyStartAt: string | null; autoReplyEndAt: string | null } {
-	return {
-		autoReplyStartAt: settings.startAt ? parseUserDateTimeLocal(settings.startAt)?.toISOString() ?? null : null,
-		autoReplyEndAt: settings.endAt ? parseUserDateTimeLocal(settings.endAt)?.toISOString() ?? null : null,
-	};
+/** A `datetime-local` wall time as the API stores it: UTC ISO, or null when empty or unparseable. */
+export function autoReplyLocalToIso(value: string): string | null {
+	return value ? parseUserDateTimeLocal(value)?.toISOString() ?? null : null;
 }
 
 /** The window as the form holds it: `datetime-local` wall times, "" when unset. */

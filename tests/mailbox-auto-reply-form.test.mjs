@@ -40,6 +40,23 @@ export function Checkbox(props){return React.createElement("input",{type:"checkb
 
 // The real form, the real settings/utils.ts save call and the real Switch; only the network,
 // translations, mailbox provider and plain UI pieces are stubbed.
+// The real src/lib/time/utils.ts is built separately and linked externally so this file can
+// import the same module instance and flip the pinned timezone with clearUserTimeZoneCache().
+await build({
+  stdin: {
+    contents: readFileSync(join(root, "src/lib/time/utils.ts"), "utf8"),
+    sourcefile: "time-utils.ts",
+    resolveDir: join(root, "src/lib/time"),
+    loader: "ts",
+  },
+  outfile: join(temp, "time.mjs"),
+  bundle: true,
+  platform: "browser",
+  format: "esm",
+  packages: "external",
+  logLevel: "silent",
+});
+const timeModuleUrl = pathToFileURL(join(temp, "time.mjs")).href;
 await build({
   stdin: {
     contents: readFileSync(join(root, "src/components/settings/mailbox-auto-reply-form.tsx"), "utf8"),
@@ -60,6 +77,7 @@ await build({
     setup(b) {
       b.onResolve({ filter: /.*/ }, args => {
         if (mock.has(args.path)) return { path: args.path, namespace: "auto-reply-test-stub" };
+        if (args.path === "@/lib/time/utils") return { path: timeModuleUrl, external: true };
         if (/^@\/components\/ui\//.test(args.path)) return { path: args.path, namespace: "auto-reply-ui-stub" };
         return undefined;
       });
@@ -71,6 +89,7 @@ await build({
 });
 const { createElement, act } = await import("react");
 const { createRoot } = await import("react-dom/client");
+const { clearUserTimeZoneCache } = await import(timeModuleUrl);
 const { MailboxAutoReplyForm } = await import(pathToFileURL(join(temp, "form.mjs")).href);
 
 const requests = [];
@@ -78,10 +97,33 @@ globalThis.__autoReplyTestFetch = async (url, options = {}) => {
   const method = options.method || "GET";
   const payload = options.body ? JSON.parse(options.body) : null;
   requests.push({ url, method, payload });
-  if (url === "/api/mailboxes/mailbox-1" && method === "PATCH") return response({ mailbox: { id: "mailbox-1", ...payload } });
+  if (url === "/api/mailboxes/mailbox-1" && method === "PATCH") {
+    // Like the real route: the response echoes the full row, so fields left out
+    // of the payload keep their stored values.
+    const current = globalThis.__autoReplyTestMailbox.selectedMailbox;
+    return response({ mailbox: {
+      id: "mailbox-1",
+      autoReplyEnabled: current.autoReplyEnabled,
+      autoReplySubject: current.autoReplySubject,
+      autoReplyBody: current.autoReplyBody,
+      autoReplyStartAt: current.autoReplyStartAt,
+      autoReplyEndAt: current.autoReplyEndAt,
+      ...payload,
+    } });
+  }
   return response({ error: "Unexpected route" }, 500);
 };
 beforeEach(() => { requests.length = 0; });
+
+const timeZoneKey = "mailflare-user-time-zone";
+function useTimeZone(t, timeZone) {
+  dom.window.localStorage.setItem(timeZoneKey, JSON.stringify({ timeZone }));
+  clearUserTimeZoneCache();
+  t.after(() => {
+    dom.window.localStorage.setItem(timeZoneKey, JSON.stringify({ timeZone: "UTC" }));
+    clearUserTimeZoneCache();
+  });
+}
 
 function response(data, status = 200) {
   return { ok: status >= 200 && status < 300, status, async json() { return data; } };
@@ -136,7 +178,7 @@ test("auto-reply that is switched off can be saved", async t => {
   assert.deepEqual(requests, [{
     url: "/api/mailboxes/mailbox-1",
     method: "PATCH",
-    payload: { autoReplyEnabled: false, autoReplySubject: "Out of office", autoReplyBody: "Back on Monday.", autoReplyStartAt: null, autoReplyEndAt: null },
+    payload: { autoReplyEnabled: false, autoReplySubject: "Out of office", autoReplyBody: "Back on Monday." },
   }]);
   assert.equal(updates.at(-1)?.autoReplyEnabled, false, "the mailbox is updated");
   assert.match(container.textContent, /common\.saved/, "the form says it saved");
@@ -181,7 +223,7 @@ test("the window is sent as UTC ISO and an empty end stays open", async t => {
     method: "PATCH",
     payload: {
       autoReplyEnabled: true, autoReplySubject: "Out of office", autoReplyBody: "Back on Monday.",
-      autoReplyStartAt: "2026-07-01T09:00:00.000Z", autoReplyEndAt: null,
+      autoReplyStartAt: "2026-07-01T09:00:00.000Z",
     },
   }]);
   assert.equal(updates.at(-1)?.autoReplyStartAt, "2026-07-01T09:00:00.000Z", "the mailbox carries the ISO window");
@@ -226,4 +268,82 @@ test("the state line follows the configured window", async t => {
 
   rendered = await renderForm(t, { ...base, endAt: past(1) });
   assert.equal(stateLine(rendered.container), "settings.autoReply.state.expired", "a past end reads as expired");
+});
+
+test("untouched window bounds are left out of the save", async t => {
+  const { container, updates } = await renderForm(t, {
+    enabled: true, subject: "Out of office", body: "Back on Monday.",
+    startAt: "2026-07-01T09:00:00.000Z", endAt: "2026-07-10T17:00:00.000Z",
+  });
+
+  await type(container.querySelector("#autoReplyBody"), "Still away.");
+  await click(container.querySelector('button[type="submit"]'));
+  assert.deepEqual(requests, [{
+    url: "/api/mailboxes/mailbox-1",
+    method: "PATCH",
+    payload: { autoReplyEnabled: true, autoReplySubject: "Out of office", autoReplyBody: "Still away." },
+  }]);
+  assert.equal(updates.at(-1)?.autoReplyStartAt, "2026-07-01T09:00:00.000Z", "the stored start survives");
+  assert.equal(updates.at(-1)?.autoReplyEndAt, "2026-07-10T17:00:00.000Z", "the stored end survives");
+});
+
+test("clearing a stored bound sends null for that field only", async t => {
+  const { container, updates } = await renderForm(t, {
+    enabled: true, subject: "Out of office", body: "Back on Monday.",
+    startAt: "2026-07-01T09:00:00.000Z", endAt: "2026-07-10T17:00:00.000Z",
+  });
+
+  await type(container.querySelector("#autoReplyStartAt"), "");
+  await click(container.querySelector('button[type="submit"]'));
+  assert.deepEqual(requests, [{
+    url: "/api/mailboxes/mailbox-1",
+    method: "PATCH",
+    payload: {
+      autoReplyEnabled: true, autoReplySubject: "Out of office", autoReplyBody: "Back on Monday.",
+      autoReplyStartAt: null,
+    },
+  }]);
+  assert.equal(updates.at(-1)?.autoReplyEndAt, "2026-07-10T17:00:00.000Z", "the untouched end keeps its stored value");
+});
+
+test("an untouched bound cannot drift inside a DST overlap", async t => {
+  // 2026-11-01T06:30Z shows as 01:30 in New York, inside the fall-back overlap
+  // where 01:30 happens twice (once in EDT, once in EST). Formatting the stored
+  // instant into the control loses which half it sits in, so the only safe save
+  // is one that leaves the field out entirely.
+  useTimeZone(t, "America/New_York");
+  const { container, updates } = await renderForm(t, {
+    enabled: true, subject: "Out of office", body: "Back on Monday.",
+    startAt: "2026-11-01T06:30:00.000Z", endAt: "2026-11-05T14:30:00.000Z",
+  });
+  assert.equal(container.querySelector("#autoReplyStartAt").value, "2026-11-01T01:30", "the stored instant shows in local time");
+
+  await type(container.querySelector("#autoReplyBody"), "Still away.");
+  await click(container.querySelector('button[type="submit"]'));
+  assert.deepEqual(requests, [{
+    url: "/api/mailboxes/mailbox-1",
+    method: "PATCH",
+    payload: { autoReplyEnabled: true, autoReplySubject: "Out of office", autoReplyBody: "Still away." },
+  }]);
+  assert.equal(updates.at(-1)?.autoReplyStartAt, "2026-11-01T06:30:00.000Z", "06:30Z is kept, not rewritten as the earlier repeated hour");
+});
+
+test("an edited overlap wall time resolves to the earlier repeated hour", async t => {
+  // datetime-local has no way to say which side of the overlap the user meant.
+  // dateFromZonedFields resolves it deterministically to the earlier repeated
+  // hour: 01:30 here is EDT (05:30Z), not EST (06:30Z). Pinned so a change in
+  // the picked side is noticed rather than silently shifting what was typed.
+  useTimeZone(t, "America/New_York");
+  const { container } = await renderForm(t, { enabled: true, subject: "Out of office", body: "Back on Monday." });
+
+  await type(container.querySelector("#autoReplyStartAt"), "2026-11-01T01:30");
+  await click(container.querySelector('button[type="submit"]'));
+  assert.deepEqual(requests, [{
+    url: "/api/mailboxes/mailbox-1",
+    method: "PATCH",
+    payload: {
+      autoReplyEnabled: true, autoReplySubject: "Out of office", autoReplyBody: "Back on Monday.",
+      autoReplyStartAt: "2026-11-01T05:30:00.000Z",
+    },
+  }]);
 });
