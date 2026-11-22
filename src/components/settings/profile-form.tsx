@@ -38,7 +38,9 @@ export function ProfileForm({
     setSyncedMailbox({ id: selectedMailbox?.id, displayName: selectedMailbox?.displayName });
     setName(nextName);
     setSavedName(nextName);
-    setProfileStatus(null);
+    // A name update on this same mailbox (including our own save landing back
+    // through the provider) keeps the status line; a switch clears it.
+    if (syncedMailbox.id !== selectedMailbox?.id) setProfileStatus(null);
   }
 
   // Name and avatar belong to the selected inbox. Only the primary inbox is the

@@ -8,7 +8,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { getUserTimeZone } from "@/lib/time/utils";
-import { autoReplyWindowFromIso, describeAutoReplyWindow, parseAutoReplyWindow } from "./mailbox-auto-reply-utils";
+import { autoReplyWindowFromIso, describeAutoReplyWindow, effectiveAutoReplyWindow } from "./mailbox-auto-reply-utils";
 import type { MailboxAutoReplySettings } from "./types";
 import { updateMailboxAutoReply } from "./utils";
 import { Switch } from "../ui/switch";
@@ -59,7 +59,7 @@ export function MailboxAutoReplyForm() {
   async function onSubmit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!selectedMailbox) return;
-    const { start, end } = parseAutoReplyWindow(settings);
+    const { start, end } = effectiveAutoReplyWindow(settings, savedSettings, selectedMailbox);
     if (start && end && start >= end) {
       setStatus(t("settings.autoReply.invalidWindow"));
       return;

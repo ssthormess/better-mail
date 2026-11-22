@@ -441,3 +441,42 @@ test("a message-only save after a bound change keeps both stored bounds", async 
   assert.equal(container.querySelector("#autoReplyStartAt").value, "2026-07-05T09:00");
   assert.equal(container.querySelector("#autoReplyEndAt").value, "2026-07-10T17:00");
 });
+
+test("a message-only save passes validation with a stored overlap window", async t => {
+  // Both instants sit inside the fall-back overlap: re-parsing the display
+  // strings (01:45 -> 05:45Z, 01:15 -> 05:15Z) would invert the window, so
+  // validation must resolve the untouched bounds from their stored instants.
+  useTimeZone(t, "America/New_York");
+  const { container } = await renderForm(t, {
+    enabled: true, subject: "Out of office", body: "Back on Monday.",
+    startAt: "2026-11-01T05:45:00.000Z", endAt: "2026-11-01T06:15:00.000Z",
+  });
+  assert.equal(container.querySelector("#autoReplyStartAt").value, "2026-11-01T01:45");
+  assert.equal(container.querySelector("#autoReplyEndAt").value, "2026-11-01T01:15");
+
+  await type(container.querySelector("#autoReplyBody"), "Still away.");
+  await click(container.querySelector('button[type="submit"]'));
+  assert.equal(requests.length, 1, "the save goes out instead of failing validation");
+  assert.equal("autoReplyStartAt" in requests[0].payload, false, "no window change is sent");
+  assert.equal("autoReplyEndAt" in requests[0].payload, false, "no window change is sent");
+  assert.match(container.textContent, /common\.saved/, "saved, not rejected as invalid");
+});
+
+test("a message-only save passes validation with a sub-minute stored window", async t => {
+  // Both instants share the same displayed minute: re-parsing either would
+  // collapse them to equality, so validation must resolve untouched bounds from
+  // the stored instants (09:00:10 < 09:00:50).
+  const { container } = await renderForm(t, {
+    enabled: true, subject: "Out of office", body: "Back on Monday.",
+    startAt: "2026-07-01T09:00:10.000Z", endAt: "2026-07-01T09:00:50.000Z",
+  });
+  assert.equal(container.querySelector("#autoReplyStartAt").value, "2026-07-01T09:00", "seconds are not shown");
+  assert.equal(container.querySelector("#autoReplyEndAt").value, "2026-07-01T09:00", "seconds are not shown");
+
+  await type(container.querySelector("#autoReplyBody"), "Still away.");
+  await click(container.querySelector('button[type="submit"]'));
+  assert.equal(requests.length, 1, "the save goes out instead of failing validation");
+  assert.equal("autoReplyStartAt" in requests[0].payload, false, "no window change is sent");
+  assert.equal("autoReplyEndAt" in requests[0].payload, false, "no window change is sent");
+  assert.match(container.textContent, /common\.saved/, "saved, not rejected as invalid");
+});

@@ -24,7 +24,9 @@ export function MailboxSignatureForm() {
 		setSyncedMailbox({ id: selectedMailbox?.id, signature: selectedMailbox?.signature });
 		setSignature(nextSignature);
 		setSavedSignature(nextSignature);
-		setStatus(null);
+		// A signature update on this same mailbox (including our own save landing
+		// back through the provider) keeps the status line; a switch clears it.
+		if (syncedMailbox.id !== selectedMailbox?.id) setStatus(null);
 	}
 
 	async function onSubmit(event: React.FormEvent<HTMLFormElement>) {

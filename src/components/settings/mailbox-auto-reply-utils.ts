@@ -30,6 +30,26 @@ export function parseAutoReplyWindow(settings: Pick<MailboxAutoReplySettings, "s
 	};
 }
 
+/**
+ * The window a save would leave stored, resolved the way the PATCH body is built:
+ * a touched bound parses its control value, an untouched one keeps its stored
+ * instant (never re-parsed from the lossy display string).
+ */
+export function effectiveAutoReplyWindow(
+	settings: Pick<MailboxAutoReplySettings, "startAt" | "endAt">,
+	previous: Pick<MailboxAutoReplySettings, "startAt" | "endAt">,
+	stored: { autoReplyStartAt?: string | null; autoReplyEndAt?: string | null },
+): { start: Date | null; end: Date | null } {
+	return {
+		start: settings.startAt !== previous.startAt
+			? parseUserDateTimeLocal(settings.startAt)
+			: stored.autoReplyStartAt ? new Date(stored.autoReplyStartAt) : null,
+		end: settings.endAt !== previous.endAt
+			? parseUserDateTimeLocal(settings.endAt)
+			: stored.autoReplyEndAt ? new Date(stored.autoReplyEndAt) : null,
+	};
+}
+
 /** One line describing where the responder stands: off, scheduled, active or expired. */
 export function describeAutoReplyWindow(
 	settings: Pick<MailboxAutoReplySettings, "enabled" | "startAt" | "endAt">,

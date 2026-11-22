@@ -27,7 +27,9 @@ export function CurrentMailboxForm() {
 		setSyncedMailbox({ id: selectedMailbox?.id, displayName: selectedMailbox?.displayName });
 		setDisplayName(nextName);
 		setSavedDisplayName(nextName);
-		setStatus(null);
+		// A name update on this same mailbox (including our own save landing back
+		// through the provider) keeps the status line; a switch clears it.
+		if (syncedMailbox.id !== selectedMailbox?.id) setStatus(null);
 	}
 
 	async function onSubmit(event: FormEvent<HTMLFormElement>) {
@@ -38,7 +40,9 @@ export function CurrentMailboxForm() {
 		setStatus(null);
 		try {
 			const updated = await updateCurrentMailboxName(selectedMailbox.id, displayName);
-			setSelectedMailbox(updated);
+			// updateCurrentMailboxName returns only the fields it owns, so it must
+			// merge over the stored mailbox rather than replace it wholesale.
+			setSelectedMailbox({ ...selectedMailbox, ...updated });
 			setSavedDisplayName(updated.displayName ?? "");
 			setDisplayName(updated.displayName ?? "");
 			setStatus(t("common.saved"));
