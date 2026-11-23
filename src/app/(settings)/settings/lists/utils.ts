@@ -19,14 +19,19 @@ export function apiError(data: { error?: unknown }, fallback: string): Error {
 // The app's QueryClient disables refetch on mount/focus/reconnect, so a bare invalidation
 // never refetches the unmounted index observer. Apply each mutation's server response to
 // the index snapshot directly, then refetch every observer to converge on server truth.
-export function updateMailingListInIndex(qc: QueryClient, list: Partial<MailingList> & { id: string }) {
+// Insert is create-only: a count/name patch must never synthesize a partial row for an
+// id the index does not have (deleted, or simply absent from an older snapshot).
+export function insertMailingListIntoIndex(qc: QueryClient, list: MailingList) {
 	qc.setQueryData<MailingListsResponse>(["mailing-lists"], (current) => {
-		if (!current) return current;
-		return {
-			lists: current.lists.some((entry) => entry.id === list.id)
-				? current.lists.map((entry) => (entry.id === list.id ? { ...entry, ...list } : entry))
-				: [...current.lists, list as MailingList],
-		};
+		if (!current || current.lists.some((entry) => entry.id === list.id)) return current;
+		return { lists: [...current.lists, list] };
+	});
+}
+
+export function updateMailingListInIndex(qc: QueryClient, patch: Partial<MailingList> & { id: string }) {
+	qc.setQueryData<MailingListsResponse>(["mailing-lists"], (current) => {
+		if (!current || !current.lists.some((entry) => entry.id === patch.id)) return current;
+		return { lists: current.lists.map((entry) => (entry.id === patch.id ? { ...entry, ...patch } : entry)) };
 	});
 }
 
@@ -36,8 +41,12 @@ export function removeMailingListFromIndex(qc: QueryClient, id: string) {
 	);
 }
 
-export function refetchMailingListIndex(qc: QueryClient) {
-	return qc.invalidateQueries({ queryKey: ["mailing-lists"], refetchType: "all" });
+export async function refetchMailingListIndex(qc: QueryClient) {
+	// A pending first-load GET has no cached data, so an implicit invalidation refetch
+	// coalesces with it instead of replacing it — a stale pre-mutation response would
+	// land last and hide a fresh create. Cancel the exact query first.
+	await qc.cancelQueries({ queryKey: ["mailing-lists"], exact: true });
+	return qc.invalidateQueries({ queryKey: ["mailing-lists"], exact: true, refetchType: "all" });
 }
 
 export async function fetchMailingLists(): Promise<MailingListsResponse> {

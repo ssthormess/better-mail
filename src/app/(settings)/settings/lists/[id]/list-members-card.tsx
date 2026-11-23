@@ -11,9 +11,8 @@ import { confirmDestructive } from "@/components/ui/confirm-dialog";
 import { Skeleton } from "@/components/ui/skeleton";
 import type { MailingListMember } from "../types";
 import { refetchMailingListIndex, updateMailingListInIndex } from "../utils";
-import { MemberDialog, memberMutationKey } from "./member-dialog";
-import type { MailingListDetailResponse } from "./types";
-import { removeMailingListMember } from "./utils";
+import { MemberDialog } from "./member-dialog";
+import { mailingListWritesKey, patchMailingListDetail, removeMailingListMember } from "./utils";
 
 type ListMembersCardProps = {
 	listId: string;
@@ -28,21 +27,22 @@ export function ListMembersCard({ listId, members, loading }: ListMembersCardPro
 	const [dialogOpen, setDialogOpen] = useState(false);
 	const [dialogKey, setDialogKey] = useState(0);
 	const openerRef = useRef<HTMLElement | null>(null);
+	const cardRef = useRef<HTMLDivElement | null>(null);
 
-	// Member writes are serialized on one mutation key so an earlier snapshot arriving
-	// last can never overwrite a newer one.
-	const memberBusy = useIsMutating({ mutationKey: memberMutationKey(listId) }) > 0;
+	// Every write on this list shares one mutation scope so an earlier snapshot
+	// arriving last can never overwrite a newer one.
+	const memberBusy = useIsMutating({ mutationKey: mailingListWritesKey(listId) }) > 0;
 
 	const remove = useMutation({
-		mutationKey: memberMutationKey(listId),
+		mutationKey: mailingListWritesKey(listId),
 		mutationFn: (memberId: string) => removeMailingListMember(listId, memberId),
 		onSuccess: async (updated) => {
-			await qc.cancelQueries({ queryKey: ["mailing-list", listId] });
-			qc.setQueryData<MailingListDetailResponse>(["mailing-list", listId], (current) =>
-				current ? { list: { ...current.list, memberCount: updated.length }, members: updated } : current,
-			);
+			await patchMailingListDetail(qc, listId, (current) => ({
+				list: { ...current.list, memberCount: updated.length },
+				members: updated,
+			}));
 			updateMailingListInIndex(qc, { id: listId, memberCount: updated.length });
-			refetchMailingListIndex(qc);
+			await refetchMailingListIndex(qc);
 		},
 	});
 
@@ -54,6 +54,8 @@ export function ListMembersCard({ listId, members, loading }: ListMembersCardPro
 	}
 
 	return (
+		// tabIndex -1: programmatic focus target when dialog close finds the opener disabled.
+		<div ref={cardRef} tabIndex={-1} className="outline-none">
 		<Card className="rounded-3xl border-0 bg-white p-6">
 			<CardHeader className="py-0">
 				<div className="flex items-center justify-between gap-4">
@@ -110,6 +112,8 @@ export function ListMembersCard({ listId, members, loading }: ListMembersCardPro
 								disabled={memberBusy}
 								onClick={async () => {
 									if (!await confirmDestructive(t("mailingLists.removeMemberConfirm", { email: member.email }))) return;
+									// The confirmation awaited: another write may have started meanwhile.
+									if (qc.isMutating({ mutationKey: mailingListWritesKey(listId) }) > 0) return;
 									remove.mutate(member.id);
 								}}
 							>
@@ -137,9 +141,11 @@ export function ListMembersCard({ listId, members, loading }: ListMembersCardPro
 				onOpenChange={setDialogOpen}
 				onCloseAutoFocus={(event) => {
 					event.preventDefault();
-					openerRef.current?.focus();
+					const opener = openerRef.current;
+					(opener && !opener.hasAttribute("disabled") ? opener : cardRef.current)?.focus();
 				}}
 			/>
 		</Card>
+		</div>
 	);
 }

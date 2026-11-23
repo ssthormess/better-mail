@@ -13,8 +13,7 @@ import { Select } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import type { MailingList } from "../types";
 import { refetchMailingListIndex, updateMailingListInIndex } from "../utils";
-import type { MailingListDetailResponse } from "./types";
-import { updateMailingList } from "./utils";
+import { patchMailingListDetail, updateMailingList } from "./utils";
 
 export function ListDetailsCard({ list }: { list: MailingList }) {
 	const { t } = useLanguage();
@@ -48,12 +47,12 @@ export function ListDetailsCard({ list }: { list: MailingList }) {
 				disabled: !enabled,
 			}),
 		onSuccess: async ({ list: updated }) => {
-			await qc.cancelQueries({ queryKey: ["mailing-list", list.id] });
-			qc.setQueryData<MailingListDetailResponse>(["mailing-list", list.id], (current) =>
-				current ? { ...current, list: { ...current.list, ...updated } } : current,
-			);
+			await patchMailingListDetail(qc, list.id, (current) => ({
+				...current,
+				list: { ...current.list, ...updated },
+			}));
 			updateMailingListInIndex(qc, updated);
-			refetchMailingListIndex(qc);
+			await refetchMailingListIndex(qc);
 		},
 	});
 

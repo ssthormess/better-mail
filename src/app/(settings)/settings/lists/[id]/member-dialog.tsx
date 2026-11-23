@@ -17,12 +17,7 @@ import { Label } from "@/components/ui/label";
 import { Select } from "@/components/ui/select";
 import type { MailingListMember } from "../types";
 import { refetchMailingListIndex, updateMailingListInIndex } from "../utils";
-import type { MailingListDetailResponse } from "./types";
-import { addMailingListMember, updateMailingListMember } from "./utils";
-
-export function memberMutationKey(listId: string) {
-	return ["mailing-list-member", listId] as const;
-}
+import { addMailingListMember, mailingListWritesKey, patchMailingListDetail, updateMailingListMember } from "./utils";
 
 type MemberDialogProps = {
 	listId: string;
@@ -42,9 +37,9 @@ export function MemberDialog({ listId, member, open, onOpenChange, onCloseAutoFo
 	const [role, setRole] = useState<"owner" | "member">(member?.role ?? "member");
 	const [moderated, setModerated] = useState(member?.moderated ?? false);
 
-	// Another member mutation (e.g. a remove) may be in flight — member writes are
-	// serialized so arrival order can't undo a newer snapshot.
-	const memberBusy = useIsMutating({ mutationKey: memberMutationKey(listId) }) > 0;
+	// Another write on this list (a remove, even the list delete) may be in flight —
+	// writes share one mutation scope so arrival order can't undo a newer snapshot.
+	const memberBusy = useIsMutating({ mutationKey: mailingListWritesKey(listId) }) > 0;
 	// A pending save can outlive the dialog: only close when this instance is still
 	// open. The parent remounts the dialog on every open, so the unmount cleanup
 	// also stops a stale save from closing its successor.
@@ -57,7 +52,7 @@ export function MemberDialog({ listId, member, open, onOpenChange, onCloseAutoFo
 	}, [open]);
 
 	const save = useMutation({
-		mutationKey: memberMutationKey(listId),
+		mutationKey: mailingListWritesKey(listId),
 		mutationFn: async (): Promise<MailingListMember[]> => {
 			if (editing) {
 				return updateMailingListMember(listId, member.id, {
@@ -74,12 +69,12 @@ export function MemberDialog({ listId, member, open, onOpenChange, onCloseAutoFo
 			});
 		},
 		onSuccess: async (members) => {
-			await qc.cancelQueries({ queryKey: ["mailing-list", listId] });
-			qc.setQueryData<MailingListDetailResponse>(["mailing-list", listId], (current) =>
-				current ? { list: { ...current.list, memberCount: members.length }, members } : current,
-			);
+			await patchMailingListDetail(qc, listId, (current) => ({
+				list: { ...current.list, memberCount: members.length },
+				members,
+			}));
 			updateMailingListInIndex(qc, { id: listId, memberCount: members.length });
-			refetchMailingListIndex(qc);
+			await refetchMailingListIndex(qc);
 			if (openRef.current) onOpenChange(false);
 		},
 	});
@@ -141,7 +136,12 @@ export function MemberDialog({ listId, member, open, onOpenChange, onCloseAutoFo
 						</p>
 					)}
 					<Button
-						onClick={() => save.mutate()}
+						onClick={() => {
+							// Synchronous recheck — the disabled prop only re-renders on mutation
+							// state change, so a same-tick second save could still slip through.
+							if (qc.isMutating({ mutationKey: mailingListWritesKey(listId) }) > 0) return;
+							save.mutate();
+						}}
 						disabled={(!editing && !email.trim()) || memberBusy}
 					>
 						{save.isPending ? t("common.saving") : t("common.save")}

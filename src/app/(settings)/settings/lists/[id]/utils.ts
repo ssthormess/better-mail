@@ -1,7 +1,32 @@
+import type { QueryClient } from "@tanstack/react-query";
 import { authFetch } from "@/lib/auth/client";
 import type { MailingListMember, MailingListMembersResponse } from "../types";
 import { apiError } from "../utils";
 import type { MailingListDetailResponse, MailingListUpdateResponse } from "./types";
+
+// One scope key for every write that touches this list (member add/edit/remove and the
+// list delete), so the UI gate and the synchronous rechecks serialize them all.
+export function mailingListWritesKey(listId: string) {
+	return ["mailing-list", listId, "writes"] as const;
+}
+
+// Patch the detail snapshot after a mutation: cancel an in-flight GET so its stale
+// response can't land on top of the patch. If there is no snapshot to patch (the cache
+// entry was dropped while a write was in flight), restart the exact query — otherwise
+// the cancelled cold GET would leave it pending forever.
+export async function patchMailingListDetail(
+	qc: QueryClient,
+	listId: string,
+	patch: (current: MailingListDetailResponse) => MailingListDetailResponse,
+) {
+	const queryKey = ["mailing-list", listId] as const;
+	await qc.cancelQueries({ queryKey });
+	if (qc.getQueryData(queryKey) === undefined) {
+		await qc.invalidateQueries({ queryKey, exact: true, refetchType: "all" });
+		return;
+	}
+	qc.setQueryData<MailingListDetailResponse>(queryKey, (current) => (current ? patch(current) : current));
+}
 
 export async function fetchMailingList(id: string): Promise<MailingListDetailResponse> {
 	const res = await authFetch(`/api/mailing-lists/${id}`);

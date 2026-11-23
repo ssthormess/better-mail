@@ -17,7 +17,10 @@ const m1 = { id: "m-1", listId: "list-1", email: "one@example.com", name: null, 
 const m2 = { ...m1, id: "m-2", email: "two@example.com" };
 const m3 = { ...m1, id: "m-3", email: "three@example.com" };
 
-const state = { members: [m1, m2], deleted: false, defer: null };
+const state = {
+	members: [m1, m2], created: [], deleted: false, failIndex: false,
+	deferMembers: null, deferIndex: null, deferDetail: null, deferList: null,
+};
 
 const listEntry = () => ({ ...list1, memberCount: state.members.length });
 const detail = () => ({ list: listEntry(), members: [...state.members] });
@@ -31,12 +34,35 @@ globalThis.__listsCacheTestFetch = async (url, options = {}) => {
 	const method = options.method || "GET";
 	const payload = options.body ? JSON.parse(options.body) : null;
 	requests.push({ url, method, payload });
-	if (state.defer && url.includes("/members") && method !== "GET") await state.defer;
+	if (state.deferMembers && url.includes("/members") && method !== "GET") await state.deferMembers;
+	if (url === "/api/domains" && method === "GET") {
+		return response({ domains: [
+			{ id: "d-1", hostname: "example.com", status: "active" },
+			{ id: "d-2", hostname: "pending.example", status: "pending" },
+		] });
+	}
 	if (url === "/api/mailing-lists" && method === "GET") {
-		return response({ lists: state.deleted ? [] : [listEntry()] });
+		// Capture before deferring — a delayed response still returns the pre-request snapshot.
+		const data = state.deleted ? { lists: [] } : { lists: [listEntry(), ...state.created] };
+		if (state.deferIndex) await state.deferIndex;
+		return state.failIndex ? response({ error: "index down" }, 500) : response(data);
+	}
+	if (url === "/api/mailing-lists" && method === "POST") {
+		const list = {
+			id: `list-${state.created.length + 2}`, userId: "u-1", domainId: payload.domainId,
+			localPart: payload.localPart, hostname: "example.com",
+			address: `${payload.localPart}@example.com`, name: payload.name,
+			description: payload.description ?? null, postingPolicy: payload.postingPolicy,
+			moderated: payload.moderated, disabled: false,
+			createdAt: "2026-01-01T00:00:00.000Z", memberCount: 0,
+		};
+		state.created.push(list);
+		return response({ list });
 	}
 	if (url === "/api/mailing-lists/list-1" && method === "GET") {
-		return state.deleted ? response({ error: "List not found" }, 404) : response(detail());
+		const data = state.deleted ? null : detail();
+		if (state.deferDetail) await state.deferDetail;
+		return data ? response(data) : response({ error: "List not found" }, 404);
 	}
 	if (url === "/api/mailing-lists/list-1/members" && method === "POST") {
 		state.members = [...state.members, { ...m3, ...payload, id: `m-${state.members.length + 1}`, email: payload.email }];
@@ -52,6 +78,7 @@ globalThis.__listsCacheTestFetch = async (url, options = {}) => {
 		return response({ members: [...state.members] });
 	}
 	if (url === "/api/mailing-lists/list-1" && method === "DELETE") {
+		if (state.deferList) await state.deferList;
 		state.deleted = true;
 		return response({ ok: true });
 	}
@@ -61,8 +88,10 @@ globalThis.__listsCacheTestRouter = { pushes: [], push(url) { this.pushes.push(u
 
 beforeEach(() => {
 	state.members = [m1, m2];
+	state.created = [];
 	state.deleted = false;
-	state.defer = null;
+	state.failIndex = false;
+	state.deferMembers = state.deferIndex = state.deferDetail = state.deferList = null;
 	requests.length = 0;
 	globalThis.__listsCacheTestRouter.pushes.length = 0;
 });
@@ -76,7 +105,7 @@ const uiStubs = {
 	"@/components/language-provider": tStub,
 	"@/lib/auth/client": `export function authFetch(...args){return globalThis.__listsCacheTestFetch(...args);}`,
 	"@/components/icons": `import React from "react"; const i = () => null;
-		export const Save = i, Pencil = i, Trash2 = i, UserPlus = i;`,
+		export const Save = i, Pencil = i, Trash2 = i, UserPlus = i, Plus = i, Users = i;`,
 	"@/components/ui/badge": `import React from "react"; export function Badge({children,...p}){return React.createElement("span",p,children);}`,
 	"@/components/ui/button": `import React from "react"; export const Button = React.forwardRef(function Button({children,size,variant,pill,asChild,...props},ref){return React.createElement("button",{...props,ref},children);});`,
 	"@/components/ui/card": `import React from "react";
@@ -86,10 +115,24 @@ const uiStubs = {
 	"@/components/ui/checkbox": `import React from "react"; export const Checkbox = React.forwardRef(function Checkbox(props,ref){return React.createElement("input",{type:"checkbox",...props,ref});});`,
 	"@/components/ui/confirm-dialog": `export function confirmDestructive(){return Promise.resolve(true);} export function confirmDialog(){return Promise.resolve(true);} export function alertDialog(){return Promise.resolve();}`,
 	"@/components/ui/dialog": `import React from "react";
+const DialogCtx = React.createContext({open:false,onOpenChange:()=>{}});
 export function Dialog({open,onOpenChange,children}){
-	return open ? React.createElement(React.Fragment,null,React.createElement("button",{type:"button","data-testid":"dismiss-dialog",onClick:()=>onOpenChange(false)},"dismiss"),children) : null;
+	return React.createElement(DialogCtx.Provider,{value:{open,onOpenChange}},children);
 }
-export function DialogContent({children,onCloseAutoFocus,...props}){return React.createElement("div",props,children);}
+export function DialogTrigger({children}){
+	const {onOpenChange} = React.useContext(DialogCtx);
+	const child = React.Children.only(children);
+	return React.cloneElement(child,{onClick:e=>{if(child.props.onClick)child.props.onClick(e);onOpenChange(true);}});
+}
+export function DialogContent({children,onCloseAutoFocus,...props}){
+	const {open,onOpenChange} = React.useContext(DialogCtx);
+	const wasOpen = React.useRef(open);
+	React.useEffect(()=>{
+		if (wasOpen.current && !open && onCloseAutoFocus) onCloseAutoFocus(new window.Event("closeAutoFocus"));
+		wasOpen.current = open;
+	},[open,onCloseAutoFocus]);
+	return open ? React.createElement("div",props,React.createElement("button",{type:"button","data-testid":"dismiss-dialog",onClick:()=>onOpenChange(false)},"dismiss"),children) : null;
+}
 export function DialogHeader({children}){return React.createElement("div",null,children);}
 export function DialogTitle({children}){return React.createElement("h2",null,children);}
 export function DialogDescription({children}){return React.createElement("p",null,children);}`,
@@ -114,7 +157,13 @@ const indexStubs = {
 
 const { default: MailingListDetailPage } = await loadComponent("src/app/(settings)/settings/lists/[id]/page.tsx", uiStubs);
 const { default: MailingListsPage } = await loadComponent("src/app/(settings)/settings/lists/page.tsx", indexStubs);
-const { createElement, act } = await import("react");
+// The real create dialog (the index page stub replaces its own copy) so a create can
+// race the initial index GET.
+const { ListCreateDialog } = await loadComponent("src/app/(settings)/settings/lists/list-create-dialog.tsx", {
+	...uiStubs,
+	"@/components/page-header-utils": `export const mobilePrimaryActionAboveNavClass = "";`,
+});
+const { createElement, act, Fragment } = await import("react");
 const { createRoot } = await import("react-dom/client");
 const { QueryClient, QueryClientProvider } = await import("@tanstack/react-query");
 
@@ -142,6 +191,14 @@ async function mount(t, client, Page, container) {
 	return reactRoot;
 }
 
+async function mountNode(t, client, node, container) {
+	const reactRoot = createRoot(container);
+	await act(async () => {
+		reactRoot.render(createElement(QueryClientProvider, { client }, node));
+	});
+	return reactRoot;
+}
+
 async function unmount(reactRoot, container) {
 	await act(async () => reactRoot.unmount());
 	container.remove();
@@ -163,6 +220,14 @@ async function setInputValue(input, value) {
 	await act(async () => {
 		setter.call(input, value);
 		input.dispatchEvent(new window.Event("input", { bubbles: true }));
+	});
+}
+
+async function setSelectValue(select, value) {
+	const setter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(select), "value").set;
+	await act(async () => {
+		setter.call(select, value);
+		select.dispatchEvent(new window.Event("change", { bubbles: true }));
 	});
 }
 
@@ -257,7 +322,7 @@ test("member actions are disabled while a member write is in flight", async t =>
 	const client = testClient();
 	t.after(() => client.clear());
 	let release;
-	state.defer = new Promise(r => { release = r; });
+	state.deferMembers = new Promise(r => { release = r; });
 
 	const container = newContainer(t);
 	const root = await mount(t, client, MailingListDetailPage, container);
@@ -271,10 +336,179 @@ test("member actions are disabled while a member write is in flight", async t =>
 	for (const btn of container.querySelectorAll('button[aria-label="mailingLists.removeMember"], button[aria-label="mailingLists.editMember"]')) {
 		assert.equal(btn.disabled, true, "every member action is blocked while a write is pending");
 	}
+	const deleteButton = [...container.querySelectorAll("button")].find(b => b.textContent === "mailingLists.delete");
+	assert.equal(deleteButton.disabled, true, "the list delete is blocked while a member write is pending");
 
-	await act(async () => { release(); state.defer = null; await new Promise(r => setTimeout(r, 30)); });
+	await act(async () => { release(); state.deferMembers = null; await new Promise(r => setTimeout(r, 30)); });
 	const addAfter = [...container.querySelectorAll("button")].find(b => b.textContent.includes("mailingLists.addMember"));
 	assert.equal(addAfter.disabled, false, "actions unlock after the write settles");
 	assert.equal(container.querySelectorAll('button[aria-label="mailingLists.removeMember"]').length, 1);
+	await unmount(root, container);
+});
+
+test("a create during the first index load survives the stale GET landing last", async t => {
+	const client = testClient();
+	t.after(() => client.clear());
+	let releaseIndex;
+	state.deferIndex = new Promise(r => { releaseIndex = r; });
+
+	// The index page mounts and its GET is still in flight when the create finishes.
+	const container = newContainer(t);
+	const root = await mountNode(t, client, createElement(Fragment, null,
+		createElement(MailingListsPage), createElement(ListCreateDialog)), container);
+	await act(async () => { await new Promise(r => setTimeout(r, 10)); });
+
+	const trigger = [...container.querySelectorAll("button")].find(b => b.textContent.includes("mailingLists.new"));
+	await click(trigger);
+	await settle(); // domains GET resolves inside the open dialog
+	await setInputValue(container.querySelector("#list-name"), "Crew");
+	await setInputValue(container.querySelector("#list-localpart"), "crew");
+	await setSelectValue(container.querySelector('select[aria-label="accounts.domain"]'), "d-1");
+	const createButton = [...container.querySelectorAll("button")].find(b => b.textContent === "mailingLists.createButton");
+	await click(createButton);
+	await settle();
+
+	// The stale first-load response lands now — after the mutation already applied.
+	await act(async () => { releaseIndex(); state.deferIndex = null; await new Promise(r => setTimeout(r, 30)); });
+
+	assert.match(container.textContent, /crew@example.com/, "the created list is visible despite the late GET");
+	const cached = client.getQueryData(["mailing-lists"]);
+	assert.ok(cached.lists.some(entry => entry.address === "crew@example.com"), "the index cache holds the created list");
+	await unmount(root, container);
+});
+
+test("a member write does not synthesize an index row for a missing id", async t => {
+	const client = testClient();
+	t.after(() => client.clear());
+	// The index snapshot predates this list (or the list was deleted): a count patch
+	// must not append a partial row. The failing refetch leaves whatever was written.
+	state.failIndex = true;
+	client.setQueryData(["mailing-lists"], { lists: [{ ...list1, id: "list-9", address: "other@example.com" }] });
+
+	const container = newContainer(t);
+	const root = await mount(t, client, MailingListDetailPage, container);
+	await settle();
+	const remove = container.querySelector('button[aria-label="mailingLists.removeMember"]');
+	await click(remove);
+	await settle();
+
+	const cached = client.getQueryData(["mailing-lists"]);
+	assert.equal(cached.lists.length, 1, "no synthesized row");
+	assert.equal(cached.lists[0].id, "list-9");
+	await unmount(root, container);
+});
+
+test("a member write landing on a dropped detail cache restarts the in-flight GET", async t => {
+	const client = testClient();
+	t.after(() => client.clear());
+
+	const container = newContainer(t);
+	const root = await mount(t, client, MailingListDetailPage, container);
+	await settle();
+
+	let releaseRemove;
+	state.deferMembers = new Promise(r => { releaseRemove = r; });
+	const remove = container.querySelector('button[aria-label="mailingLists.removeMember"]');
+	await act(async () => { remove.dispatchEvent(new window.MouseEvent("click", { bubbles: true })); await new Promise(r => setTimeout(r, 10)); });
+
+	// The page navigates away mid-write and its inactive detail cache is evicted.
+	await unmount(root, container);
+	client.removeQueries({ queryKey: ["mailing-list", "list-1"] });
+
+	// Revisiting the route starts a cold GET while the member write is still in flight.
+	let releaseDetail;
+	state.deferDetail = new Promise(r => { releaseDetail = r; });
+	const container2 = newContainer(t);
+	const root2 = await mount(t, client, MailingListDetailPage, container2);
+	await act(async () => { await new Promise(r => setTimeout(r, 10)); });
+
+	// The write lands: it cancels the cold GET, finds no snapshot, and must restart it.
+	await act(async () => { releaseRemove(); state.deferMembers = null; await new Promise(r => setTimeout(r, 20)); });
+	await act(async () => { releaseDetail(); state.deferDetail = null; await new Promise(r => setTimeout(r, 30)); });
+
+	const cached = client.getQueryData(["mailing-list", "list-1"]);
+	assert.ok(cached, "the detail query is not stranded pending");
+	assert.equal(cached.members.length, 1, "the restarted GET returns post-write data");
+	assert.equal(container2.querySelectorAll('button[aria-label="mailingLists.removeMember"]').length, 1);
+	await unmount(root2, container2);
+});
+
+test("two rapid removes produce a single member DELETE", async t => {
+	const client = testClient();
+	t.after(() => client.clear());
+	let release;
+	state.deferMembers = new Promise(r => { release = r; });
+
+	const container = newContainer(t);
+	const root = await mount(t, client, MailingListDetailPage, container);
+	await settle();
+
+	const removes = container.querySelectorAll('button[aria-label="mailingLists.removeMember"]');
+	// Both clicks land before the first confirmation resolves — only one write may start.
+	await act(async () => {
+		removes[0].dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+		removes[1].dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+		await new Promise(r => setTimeout(r, 30));
+	});
+
+	const deletes = requests.filter(r => r.method === "DELETE" && r.url.includes("/members"));
+	assert.equal(deletes.length, 1, "the async confirmation rechecks the write scope");
+
+	await act(async () => { release(); state.deferMembers = null; await new Promise(r => setTimeout(r, 30)); });
+	await unmount(root, container);
+});
+
+test("member actions are disabled while the list delete is in flight", async t => {
+	const client = testClient();
+	t.after(() => client.clear());
+	let release;
+	state.deferList = new Promise(r => { release = r; });
+
+	const container = newContainer(t);
+	const root = await mount(t, client, MailingListDetailPage, container);
+	await settle();
+
+	const deleteButton = [...container.querySelectorAll("button")].find(b => b.textContent === "mailingLists.delete");
+	await act(async () => { deleteButton.dispatchEvent(new window.MouseEvent("click", { bubbles: true })); await new Promise(r => setTimeout(r, 10)); });
+
+	const addButton = [...container.querySelectorAll("button")].find(b => b.textContent.includes("mailingLists.addMember"));
+	assert.equal(addButton.disabled, true, "member actions are blocked while the delete is pending");
+	for (const btn of container.querySelectorAll('button[aria-label="mailingLists.removeMember"], button[aria-label="mailingLists.editMember"]')) {
+		assert.equal(btn.disabled, true);
+	}
+
+	await act(async () => { release(); state.deferList = null; await new Promise(r => setTimeout(r, 30)); });
+	assert.deepEqual(globalThis.__listsCacheTestRouter.pushes, ["/settings/lists"]);
+	await unmount(root, container);
+});
+
+test("closing a dialog while a write is pending moves focus to a focusable fallback", async t => {
+	const client = testClient();
+	t.after(() => client.clear());
+
+	const container = newContainer(t);
+	const root = await mount(t, client, MailingListDetailPage, container);
+	await settle();
+
+	// Plain dismiss: focus returns to the opener.
+	const addButton = [...container.querySelectorAll("button")].find(b => b.textContent.includes("mailingLists.addMember"));
+	await click(addButton);
+	await click(container.querySelector('[data-testid="dismiss-dialog"]'));
+	assert.equal(document.activeElement, addButton, "an enabled opener gets focus back");
+
+	// Dismiss while a save is pending: the disabled opener cannot take focus.
+	let release;
+	state.deferMembers = new Promise(r => { release = r; });
+	await click(addButton);
+	await setInputValue(container.querySelector("#member-email"), "new@example.com");
+	const save = [...container.querySelectorAll("button")].find(b => b.textContent === "common.save");
+	await click(save);
+	assert.equal(addButton.disabled, true, "the opener is disabled while the save is in flight");
+	await click(container.querySelector('[data-testid="dismiss-dialog"]'));
+
+	const fallback = container.querySelector('[tabindex="-1"]');
+	assert.equal(document.activeElement, fallback, "focus lands on the card fallback instead of the disabled opener");
+
+	await act(async () => { release(); state.deferMembers = null; await new Promise(r => setTimeout(r, 30)); });
 	await unmount(root, container);
 });

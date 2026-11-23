@@ -19,7 +19,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
-import { createMailingList, fetchMailingListDomains, refetchMailingListIndex, updateMailingListInIndex } from "./utils";
+import { createMailingList, fetchMailingListDomains, insertMailingListIntoIndex, refetchMailingListIndex } from "./utils";
 
 export function ListCreateDialog() {
 	const { t } = useLanguage();
@@ -49,9 +49,9 @@ export function ListCreateDialog() {
 				postingPolicy,
 				moderated,
 			}),
-		onSuccess: ({ list }) => {
-			updateMailingListInIndex(qc, list);
-			refetchMailingListIndex(qc);
+		onSuccess: async ({ list }) => {
+			insertMailingListIntoIndex(qc, list);
+			await refetchMailingListIndex(qc);
 			setOpen(false);
 			setName("");
 			setLocalPart("");
