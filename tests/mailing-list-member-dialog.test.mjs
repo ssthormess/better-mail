@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { pathToFileURL } from "node:url";
 import test, { beforeEach } from "node:test";
 import { loadComponent } from "./helpers/dom-component.mjs";
 
@@ -23,8 +22,10 @@ const mock = {
 	"@/components/ui/button": `import React from "react"; export function Button({children,size,variant,pill,...props}){return React.createElement("button",props,children);}`,
 	"@/components/ui/checkbox": `import React from "react"; export const Checkbox = React.forwardRef(function Checkbox(props,ref){return React.createElement("input",{type:"checkbox",...props,ref});});`,
 	"@/components/ui/dialog": `import React from "react";
-export function Dialog({open,onOpenChange,children}){return open ? React.createElement(React.Fragment,null,children) : null;}
-export function DialogContent({children,...props}){return React.createElement("div",props,children);}
+export function Dialog({open,onOpenChange,children}){
+	return open ? React.createElement(React.Fragment,null,React.createElement("button",{type:"button","data-testid":"dismiss-dialog",onClick:()=>onOpenChange(false)},"dismiss"),children) : null;
+}
+export function DialogContent({children,onCloseAutoFocus,...props}){return React.createElement("div",props,children);}
 export function DialogHeader({children}){return React.createElement("div",null,children);}
 export function DialogTitle({children}){return React.createElement("h2",null,children);}
 export function DialogDescription({children}){return React.createElement("p",null,children);}`,
@@ -44,6 +45,7 @@ const { createRoot } = await import("react-dom/client");
 const { QueryClient, QueryClientProvider } = await import("@tanstack/react-query");
 
 const requests = [];
+globalThis.__listsTestPostHandler = null; // tests may override the members POST
 globalThis.__listsTestFetch = async (url, options = {}) => {
 	const method = options.method || "GET";
 	const payload = options.body ? JSON.parse(options.body) : null;
@@ -52,11 +54,12 @@ globalThis.__listsTestFetch = async (url, options = {}) => {
 		return response({ members: [{ ...member, ...payload, id: member.id }] });
 	}
 	if (url === "/api/mailing-lists/list-1/members" && method === "POST") {
+		if (globalThis.__listsTestPostHandler) return globalThis.__listsTestPostHandler(payload);
 		return response({ error: "That address is already a member of this list" }, 409);
 	}
 	return response({ error: "Unexpected route" }, 500);
 };
-beforeEach(() => { requests.length = 0; });
+beforeEach(() => { requests.length = 0; globalThis.__listsTestPostHandler = null; });
 
 function response(data, status = 200) {
 	return { ok: status >= 200 && status < 300, status, async json() { return data; } };
@@ -66,17 +69,20 @@ async function renderDialog(t, memberProp) {
 	const container = document.createElement("div");
 	document.body.appendChild(container);
 	const reactRoot = createRoot(container);
-	const client = new QueryClient();
+	// gcTime Infinity schedules no GC timers — default 5-minute GC would keep Node alive.
+	const client = new QueryClient({ defaultOptions: { queries: { gcTime: Infinity }, mutations: { gcTime: Infinity } } });
 	const closed = [];
-	const props = { listId: "list-1", member: memberProp, open: true, onOpenChange: next => closed.push(next) };
+	const props = { listId: "list-1", member: memberProp, open: true, onOpenChange: next => { closed.push(next); props.open = next; rerender(); } };
+	const rerender = () => {
+		reactRoot.render(createElement(QueryClientProvider, { client }, createElement(MemberDialog, { ...props })));
+	};
 	t.after(async () => {
 		await act(async () => reactRoot.unmount());
+		client.clear();
 		container.remove();
 	});
-	await act(async () => {
-		reactRoot.render(createElement(QueryClientProvider, { client }, createElement(MemberDialog, props)));
-	});
-	return { container, closed };
+	await act(async () => { rerender(); });
+	return { container, closed, props };
 }
 
 async function setInputValue(input, value) {
@@ -133,4 +139,25 @@ test("adding a duplicate member surfaces the API's conflict message", async t =>
 	assert.ok(alert, "an alert is shown");
 	assert.match(alert.textContent, /already a member/, "the server's 409 message is shown verbatim");
 	assert.deepEqual(closed, [], "the dialog stays open on conflict");
+});
+
+test("a save dismissed while pending does not fire onOpenChange again when it lands", async t => {
+	let release;
+	globalThis.__listsTestPostHandler = () => new Promise(resolve => { release = resolve; });
+	const { container, closed } = await renderDialog(t, undefined);
+	await setInputValue(container.querySelector("#member-email"), "late@example.com");
+	const save = [...container.querySelectorAll("button")].find(b => b.textContent === "common.save");
+
+	await click(save);
+	assert.equal(requests.length, 1, "the POST is in flight");
+
+	// The user dismisses the dialog before the response arrives.
+	await click(container.querySelector('[data-testid="dismiss-dialog"]'));
+	assert.deepEqual(closed, [false], "the dismiss closed the dialog");
+
+	await act(async () => {
+		release(response({ members: [{ ...member, email: "late@example.com", id: "m-2" }] }));
+		await new Promise(r => setTimeout(r, 20));
+	});
+	assert.deepEqual(closed, [false], "a dismissed pending save must not close its successor");
 });

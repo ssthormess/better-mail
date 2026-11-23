@@ -1,11 +1,12 @@
 import { authFetch } from "@/lib/auth/client";
 import type { MailingListMember, MailingListMembersResponse } from "../types";
+import { apiError } from "../utils";
 import type { MailingListDetailResponse, MailingListUpdateResponse } from "./types";
 
 export async function fetchMailingList(id: string): Promise<MailingListDetailResponse> {
 	const res = await authFetch(`/api/mailing-lists/${id}`);
-	const json = (await res.json()) as MailingListDetailResponse & { error?: string };
-	if (!res.ok) throw new Error(json.error ?? "Failed to load list");
+	const json = (await res.json()) as MailingListDetailResponse & { error?: unknown };
+	if (!res.ok) throw apiError(json, "Failed to load list");
 	return json;
 }
 
@@ -24,8 +25,8 @@ export async function updateMailingList(
 		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify(input),
 	});
-	const json = (await res.json()) as MailingListUpdateResponse & { error?: string };
-	if (!res.ok) throw new Error(json.error ?? "Failed to update list");
+	const json = (await res.json()) as MailingListUpdateResponse & { error?: unknown };
+	if (!res.ok) throw apiError(json, "Failed to update list");
 	return json;
 }
 
@@ -38,8 +39,8 @@ export async function addMailingListMember(
 		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify(input),
 	});
-	const json = (await res.json()) as MailingListMembersResponse & { error?: string };
-	if (!res.ok) throw new Error(json.error ?? "Failed to add member");
+	const json = (await res.json()) as MailingListMembersResponse & { error?: unknown };
+	if (!res.ok) throw apiError(json, "Failed to add member");
 	return json.members;
 }
 
@@ -53,8 +54,8 @@ export async function updateMailingListMember(
 		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify({ memberId, ...input }),
 	});
-	const json = (await res.json()) as MailingListMembersResponse & { error?: string };
-	if (!res.ok) throw new Error(json.error ?? "Failed to update member");
+	const json = (await res.json()) as MailingListMembersResponse & { error?: unknown };
+	if (!res.ok) throw apiError(json, "Failed to update member");
 	return json.members;
 }
 
@@ -62,7 +63,7 @@ export async function removeMailingListMember(id: string, memberId: string): Pro
 	const res = await authFetch(`/api/mailing-lists/${id}/members?memberId=${encodeURIComponent(memberId)}`, {
 		method: "DELETE",
 	});
-	const json = (await res.json()) as MailingListMembersResponse & { error?: string };
-	if (!res.ok) throw new Error(json.error ?? "Failed to remove member");
+	const json = (await res.json()) as MailingListMembersResponse & { error?: unknown };
+	if (!res.ok) throw apiError(json, "Failed to remove member");
 	return json.members;
 }

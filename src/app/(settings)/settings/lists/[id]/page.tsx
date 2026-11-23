@@ -33,7 +33,7 @@ export default function MailingListDetailPage() {
 					{list ? (
 						<p className="mt-1 truncate no-font-mono text-sm text-neutral-500">{list.address}</p>
 					) : (
-						<Skeleton className="mt-2 h-4 w-52" />
+						!detail.isError && <Skeleton className="mt-2 h-4 w-52" />
 					)}
 				</div>
 				<div className="flex shrink-0 items-center gap-2">

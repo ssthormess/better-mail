@@ -8,7 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { confirmDestructive } from "@/components/ui/confirm-dialog";
 import type { MailingList } from "../types";
-import { deleteMailingList } from "../utils";
+import { deleteMailingList, refetchMailingListIndex, removeMailingListFromIndex } from "../utils";
 
 export function ListDangerCard({ list }: { list: MailingList }) {
 	const { t } = useLanguage();
@@ -18,7 +18,10 @@ export function ListDangerCard({ list }: { list: MailingList }) {
 	const remove = useMutation({
 		mutationFn: () => deleteMailingList(list.id),
 		onSuccess: async () => {
-			await qc.invalidateQueries({ queryKey: ["mailing-lists"] });
+			removeMailingListFromIndex(qc, list.id);
+			// Drop the detail snapshot too — a cached URL must not resurrect dead controls.
+			qc.removeQueries({ queryKey: ["mailing-list", list.id] });
+			await refetchMailingListIndex(qc);
 			router.push("/settings/lists");
 		},
 	});
@@ -31,7 +34,7 @@ export function ListDangerCard({ list }: { list: MailingList }) {
 			</CardHeader>
 			<CardContent className="pt-5">
 				{remove.isError && (
-					<p className="mb-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+					<p role="alert" className="mb-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
 						{remove.error instanceof Error ? remove.error.message : t("mailingLists.deleteFailed")}
 					</p>
 				)}

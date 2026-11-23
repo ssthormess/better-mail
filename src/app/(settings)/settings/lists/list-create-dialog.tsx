@@ -19,7 +19,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
-import { createMailingList, fetchMailingListDomains } from "./utils";
+import { createMailingList, fetchMailingListDomains, refetchMailingListIndex, updateMailingListInIndex } from "./utils";
 
 export function ListCreateDialog() {
 	const { t } = useLanguage();
@@ -49,7 +49,9 @@ export function ListCreateDialog() {
 				postingPolicy,
 				moderated,
 			}),
-		onSuccess: () => {
+		onSuccess: ({ list }) => {
+			updateMailingListInIndex(qc, list);
+			refetchMailingListIndex(qc);
 			setOpen(false);
 			setName("");
 			setLocalPart("");
@@ -57,7 +59,6 @@ export function ListCreateDialog() {
 			setDescription("");
 			setPostingPolicy("members_only");
 			setModerated(false);
-			qc.invalidateQueries({ queryKey: ["mailing-lists"] });
 		},
 	});
 
@@ -113,6 +114,21 @@ export function ListCreateDialog() {
 							</Select>
 						</div>
 					</div>
+					{domains.isLoading && (
+						<p className="text-sm text-neutral-500">{t("common.loading")}</p>
+					)}
+					{domains.isError && (
+						<p role="alert" className="flex items-center gap-2 text-sm text-red-600">
+							{domains.error instanceof Error ? domains.error.message : t("mailingLists.domainsLoadFailed")}
+							<button
+								type="button"
+								className="underline underline-offset-2"
+								onClick={() => domains.refetch()}
+							>
+								{t("undo.retry")}
+							</button>
+						</p>
+					)}
 					{domains.data && activeDomains.length === 0 && (
 						<p className="rounded-2xl bg-neutral-50 px-4 py-3 text-sm text-neutral-500">
 							{t("mailingLists.noDomains")}

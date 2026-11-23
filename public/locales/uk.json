@@ -2616,6 +2616,7 @@
 	"mailingLists.createFailed": "Failed to create list",
 	"mailingLists.none": "No mailing lists yet",
 	"mailingLists.loadFailed": "Failed to load mailing lists",
+	"mailingLists.domainsLoadFailed": "Failed to load domains",
 	"mailingLists.noDomains": "You need an active domain before creating a list.",
 	"mailingLists.memberCount.one": "{count} member",
 	"mailingLists.memberCount.other": "{count} members",

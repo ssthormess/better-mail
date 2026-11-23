@@ -12,6 +12,7 @@ import { Label } from "@/components/ui/label";
 import { Select } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import type { MailingList } from "../types";
+import { refetchMailingListIndex, updateMailingListInIndex } from "../utils";
 import type { MailingListDetailResponse } from "./types";
 import { updateMailingList } from "./utils";
 
@@ -24,10 +25,12 @@ export function ListDetailsCard({ list }: { list: MailingList }) {
 	const [postingPolicy, setPostingPolicy] = useState(list.postingPolicy);
 	const [moderated, setModerated] = useState(list.moderated);
 
-	// Copy each newly loaded (or freshly saved) list into the form fields.
-	const [syncedList, setSyncedList] = useState(list);
-	if (list !== syncedList) {
-		setSyncedList(list);
+	// Re-sync the fields only when the editable values themselves change: member mutations
+	// create a new list object (memberCount) and must not wipe an unsaved draft.
+	const fieldsKey = JSON.stringify([list.id, list.name, list.description ?? "", list.postingPolicy, list.moderated, list.disabled]);
+	const [appliedKey, setAppliedKey] = useState(fieldsKey);
+	if (appliedKey !== fieldsKey) {
+		setAppliedKey(fieldsKey);
 		setEnabled(!list.disabled);
 		setName(list.name);
 		setDescription(list.description ?? "");
@@ -44,11 +47,13 @@ export function ListDetailsCard({ list }: { list: MailingList }) {
 				moderated,
 				disabled: !enabled,
 			}),
-		onSuccess: ({ list: updated }) => {
+		onSuccess: async ({ list: updated }) => {
+			await qc.cancelQueries({ queryKey: ["mailing-list", list.id] });
 			qc.setQueryData<MailingListDetailResponse>(["mailing-list", list.id], (current) =>
 				current ? { ...current, list: { ...current.list, ...updated } } : current,
 			);
-			qc.invalidateQueries({ queryKey: ["mailing-lists"] });
+			updateMailingListInIndex(qc, updated);
+			refetchMailingListIndex(qc);
 		},
 	});
 
@@ -120,7 +125,7 @@ export function ListDetailsCard({ list }: { list: MailingList }) {
 						{update.error instanceof Error ? update.error.message : t("mailingLists.updateFailed")}
 					</p>
 				)}
-				{update.isSuccess && <p className="text-sm text-green-700">{t("mailingLists.saved")}</p>}
+				{update.isSuccess && <p role="status" className="text-sm text-green-700">{t("mailingLists.saved")}</p>}
 				<Button onClick={() => update.mutate()} disabled={!name.trim() || update.isPending}>
 					<Save className="h-4 w-4" />
 					{update.isPending ? t("common.saving") : t("settings.mailbox.saveChanges")}

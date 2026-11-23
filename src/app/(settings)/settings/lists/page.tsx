@@ -33,7 +33,7 @@ export default function MailingListsPage() {
 			)}
 			<section className="space-y-3">
 				{lists.isLoading && <SectionRowSkeleton />}
-				{!lists.isLoading && (lists.data?.lists ?? []).length === 0 && (
+				{!lists.isLoading && !lists.isError && (lists.data?.lists ?? []).length === 0 && (
 					<p className="rounded-2xl bg-white px-5 py-4 text-sm text-neutral-500">
 						{t("mailingLists.none")}
 					</p>

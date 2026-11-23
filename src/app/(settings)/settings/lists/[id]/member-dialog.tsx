@@ -1,7 +1,7 @@
 "use client";
 
-import { useState } from "react";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useEffect, useRef, useState } from "react";
+import { useIsMutating, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useLanguage } from "@/components/language-provider";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -16,17 +16,24 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select } from "@/components/ui/select";
 import type { MailingListMember } from "../types";
+import { refetchMailingListIndex, updateMailingListInIndex } from "../utils";
 import type { MailingListDetailResponse } from "./types";
 import { addMailingListMember, updateMailingListMember } from "./utils";
+
+export function memberMutationKey(listId: string) {
+	return ["mailing-list-member", listId] as const;
+}
 
 type MemberDialogProps = {
 	listId: string;
 	member?: MailingListMember;
 	open: boolean;
 	onOpenChange: (open: boolean) => void;
+	/** Forwarded to DialogContent — the card uses it to return focus to the opener. */
+	onCloseAutoFocus?: (event: Event) => void;
 };
 
-export function MemberDialog({ listId, member, open, onOpenChange }: MemberDialogProps) {
+export function MemberDialog({ listId, member, open, onOpenChange, onCloseAutoFocus }: MemberDialogProps) {
 	const { t } = useLanguage();
 	const qc = useQueryClient();
 	const editing = !!member;
@@ -35,7 +42,22 @@ export function MemberDialog({ listId, member, open, onOpenChange }: MemberDialo
 	const [role, setRole] = useState<"owner" | "member">(member?.role ?? "member");
 	const [moderated, setModerated] = useState(member?.moderated ?? false);
 
+	// Another member mutation (e.g. a remove) may be in flight — member writes are
+	// serialized so arrival order can't undo a newer snapshot.
+	const memberBusy = useIsMutating({ mutationKey: memberMutationKey(listId) }) > 0;
+	// A pending save can outlive the dialog: only close when this instance is still
+	// open. The parent remounts the dialog on every open, so the unmount cleanup
+	// also stops a stale save from closing its successor.
+	const openRef = useRef(open);
+	useEffect(() => {
+		openRef.current = open;
+		return () => {
+			openRef.current = false;
+		};
+	}, [open]);
+
 	const save = useMutation({
+		mutationKey: memberMutationKey(listId),
 		mutationFn: async (): Promise<MailingListMember[]> => {
 			if (editing) {
 				return updateMailingListMember(listId, member.id, {
@@ -51,18 +73,20 @@ export function MemberDialog({ listId, member, open, onOpenChange }: MemberDialo
 				moderated,
 			});
 		},
-		onSuccess: (members) => {
+		onSuccess: async (members) => {
+			await qc.cancelQueries({ queryKey: ["mailing-list", listId] });
 			qc.setQueryData<MailingListDetailResponse>(["mailing-list", listId], (current) =>
 				current ? { list: { ...current.list, memberCount: members.length }, members } : current,
 			);
-			qc.invalidateQueries({ queryKey: ["mailing-lists"] });
-			onOpenChange(false);
+			updateMailingListInIndex(qc, { id: listId, memberCount: members.length });
+			refetchMailingListIndex(qc);
+			if (openRef.current) onOpenChange(false);
 		},
 	});
 
 	return (
 		<Dialog open={open} onOpenChange={onOpenChange}>
-			<DialogContent>
+			<DialogContent onCloseAutoFocus={onCloseAutoFocus}>
 				<DialogHeader>
 					<DialogTitle>{editing ? t("mailingLists.editMemberTitle") : t("mailingLists.addMember")}</DialogTitle>
 					<DialogDescription>{t("mailingLists.membersDescription")}</DialogDescription>
@@ -118,7 +142,7 @@ export function MemberDialog({ listId, member, open, onOpenChange }: MemberDialo
 					)}
 					<Button
 						onClick={() => save.mutate()}
-						disabled={(!editing && !email.trim()) || save.isPending}
+						disabled={(!editing && !email.trim()) || memberBusy}
 					>
 						{save.isPending ? t("common.saving") : t("common.save")}
 					</Button>

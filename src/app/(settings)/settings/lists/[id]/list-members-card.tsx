@@ -1,7 +1,7 @@
 "use client";
 
-import { useState } from "react";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useRef, useState } from "react";
+import { useIsMutating, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Pencil, Trash2, UserPlus } from "@/components/icons";
 import { useLanguage } from "@/components/language-provider";
 import { Badge } from "@/components/ui/badge";
@@ -10,7 +10,8 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { confirmDestructive } from "@/components/ui/confirm-dialog";
 import { Skeleton } from "@/components/ui/skeleton";
 import type { MailingListMember } from "../types";
-import { MemberDialog } from "./member-dialog";
+import { refetchMailingListIndex, updateMailingListInIndex } from "../utils";
+import { MemberDialog, memberMutationKey } from "./member-dialog";
 import type { MailingListDetailResponse } from "./types";
 import { removeMailingListMember } from "./utils";
 
@@ -26,18 +27,27 @@ export function ListMembersCard({ listId, members, loading }: ListMembersCardPro
 	const [dialogMember, setDialogMember] = useState<MailingListMember | undefined>(undefined);
 	const [dialogOpen, setDialogOpen] = useState(false);
 	const [dialogKey, setDialogKey] = useState(0);
+	const openerRef = useRef<HTMLElement | null>(null);
+
+	// Member writes are serialized on one mutation key so an earlier snapshot arriving
+	// last can never overwrite a newer one.
+	const memberBusy = useIsMutating({ mutationKey: memberMutationKey(listId) }) > 0;
 
 	const remove = useMutation({
+		mutationKey: memberMutationKey(listId),
 		mutationFn: (memberId: string) => removeMailingListMember(listId, memberId),
-		onSuccess: (updated) => {
+		onSuccess: async (updated) => {
+			await qc.cancelQueries({ queryKey: ["mailing-list", listId] });
 			qc.setQueryData<MailingListDetailResponse>(["mailing-list", listId], (current) =>
 				current ? { list: { ...current.list, memberCount: updated.length }, members: updated } : current,
 			);
-			qc.invalidateQueries({ queryKey: ["mailing-lists"] });
+			updateMailingListInIndex(qc, { id: listId, memberCount: updated.length });
+			refetchMailingListIndex(qc);
 		},
 	});
 
-	function openDialog(member?: MailingListMember) {
+	function openDialog(member: MailingListMember | undefined, opener: HTMLElement | null) {
+		openerRef.current = opener;
 		setDialogMember(member);
 		setDialogKey((key) => key + 1);
 		setDialogOpen(true);
@@ -48,7 +58,7 @@ export function ListMembersCard({ listId, members, loading }: ListMembersCardPro
 			<CardHeader className="py-0">
 				<div className="flex items-center justify-between gap-4">
 					<CardTitle>{t("mailingLists.membersTitle")}</CardTitle>
-					<Button type="button" size="sm" variant="outline" onClick={() => openDialog()}>
+					<Button type="button" size="sm" variant="outline" disabled={memberBusy} onClick={(event) => openDialog(undefined, event.currentTarget)}>
 						<UserPlus className="h-4 w-4" />
 						{t("mailingLists.addMember")}
 					</Button>
@@ -87,7 +97,8 @@ export function ListMembersCard({ listId, members, loading }: ListMembersCardPro
 								size="icon"
 								variant="ghost"
 								aria-label={t("mailingLists.editMember", { email: member.email })}
-								onClick={() => openDialog(member)}
+								disabled={memberBusy}
+								onClick={(event) => openDialog(member, event.currentTarget)}
 							>
 								<Pencil className="h-4 w-4" />
 							</Button>
@@ -96,7 +107,7 @@ export function ListMembersCard({ listId, members, loading }: ListMembersCardPro
 								size="icon"
 								variant="ghost"
 								aria-label={t("mailingLists.removeMember", { email: member.email })}
-								disabled={remove.isPending}
+								disabled={memberBusy}
 								onClick={async () => {
 									if (!await confirmDestructive(t("mailingLists.removeMemberConfirm", { email: member.email }))) return;
 									remove.mutate(member.id);
@@ -113,7 +124,7 @@ export function ListMembersCard({ listId, members, loading }: ListMembersCardPro
 					</p>
 				)}
 				{remove.isError && (
-					<p className="text-sm text-red-600">
+					<p role="alert" className="text-sm text-red-600">
 						{remove.error instanceof Error ? remove.error.message : t("mailingLists.memberRemoveFailed")}
 					</p>
 				)}
@@ -124,6 +135,10 @@ export function ListMembersCard({ listId, members, loading }: ListMembersCardPro
 				member={dialogMember}
 				open={dialogOpen}
 				onOpenChange={setDialogOpen}
+				onCloseAutoFocus={(event) => {
+					event.preventDefault();
+					openerRef.current?.focus();
+				}}
 			/>
 		</Card>
 	);
