@@ -42,7 +42,9 @@ export type RoutingDecision = {
 	/**
 	 * Set on a list decision when the post is held for review: it is accepted but
 	 * fans out only to the list's owner members, not the full membership. A
-	 * moderated list holds every allowed post; a moderated member holds theirs.
+	 * moderated list holds posts from non-owner senders — owners are the
+	 * reviewers, so their posts pass and an owner repost approves — while a
+	 * member-level `moderated` flag holds that member's posts at every role.
 	 */
 	heldForModeration?: boolean;
 };
@@ -399,22 +401,74 @@ async function listClaimDecision(
 type ListPostingOutcome = "allow" | "hold" | "deny";
 
 /**
+ * The mailbox an address belongs to, for identity purposes only: the explicit
+ * mailbox and enabled-alias claims a direct delivery applies, with the same
+ * plus-tag semantics (`user+tag` claims a stored `user+tag`, else strips to
+ * `user`, and a `useAllDomains` mailbox claims its own local part). Catch-all
+ * and forward rules, block rules, disabled aliases and mailing lists never
+ * count: posting membership is about which mailbox a sender controls, not
+ * where arbitrary mail to that address lands. A member row at an address with
+ * no hosted identity — an external address, or one only a catch-all would
+ * claim — can still match the sender's literal address but never their
+ * mailbox, so a catch-all cannot fold a stranger onto a member's identity.
+ *
+ * This is an envelope-address contract, not sender authentication: SMTP gives
+ * no cryptographic proof the envelope sender is theirs, so membership keys off
+ * address ownership and a spoofed envelope sender inherits that member's
+ * posting rights — the same trust every SMTP list extends to envelope MAIL
+ * FROM.
+ */
+export async function resolveMailboxIdentity(
+	db: AppDatabase,
+	address: string,
+): Promise<ResolvedMailbox | null> {
+	const parsed = parseRecipientAddress(address);
+	if (!parsed) return null;
+	const [domain] = await db
+		.select()
+		.from(domains)
+		.where(and(eq(domains.hostname, parsed.domain), eq(domains.status, "active")))
+		.limit(1);
+	if (!domain) return null;
+
+	const enabledMailboxes = await db
+		.select()
+		.from(mailboxes)
+		.where(and(eq(mailboxes.domainId, domain.id), eq(mailboxes.disabled, false)));
+	const taggedMailbox = parsed.fullLocalPart !== parsed.localPart
+		? enabledMailboxes.find(
+			(mailbox) => normalizeRecipientFullLocalPart(mailbox.localPart) === parsed.fullLocalPart,
+		)
+		: undefined;
+	const mailbox = taggedMailbox
+		?? enabledMailboxes.find(
+			(mailbox) => normalizeRecipientLocalPart(mailbox.localPart) === parsed.localPart,
+		)
+		?? await resolveMailboxAlias(db, domain.id, parsed.localPart)
+		?? await resolveMailboxDomainAlias(db, parsed.localPart, parsed.normalizedAddress);
+	return mailbox ? toResolvedMailbox(mailbox, domain.id, domain.hostname) : null;
+}
+
+/**
  * Who may post to a list. Membership is established two ways, matching the
- * sender-dedup semantics in the delivery engine: the envelope sender's address
- * literally appears as a member email, or it resolves to the same mailbox a
- * member email resolves to — a member subscribed under one address can post
- * from any other address or alias of that mailbox, plus-tags included.
+ * sender-suppression semantics in the delivery engine: the envelope sender's
+ * address literally appears as a member email, or its mailbox identity matches
+ * a member row's mailbox identity — a member subscribed under one address can
+ * post from any other address or alias of that mailbox, plus-tags included.
  *
  * A `members_only` list denies a sender matching neither path, including an
  * empty or unparseable envelope sender. `anyone` posts freely — the member scan
  * still runs there only when a moderated flag exists, because a moderated
  * member's posts are held under every policy. A list-level `moderated` flag
- * holds every allowed post. When several member rows map to the sender's
- * mailbox, any moderated one holds the post.
+ * holds posts from non-owner senders; owners are exempt because they are the
+ * reviewers — an owner approving a held post does so by reposting to the list.
+ * When several member rows map to the sender's mailbox, any moderated one
+ * holds the post and any owner one exempts the list flag.
  *
- * Only useful member rows are resolved: once membership is proven, unmoderated
- * rows cannot change the outcome, and an open list with no moderation anywhere
- * never resolves at all.
+ * Only rows that can still change the outcome are resolved: once membership
+ * and every flag that matters are settled, the rest of the member list is
+ * never touched, and an open list with no moderation anywhere resolves
+ * nothing at all.
  */
 async function checkListPosting(
 	db: AppDatabase,
@@ -423,34 +477,46 @@ async function checkListPosting(
 ): Promise<ListPostingOutcome> {
 	const membersOnly = list.postingPolicy === "members_only";
 	const members = await db
-		.select({ email: mailingListMembers.email, moderated: mailingListMembers.moderated })
+		.select({ email: mailingListMembers.email, role: mailingListMembers.role, moderated: mailingListMembers.moderated })
 		.from(mailingListMembers)
 		.where(eq(mailingListMembers.listId, list.id));
 
 	const sender = normalizeEmailAddress(envelopeFrom ?? "");
 	const matched = new Set(members.filter((member) => normalizeEmailAddress(member.email) === sender));
-	let memberFound = matched.size > 0;
-	let hold = list.moderated || [...matched].some((member) => member.moderated);
+	const tally = () => {
+		const hits = [...matched];
+		return {
+			memberFound: hits.length > 0,
+			ownerFound: hits.some((member) => member.role === "owner"),
+			memberModerated: hits.some((member) => member.moderated),
+		};
+	};
+	let { memberFound, ownerFound, memberModerated } = tally();
 
-	// Member resolution can still change the outcome while a members-only
-	// sender has no match yet, or an unmatched moderated row could still hold.
-	const worthScanning = (membersOnly && !memberFound) || (!hold && members.some((member) => member.moderated && !matched.has(member)));
-	if (worthScanning && sender) {
-		const senderMailbox = (await resolveInboundAddress(db, sender, null, { skipPostingAuth: true }))?.mailbox;
+	// Resolution can still change the outcome while an unmatched row could
+	// grant membership (members_only), impose a member-level hold, or lift a
+	// list-level hold by matching an owner.
+	const stillUseful = (member: (typeof members)[number]) =>
+		!matched.has(member) && (
+			(membersOnly && !memberFound)
+			|| (member.moderated && !memberModerated)
+			|| (list.moderated && member.role === "owner" && !ownerFound)
+		);
+	if (sender && members.some(stillUseful)) {
+		const senderMailbox = await resolveMailboxIdentity(db, sender);
 		if (senderMailbox) {
 			for (const member of members) {
-				if (matched.has(member)) continue;
-				if (!((membersOnly && !memberFound) || (member.moderated && !hold))) continue;
-				const decision = await resolveInboundAddress(db, member.email, null, { skipPostingAuth: true });
-				if (decision?.mailbox?.mailboxId !== senderMailbox.mailboxId) continue;
+				if (!stillUseful(member)) continue;
+				const identity = await resolveMailboxIdentity(db, member.email);
+				if (identity?.mailboxId !== senderMailbox.mailboxId) continue;
 				matched.add(member);
-				memberFound = true;
-				if (member.moderated) hold = true;
+				({ memberFound, ownerFound, memberModerated } = tally());
 			}
 		}
 	}
+
 	if (membersOnly && !memberFound) return "deny";
-	return hold ? "hold" : "allow";
+	return memberModerated || (list.moderated && !ownerFound) ? "hold" : "allow";
 }
 
 async function resolveMailboxDomainAlias(

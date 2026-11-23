@@ -20,8 +20,7 @@ await build({
 			export { applyMigrations } from "./server/runtime/migrate.ts";
 			export { intakeIncomingMail } from "./src/lib/email/intake.ts";
 			export { processInboundMessage } from "./src/lib/email/inbound.ts";
-			export { resolveInboundAddress } from "./src/lib/email/routing.ts";
-			export { inboundStorageScope } from "./src/lib/email/inbound-id.ts";
+			export { resolveInboundAddress, resolveMailboxIdentity } from "./src/lib/email/routing.ts";
 			export { getDb } from "./src/db/index.ts";
 		`,
 		resolveDir: root,
@@ -37,7 +36,7 @@ await build({
 	alias: { "cloudflare:workers": "./server/runtime/cloudflare-workers.ts" },
 	logLevel: "silent",
 });
-const { SqliteDatabase, applyMigrations, intakeIncomingMail, processInboundMessage, resolveInboundAddress, inboundStorageScope, getDb } =
+const { SqliteDatabase, applyMigrations, intakeIncomingMail, processInboundMessage, resolveInboundAddress, resolveMailboxIdentity, getDb } =
 	await import(pathToFileURL(join(directory, "entry.mjs")).href);
 
 const raw = new TextEncoder().encode("From: sender@ext.test\r\nTo: team@one.test\r\nSubject: hi\r\nMessage-ID: <1@ext.test>\r\n\r\nbody\r\n").buffer;
@@ -55,8 +54,8 @@ async function setup(t) {
 		INSERT INTO domains (id, user_id, hostname, zone_id, status, created_at) VALUES ('one', 'admin', 'one.test', 'z', 'active', 1);
 		INSERT INTO mailboxes (id, user_id, domain_id, local_part, created_at) VALUES
 			('bobbox', 'admin', 'one', 'bob', 1),
-			('annbox', 'admin', 'one', 'ann', 1),
-			('carolbox', 'admin', 'one', 'carol', 1);
+			('annbox', 'admin', 'one', 'ann', 2),
+			('carolbox', 'admin', 'one', 'carol', 3);
 		INSERT INTO mailbox_aliases (id, mailbox_id, domain_id, local_part, enabled, created_at) VALUES
 			('bobalias', 'bobbox', 'one', 'bob-alias', 1, 1);
 	`);
@@ -75,9 +74,9 @@ async function setup(t) {
 	return { env, database, objects, queued };
 }
 
-function insertList(database, { id = "team", localPart = "team", postingPolicy = "members_only", moderated = 0, members = [] }) {
-	database.db.prepare(`INSERT INTO mailing_lists (id, user_id, domain_id, local_part, name, posting_policy, moderated, disabled, created_at) VALUES (?, 'admin', 'one', ?, ?, ?, ?, 0, 1)`)
-		.run(id, localPart, id, postingPolicy, moderated);
+function insertList(database, { id = "team", localPart = "team", postingPolicy = "members_only", moderated = 0, userId = "admin", members = [] }) {
+	database.db.prepare(`INSERT INTO mailing_lists (id, user_id, domain_id, local_part, name, posting_policy, moderated, disabled, created_at) VALUES (?, ?, 'one', ?, ?, ?, ?, 0, 1)`)
+		.run(id, userId, localPart, id, postingPolicy, moderated);
 	for (const [index, member] of members.entries()) {
 		const row = typeof member === "string" ? { email: member } : member;
 		database.db.prepare(`INSERT INTO mailing_list_members (id, list_id, email, role, moderated, created_at) VALUES (?, ?, ?, ?, ?, 1)`)
@@ -86,7 +85,7 @@ function insertList(database, { id = "team", localPart = "team", postingPolicy =
 }
 
 function mailByMailbox(database) {
-	return database.db.prepare("SELECT mailbox_id AS mailboxId, status FROM messages").all();
+	return database.db.prepare("SELECT mailbox_id AS mailboxId, raw_r2_key AS rawR2Key, status FROM messages").all();
 }
 
 function intake(env, to, from = "sender@ext.test", bytes = raw) {
@@ -216,7 +215,7 @@ test("an unmoderated member posts normally on a list with moderated members", as
 	assert.deepEqual(new Set(mailByMailbox(database).map((row) => row.mailboxId)), new Set(["bobbox", "carolbox"]));
 });
 
-test("a moderated list holds every allowed post for owner review", async (t) => {
+test("a moderated list holds a non-owner's post for owner review", async (t) => {
 	t.mock.method(console, "info", () => {});
 	const { env, database, queued } = await setup(t);
 	insertList(database, {
@@ -265,11 +264,169 @@ test("a nested members_only list still denies a non-member sender", async (t) =>
 	assert.deepEqual(mailByMailbox(database).map((row) => row.mailboxId), ["bobbox"]);
 });
 
-test("the storage scope is the resolved mailbox or list, so the worker path dedupes like intake", async () => {
-	assert.equal(inboundStorageScope({ mailbox: { mailboxId: "mb1" } }), "mb1");
-	assert.equal(inboundStorageScope({ list: { listId: "l1" } }), "l1");
-	assert.equal(inboundStorageScope(null), undefined);
-	// A direct decision scopes by mailbox; the same member's copy through the
-	// list is re-keyed by mailbox at fan-out, so the two events land on one key.
-	assert.equal(inboundStorageScope({ mailbox: { mailboxId: "mb1" }, list: { listId: "l1" } }), "mb1");
+test("a reject consumed before its sibling cannot delete the raw the sibling owns", async (t) => {
+	t.mock.method(console, "warn", () => {});
+	t.mock.method(console, "info", () => {});
+	const { env, database, objects, queued } = await setup(t);
+
+	// Same bytes to bob directly and to his alias: two queue events.
+	const bytes = rawFor("shared-raw");
+	await intake(env, "bob@one.test", "sender@ext.test", bytes);
+	await intake(env, "bob-alias@one.test", "sender@ext.test", bytes);
+	assert.equal(queued.length, 2);
+	// Each event stages under a private key — no shared object exists yet.
+	assert.ok(queued.every((payload) => payload.rawR2Key.startsWith("inbound/staging/")));
+	assert.notEqual(queued[0].rawR2Key, queued[1].rawR2Key);
+
+	// The alias is disabled before its event is consumed, so that delivery
+	// resolves to reject — the ordering the raw-loss regression lived in.
+	database.db.prepare("UPDATE mailbox_aliases SET enabled = 0 WHERE id = 'bobalias'").run();
+	await processInboundMessage(env, queued[1]);
+	assert.equal(objects.has(queued[1].rawR2Key), false);
+
+	// The sibling still stores; nothing its cleanup touched was shared.
+	await processInboundMessage(env, queued[0]);
+	const rows = mailByMailbox(database);
+	assert.equal(rows.filter((row) => row.mailboxId === "bobbox").length, 1);
+	assert.ok(objects.has(rows[0].rawR2Key));
+	assert.ok(!rows[0].rawR2Key.startsWith("inbound/staging/"));
+});
+
+test("a reject consumed after its sibling still cannot delete the stored raw", async (t) => {
+	t.mock.method(console, "warn", () => {});
+	t.mock.method(console, "info", () => {});
+	const { env, database, objects, queued } = await setup(t);
+
+	const bytes = rawFor("stored-raw");
+	await intake(env, "bob@one.test", "sender@ext.test", bytes);
+	await intake(env, "bob-alias@one.test", "sender@ext.test", bytes);
+	database.db.prepare("UPDATE mailbox_aliases SET enabled = 0 WHERE id = 'bobalias'").run();
+
+	// Store first: the message row now references the canonical object.
+	await processInboundMessage(env, queued[0]);
+	const [row] = mailByMailbox(database);
+	assert.equal(row.mailboxId, "bobbox");
+	assert.ok(objects.has(row.rawR2Key));
+
+	// The reject cleanup must skip the object the stored message references.
+	await processInboundMessage(env, queued[1]);
+	assert.ok(objects.has(row.rawR2Key), "reject deleted an object a stored message owns");
+});
+
+test("a catch-all cannot lend a member mailbox's identity to a stranger", async (t) => {
+	t.mock.method(console, "info", () => {});
+	t.mock.method(console, "warn", () => {});
+	const { env, database, queued } = await setup(t);
+	insertList(database, { members: ["bob@one.test", "ann@one.test"] });
+	// A catch-all delivers any unmatched domain address into bob's mailbox —
+	// that is a delivery rule, not an identity: stranger owns no mailbox here.
+	database.db.prepare("INSERT INTO routing_rules (id, user_id, domain_id, scope, mailbox_id, pattern, match_field, match_operator, match_value, action, enabled, priority, created_at) VALUES ('catchall', 'admin', 'one', 'domain', 'bobbox', '*', 'email', 'contains', '*', 'store', 1, 0, 1)").run();
+
+	// Mail to the stranger does reach bobbox via the catch-all…
+	const delivery = await resolveInboundAddress(getDb(env), "stranger@one.test", "sender@ext.test");
+	assert.equal(delivery?.mailbox?.mailboxId, "bobbox");
+	// …but it is not the stranger's mailbox, so he cannot post to members_only.
+	assert.equal((await resolveMailboxIdentity(getDb(env), "stranger@one.test")), null);
+	const decision = await resolveInboundAddress(getDb(env), "team@one.test", "stranger@one.test");
+	assert.equal(decision?.action, "reject");
+
+	const result = await intake(env, "team@one.test", "stranger@one.test");
+	assert.equal(result.action, "reject");
+	assert.equal(queued.length, 0);
+});
+
+test("a catch-all sender is not wrongly held by a moderated member's flag", async (t) => {
+	t.mock.method(console, "info", () => {});
+	const { env, database, queued } = await setup(t);
+	insertList(database, {
+		postingPolicy: "anyone",
+		members: [{ email: "bob@one.test", moderated: 1 }, "ann@one.test"],
+	});
+	database.db.prepare("INSERT INTO routing_rules (id, user_id, domain_id, scope, mailbox_id, pattern, match_field, match_operator, match_value, action, enabled, priority, created_at) VALUES ('catchall', 'admin', 'one', 'domain', 'bobbox', '*', 'email', 'contains', '*', 'store', 1, 0, 1)").run();
+
+	// The stranger's address catch-alls into the moderated member's mailbox,
+	// but his post is not that member's post — it goes out unheld.
+	const decision = await resolveInboundAddress(getDb(env), "team@one.test", "stranger@one.test");
+	assert.equal(decision?.action, "list");
+	assert.ok(!decision.heldForModeration);
+
+	await intake(env, "team@one.test", "stranger@one.test");
+	await processInboundMessage(env, queued[0]);
+	assert.deepEqual(new Set(mailByMailbox(database).map((row) => row.mailboxId)), new Set(["bobbox", "annbox"]));
+});
+
+test("a held post with no owner member lands with the list's owning user", async (t) => {
+	t.mock.method(console, "info", () => {});
+	const { env, database, queued } = await setup(t);
+	insertList(database, {
+		postingPolicy: "anyone",
+		moderated: 1,
+		members: ["ann@one.test", "carol@one.test"],
+	});
+
+	await intake(env, "team@one.test", "stranger@elsewhere.test");
+	await processInboundMessage(env, queued[0]);
+
+	// No owner-role member exists, so the held copy falls back to the list
+	// owner (user admin), whose oldest mailbox on the domain is bobbox.
+	assert.deepEqual(mailByMailbox(database).map((row) => row.mailboxId), ["bobbox"]);
+});
+
+test("a held post with no reviewer at all is retained, never discarded", async (t) => {
+	t.mock.method(console, "warn", () => {});
+	t.mock.method(console, "info", () => {});
+	const { env, database, objects, queued } = await setup(t);
+	// The list owner has no mailbox anywhere: nobody can receive the copy.
+	database.db.prepare("INSERT INTO users (id, email, password_hash, name, role, is_primary_admin, created_at) VALUES ('ghost', 'ghost@one.test', 'hash', 'Ghost', 'member', 0, 1)").run();
+	insertList(database, {
+		postingPolicy: "anyone",
+		moderated: 1,
+		userId: "ghost",
+		members: ["ann@one.test"],
+	});
+
+	await intake(env, "team@one.test", "stranger@elsewhere.test");
+	await processInboundMessage(env, queued[0]);
+
+	assert.equal(mailByMailbox(database).length, 0);
+	assert.ok([...objects.keys()].some((key) => key.startsWith("held/team/")), "held raw must be retained");
+	assert.equal(objects.has(queued[0].rawR2Key), false, "staging object is consumed");
+});
+
+test("sender suppression cannot remove the last reviewer of a held post", async (t) => {
+	t.mock.method(console, "info", () => {});
+	const { env, database, queued } = await setup(t);
+	insertList(database, {
+		postingPolicy: "anyone",
+		members: [{ email: "carol@one.test", role: "owner", moderated: 1 }, "ann@one.test"],
+	});
+
+	// carol is moderated, so her post is held; she is also the only owner —
+	// echo suppression must not strip the last reviewer, so she still gets it.
+	await intake(env, "team@one.test", "carol@one.test");
+	await processInboundMessage(env, queued[0]);
+
+	assert.deepEqual(mailByMailbox(database).map((row) => row.mailboxId), ["carolbox"]);
+});
+
+test("an owner repost on a moderated list is not re-held", async (t) => {
+	t.mock.method(console, "info", () => {});
+	const { env, database, queued } = await setup(t);
+	insertList(database, {
+		postingPolicy: "anyone",
+		moderated: 1,
+		members: [{ email: "bob@one.test", role: "owner" }, "ann@one.test", "carol@one.test"],
+	});
+
+	// The list flag holds strangers' posts, not an owner's — that is what makes
+	// "repost to approve" work: the owner post fans out to the full membership.
+	const held = await resolveInboundAddress(getDb(env), "team@one.test", "stranger@elsewhere.test");
+	assert.equal(held?.heldForModeration, true);
+	const repost = await resolveInboundAddress(getDb(env), "team@one.test", "bob@one.test");
+	assert.equal(repost?.action, "list");
+	assert.ok(!repost.heldForModeration);
+
+	await intake(env, "team@one.test", "bob@one.test");
+	await processInboundMessage(env, queued[0]);
+	assert.deepEqual(new Set(mailByMailbox(database).map((row) => row.mailboxId)), new Set(["annbox", "carolbox"]));
 });

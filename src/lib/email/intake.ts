@@ -1,6 +1,6 @@
 import { forwardedMarker, getAccountForwardingDestination, isForwardedMarkerValid, MAILFLARE_FORWARDED_HEADER } from "@/lib/email/account-forwarding";
 import { resolveIncomingMail } from "@/lib/email/incoming";
-import { inboundStorageKey, inboundStorageScope } from "@/lib/email/inbound-id";
+import { inboundStagingKey } from "@/lib/email/inbound-id";
 import type { InboundQueueMessage } from "@/lib/email/inbound";
 import type { IntakeActions, IntakeInput, IntakeResult } from "@/lib/email/intake-types";
 
@@ -37,10 +37,11 @@ export async function intakeIncomingMail(env: CloudflareEnv, input: IntakeInput,
 		if (destination) await actions.forward?.(destination, marker);
 	}
 
-	// A relay retry replays the same bytes, so key the object on a content hash
-	// scoped by the routing decision (mailbox, or list for list-addressed mail):
-	// the consumer dedupes by `(mailboxId, rawR2Key)`.
-	const rawR2Key = await inboundStorageKey(input.raw, inboundStorageScope(decision));
+	// The raw stages under a per-event key — private to this delivery, so the
+	// consumer's reject/no-route cleanup can never delete an object a sibling
+	// event or a stored message references. The consumer derives the canonical
+	// content-hash key (scoped by mailbox) that the stored row dedupes on.
+	const rawR2Key = inboundStagingKey();
 	await env.BUCKET.put(rawR2Key, input.raw, {
 		httpMetadata: { contentType: "message/rfc822" },
 		customMetadata: { from: input.from, to: input.to },

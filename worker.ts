@@ -6,7 +6,7 @@ import {
 	processInboundMessage,
 	type InboundQueueMessage,
 } from "./src/lib/email/inbound";
-import { inboundStorageKey, inboundStorageScope } from "./src/lib/email/inbound-id";
+import { inboundStagingKey } from "./src/lib/email/inbound-id";
 import { processOutboundQueue, type OutboundQueueMessage } from "./src/lib/email/send";
 import {
 	isImportJobMessage,
@@ -113,10 +113,11 @@ export default {
 					await forwardMessage(env, message, forwardingDestination);
 				}
 			}
-			// Same keying as the intake path: a content hash scoped by the routing
-			// decision, so a member reached directly and through a list dedupes to
-			// one copy instead of storing a second under a random key.
-			const rawR2Key = await inboundStorageKey(raw, inboundStorageScope(decision));
+			// Same staging as the intake path: the raw lands under a private
+			// per-event key and the consumer derives the content-hash key the
+			// stored message references. A shared canonical key here would let a
+			// reject/no-route cleanup delete an object another delivery owns.
+			const rawR2Key = inboundStagingKey();
 			await env.BUCKET.put(rawR2Key, raw, {
 				httpMetadata: { contentType: "message/rfc822" },
 				customMetadata: { from: message.from, to: message.to },

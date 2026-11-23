@@ -1,4 +1,4 @@
-import { and, eq, isNotNull } from "drizzle-orm";
+import { and, eq, inArray, isNotNull } from "drizzle-orm";
 import { getDb } from "@/db";
 import { messages, outboundJobs, users } from "@/db/schema";
 import { newId } from "@/lib/ids";
@@ -15,7 +15,7 @@ import { getMailboxAccessLevel } from "@/lib/mailboxes/access";
 import { listMessageAttachments, storeMessageAttachments } from "@/lib/email/attachments";
 import { registerInboundInvite } from "@/lib/calendar/invite-store";
 import { inboundAttachmentLimitReason } from "@/lib/email/inbound-attachments";
-import { inboundMessageId } from "@/lib/email/inbound-id";
+import { deleteUnreferencedRawMail, inboundMessageId, inboundStorageKey, INBOUND_STAGING_PREFIX, mailboxInboundScope } from "@/lib/email/inbound-id";
 import { extractUnsubscribeLinkFromBody, extractUnsubscribeUrlFromRaw, getUnsubscribeUrlFromRawR2Key } from "@/lib/email/unsubscribe";
 import { resolveThreadId } from "@/lib/email/threading";
 import { normalizeMessageId } from "@/lib/email/thread-lookup";
@@ -36,6 +36,14 @@ import { buildNewMessageNotification } from "@/lib/email/inbound-notification";
 export type InboundQueueMessage = {
 	from: string;
 	to: string;
+	/**
+	 * The object holding this delivery's raw MIME. Queue events stage bytes
+	 * under `inbound/staging/` — private to this event, so every cleanup path
+	 * may delete it without touching another delivery's object. A member copy
+	 * instead carries the mailbox-scoped canonical key the fan-out already
+	 * stored. Either way a stored message row ends up referencing the canonical
+	 * key the consumer derived, never this staging key.
+	 */
 	rawR2Key: string;
 	headers?: Record<string, string>;
 	verdicts?: ProviderVerdicts;
@@ -52,8 +60,11 @@ export async function processInboundMessage(
 	// do in the Worker email handler.
 	const decision = await resolveInboundAddress(db, payload.to, payload.from);
 
-	// Nothing references the raw object on these paths, so keep it from piling up in storage.
-	const dropRaw = () => env.BUCKET.delete(payload.rawR2Key).catch((error) => console.error(`Raw cleanup failed for ${payload.rawR2Key}`, error));
+	// Content-hash keys are shared between deliveries of identical bytes, so a
+	// reject/no-route cleanup must never delete an object a stored message or a
+	// sibling event still needs: deletes go through the reference check, and new
+	// payloads always carry a private staging object here.
+	const dropRaw = () => deleteUnreferencedRawMail(env, db, payload.rawR2Key);
 
 	if (!decision) {
 		console.warn(`No routing for inbound address: ${payload.to}`);
@@ -94,11 +105,30 @@ async function storeInboundMessage(
 	mailbox: ResolvedMailbox,
 ): Promise<void> {
 	const db = getDb(env);
-	const [stored] = await db.select({ id: messages.id }).from(messages).where(and(
+	const raw = await env.BUCKET.get(payload.rawR2Key);
+	if (!raw) {
+		console.error(`Missing R2 object: ${payload.rawR2Key}`);
+		return;
+	}
+	const buffer = await raw.arrayBuffer();
+
+	// The stored object lives at the canonical content key for this mailbox —
+	// unless the payload already carries one (a member copy the fan-out wrote,
+	// or a payload produced before staging keys existed, whose key IS the
+	// stored key). Rows written before scope prefixes carry the unprefixed
+	// form, so a replay across the format change still dedupes on both.
+	const storedKey = payload.rawR2Key.startsWith(INBOUND_STAGING_PREFIX)
+		? await inboundStorageKey(buffer, mailboxInboundScope(mailbox.mailboxId))
+		: payload.rawR2Key;
+	const legacyKey = await inboundStorageKey(buffer, mailbox.mailboxId);
+	const [stored] = await db.select({ id: messages.id, rawR2Key: messages.rawR2Key }).from(messages).where(and(
 		eq(messages.mailboxId, mailbox.mailboxId),
-		eq(messages.rawR2Key, payload.rawR2Key),
+		inArray(messages.rawR2Key, [...new Set([storedKey, legacyKey])]),
 	)).limit(1);
 	if (stored) {
+		// The source object is a duplicate delivery artifact: a staging key or
+		// a re-put canonical that is not the one the stored row references.
+		if (payload.rawR2Key !== stored.rawR2Key) await deleteUnreferencedRawMail(env, db, payload.rawR2Key);
 		try {
 			const [existing] = await db.select().from(messages).where(eq(messages.id, stored.id)).limit(1);
 			if (existing && Date.now() - existing.createdAt.getTime() < 30 * 60_000) await scheduleAutoDraft(env, { mailboxId: mailbox.mailboxId, sourceMessageId: existing.id, ownerUserId: mailbox.userId, sender: existing.fromAddr, headers: payload.headers, status: existing.status, folderId: existing.folderId, spamVerdict: existing.spamVerdict, spamAnalysisError: existing.spamAnalysisError });
@@ -106,29 +136,31 @@ async function storeInboundMessage(
 		return;
 	}
 
-	const raw = await env.BUCKET.get(payload.rawR2Key);
-	if (!raw) {
-		console.error(`Missing R2 object: ${payload.rawR2Key}`);
-		return;
-	}
-
-	const buffer = await raw.arrayBuffer();
 	let parsed: Awaited<ReturnType<typeof parseRawMime>>;
 	try {
 		parsed = boundParsedEmail(await parseRawMime(buffer));
 	} catch (error) {
 		// Deterministic: a retry would repeat the same expensive parse, so drop the message.
 		console.warn(`Inbound MIME rejected for ${payload.to}`, error);
-		await env.BUCKET.delete(payload.rawR2Key);
+		await deleteUnreferencedRawMail(env, db, payload.rawR2Key);
 		return;
 	}
 	const attachmentLimitReason = inboundAttachmentLimitReason(parsed.attachments);
 	if (attachmentLimitReason) {
 		console.warn(`Inbound attachment limit reached for ${payload.to}: ${attachmentLimitReason}`);
-		await env.BUCKET.delete(payload.rawR2Key);
+		await deleteUnreferencedRawMail(env, db, payload.rawR2Key);
 		return;
 	}
-	const messageId = await inboundMessageId(payload.rawR2Key);
+
+	// Promote the staged bytes to the canonical key the row will reference.
+	// Writes are idempotent — every event computing this key holds these bytes.
+	if (payload.rawR2Key !== storedKey) {
+		await env.BUCKET.put(storedKey, buffer, {
+			httpMetadata: { contentType: "message/rfc822" },
+			customMetadata: { from: payload.from, to: payload.to },
+		});
+	}
+	const messageId = await inboundMessageId(storedKey);
 	const snippet = buildSnippet(parsed.text, parsed.html);
 	const deliveredAddress = getEmailAddress(payload.to) || `${mailbox.localPart}@${mailbox.hostname}`;
 	// Keep the whole To header so reply-all can address everyone; rules and
@@ -222,7 +254,7 @@ async function storeInboundMessage(
 			snippet,
 			textBody: parsed.text,
 			htmlBody: parsed.html,
-			rawR2Key: payload.rawR2Key,
+			rawR2Key: storedKey,
 			status,
 			// The From header is forgeable, so mail "from yourself" is not treated as already read.
 			read: false,
@@ -236,7 +268,14 @@ async function storeInboundMessage(
 			spamAnalyzedAt: spamAnalysis ? new Date() : null,
 			spamAnalysisError,
 		}).onConflictDoNothing().returning({ id: messages.id });
-		if (!inserted.length) return;
+		if (!inserted.length) {
+			// A concurrent delivery of these identical bytes beat the dedupe check
+			// to the insert; this event's staging object is now unreferenced.
+			if (payload.rawR2Key !== storedKey) {
+				await env.BUCKET.delete(payload.rawR2Key).catch((error) => console.error(`Raw cleanup failed for ${payload.rawR2Key}`, error));
+			}
+			return;
+		}
 
 		await storeMessageAttachments(env, messageId, parsed.attachments);
 		if (status !== "spam" && status !== "trash") {
@@ -308,6 +347,11 @@ async function storeInboundMessage(
 	try {
 		await scheduleAutoDraft(env, { mailboxId: mailbox.mailboxId, sourceMessageId: messageId, ownerUserId: mailbox.userId, sender: fromAddr, headers: payload.headers, status, folderId, spamVerdict: spamAnalysis?.verdict, spamAnalysisError });
 	} catch (error) { console.error("Auto-draft scheduling failed", error); }
+	// The row now references the canonical object; the per-event staging object
+	// (when there is one) is consumed. Member copies already live at storedKey.
+	if (payload.rawR2Key !== storedKey) {
+		await env.BUCKET.delete(payload.rawR2Key).catch((error) => console.error(`Raw cleanup failed for ${payload.rawR2Key}`, error));
+	}
 }
 
 export async function getMessageWithBody(env: CloudflareEnv, userId: string, messageId: string) {

@@ -1,9 +1,9 @@
-import { and, eq } from "drizzle-orm";
+import { and, asc, eq } from "drizzle-orm";
 import { getDb, type AppDatabase } from "@/db";
-import { mailingListMembers } from "@/db/schema";
+import { domains, mailboxes, mailingListMembers } from "@/db/schema";
 import { normalizeEmailAddress } from "@/lib/email/address";
-import { inboundStorageKey } from "@/lib/email/inbound-id";
-import { resolveInboundAddress, type ResolvedList, type ResolvedMailbox } from "@/lib/email/routing";
+import { deleteUnreferencedRawMail, heldInboundKey, inboundStorageKey, mailboxInboundScope } from "@/lib/email/inbound-id";
+import { resolveInboundAddress, resolveMailboxIdentity, type ResolvedList, type ResolvedMailbox } from "@/lib/email/routing";
 import type { InboundQueueMessage } from "@/lib/email/inbound";
 
 /**
@@ -44,6 +44,13 @@ export type MailingListExpansion = {
  * for a post held for review. It propagates through nested lists, and a nested
  * list that would itself hold the sender's post also restricts that branch to
  * its owners, so a held post only ever reaches mailboxes that can review it.
+ *
+ * The delivery set is a union over expansion branches, not traversal order:
+ * a mailbox deliverable through any branch gets the copy, so a member reached
+ * only through a held branch is skipped while the same member reached through
+ * an unheld sibling branch still receives the post. Skipped members are
+ * reported, never subtracted — which branch a mailbox came through cannot
+ * make another branch's copy undeliverable.
  */
 export async function expandMailingListDeliveries(
 	db: AppDatabase,
@@ -57,11 +64,55 @@ export async function expandMailingListDeliveries(
 
 	// Sender dedup: a member posting to the list does not get a copy of their
 	// own post, whether their member row uses the address they sent from or an
-	// alias of the same mailbox.
-	const sender = await resolveInboundAddress(db, envelopeFrom ?? "", null, { skipPostingAuth: true });
-	if (sender?.mailbox) deliveries.delete(sender.mailbox.mailboxId);
+	// alias of the same mailbox. The identity lookup — not the delivery
+	// resolver — decides whose mailbox the sender owns, so a catch-all cannot
+	// fold an unrelated sender onto a member mailbox and suppress their copy.
+	// For a held post the reviewers are the deliveries: suppression only
+	// applies while at least one other reviewer remains, since echo-free
+	// delivery must not leave a held post with nobody who can act on it.
+	const senderMailbox = await resolveMailboxIdentity(db, envelopeFrom ?? "");
+	if (senderMailbox && (!options.ownersOnly || deliveries.size > 1)) {
+		deliveries.delete(senderMailbox.mailboxId);
+	}
+
+	if (options.ownersOnly && !deliveries.size) {
+		// A held post must land with a reviewer: when no owner member resolves,
+		// the list's owning user's mailbox is the reviewer of last resort.
+		const fallback = await resolveFallbackReviewer(db, list);
+		if (fallback) deliveries.set(fallback.mailboxId, { address: `${fallback.localPart}@${fallback.hostname}`, mailbox: fallback });
+	}
 
 	return { deliveries: [...deliveries.values()], skipped };
+}
+
+/**
+ * The reviewer of last resort for a held post: the list's owning user's
+ * mailbox, preferring one on the list's domain but accepting any of their
+ * mailboxes — the point is only that a held copy reaches someone who can act
+ * on it. Returns null when the owner has no enabled mailbox at all; the caller
+ * then retains the raw object instead of delivering.
+ */
+async function resolveFallbackReviewer(
+	db: AppDatabase,
+	list: ResolvedList,
+): Promise<ResolvedMailbox | null> {
+	const rows = await db
+		.select({ mailbox: mailboxes, hostname: domains.hostname })
+		.from(mailboxes)
+		.innerJoin(domains, eq(mailboxes.domainId, domains.id))
+		.where(and(eq(mailboxes.userId, list.userId), eq(mailboxes.disabled, false)))
+		.orderBy(asc(mailboxes.createdAt));
+	const pick = rows.find((row) => row.mailbox.domainId === list.domainId) ?? rows[0];
+	if (!pick) return null;
+	return {
+		mailboxId: pick.mailbox.id,
+		folderId: null,
+		userId: pick.mailbox.userId,
+		domainId: pick.mailbox.domainId,
+		localPart: pick.mailbox.localPart,
+		hostname: pick.hostname,
+		displayName: pick.mailbox.displayName,
+	};
 }
 
 async function collectMemberDeliveries(
@@ -139,9 +190,13 @@ async function collectMemberDeliveries(
  *
  * A post the routing decision held for review (`ownersOnly`) goes only to the
  * list's owner members — the reviewers — instead of the full membership. The
- * owner copy is the moderation notice: approving means reposting or forwarding
- * to the list as an owner. A real pending-posts queue with approve/discard is
- * a later slice.
+ * reviewer copy is the moderation notice: an owner approves by reposting or
+ * forwarding the message to the list, which a list-level `moderated` flag
+ * does not re-hold because owner senders are exempt from it (a member-level
+ * `moderated` flag on the owner still holds). When no owner member resolves,
+ * the list's owning user's mailbox reviews it; when even that fails, the raw
+ * is retained under `held/` so the post is never silently discarded. A real
+ * pending-posts queue with approve/discard is a later slice.
  */
 export async function deliverToMailingList(
 	env: CloudflareEnv,
@@ -159,8 +214,27 @@ export async function deliverToMailingList(
 		console.info(`Mailing list ${list.localPart}@${list.hostname}: skipped ${skipped.map((member) => `${member.email} (${member.reason})`).join(", ")}`);
 	}
 	if (!deliveries.length) {
+		if (options.ownersOnly) {
+			// A held post must never vanish silently: retain the raw under a
+			// content-keyed `held/` object (retries idempotent) where ops or a
+			// later moderation surface can recover it.
+			const raw = await env.BUCKET.get(payload.rawR2Key);
+			if (!raw) {
+				console.error(`Missing R2 object: ${payload.rawR2Key}`);
+				return;
+			}
+			const buffer = await raw.arrayBuffer();
+			const heldKey = await heldInboundKey(list.listId, buffer);
+			await env.BUCKET.put(heldKey, buffer, {
+				httpMetadata: { contentType: "message/rfc822" },
+				customMetadata: { from: payload.from, to: payload.to },
+			});
+			await deleteUnreferencedRawMail(env, db, payload.rawR2Key);
+			console.warn(`Mailing list ${list.localPart}@${list.hostname}: held post retained at ${heldKey} — no reviewer could receive it`);
+			return;
+		}
 		console.warn(`Mailing list ${list.localPart}@${list.hostname} has no deliverable members`);
-		await env.BUCKET.delete(payload.rawR2Key).catch((error) => console.error(`Raw cleanup failed for ${payload.rawR2Key}`, error));
+		await deleteUnreferencedRawMail(env, db, payload.rawR2Key);
 		return;
 	}
 
@@ -173,7 +247,7 @@ export async function deliverToMailingList(
 
 	let firstError: unknown = null;
 	for (const delivery of deliveries) {
-		const rawR2Key = await inboundStorageKey(buffer, delivery.mailbox.mailboxId);
+		const rawR2Key = await inboundStorageKey(buffer, mailboxInboundScope(delivery.mailbox.mailboxId));
 		await env.BUCKET.put(rawR2Key, buffer, {
 			httpMetadata: { contentType: "message/rfc822" },
 			customMetadata: { from: payload.from, to: delivery.address },
@@ -188,5 +262,5 @@ export async function deliverToMailingList(
 	// Keep the source object while any member still needs the retry; once every
 	// member's own copy is stored the original is unreferenced.
 	if (firstError) throw firstError;
-	await env.BUCKET.delete(payload.rawR2Key).catch((error) => console.error(`Raw cleanup failed for ${payload.rawR2Key}`, error));
+	await deleteUnreferencedRawMail(env, db, payload.rawR2Key);
 }
