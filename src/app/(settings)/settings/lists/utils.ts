@@ -41,12 +41,16 @@ export function removeMailingListFromIndex(qc: QueryClient, id: string) {
 	);
 }
 
-export async function refetchMailingListIndex(qc: QueryClient) {
+export function refetchMailingListIndex(qc: QueryClient) {
 	// A pending first-load GET has no cached data, so an implicit invalidation refetch
 	// coalesces with it instead of replacing it — a stale pre-mutation response would
-	// land last and hide a fresh create. Cancel the exact query first.
-	await qc.cancelQueries({ queryKey: ["mailing-lists"], exact: true });
-	return qc.invalidateQueries({ queryKey: ["mailing-lists"], exact: true, refetchType: "all" });
+	// land last and hide a fresh create. Cancel the exact query first. Fire-and-forget:
+	// a mutation's pending lifetime must not extend to this post-commit refresh —
+	// a stalled GET would hold the per-list write gate open after the write committed.
+	void qc
+		.cancelQueries({ queryKey: ["mailing-lists"], exact: true })
+		.then(() => qc.invalidateQueries({ queryKey: ["mailing-lists"], exact: true, refetchType: "all" }))
+		.catch(() => {});
 }
 
 export async function fetchMailingLists(): Promise<MailingListsResponse> {

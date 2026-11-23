@@ -26,7 +26,7 @@ export function ListDangerCard({ list }: { list: MailingList }) {
 			removeMailingListFromIndex(qc, list.id);
 			// Drop the detail snapshot too — a cached URL must not resurrect dead controls.
 			qc.removeQueries({ queryKey: ["mailing-list", list.id] });
-			await refetchMailingListIndex(qc);
+			refetchMailingListIndex(qc);
 			router.push("/settings/lists");
 		},
 	});

@@ -282,11 +282,15 @@ test("deleting a list drops it from the index and clears its detail cache", asyn
 	const detailContainer = newContainer(t);
 	const detailRoot = await mount(t, client, MailingListDetailPage, detailContainer);
 	await settle();
+	// Hold the scheduled index refresh — the redirect must not wait on it.
+	let releaseIndex;
+	state.deferIndex = new Promise(r => { releaseIndex = r; });
 	const del = [...detailContainer.querySelectorAll("button")].find(b => b.textContent.includes("mailingLists.delete"));
 	await click(del);
 	await settle();
 
-	assert.deepEqual(globalThis.__listsCacheTestRouter.pushes, ["/settings/lists"]);
+	assert.deepEqual(globalThis.__listsCacheTestRouter.pushes, ["/settings/lists"], "redirects without waiting on the held GET");
+	await act(async () => { releaseIndex(); state.deferIndex = null; await new Promise(r => setTimeout(r, 30)); });
 	assert.equal(client.getQueryData(["mailing-list", "list-1"]), undefined, "the detail cache is dropped");
 	await unmount(detailRoot, detailContainer);
 
@@ -368,6 +372,7 @@ test("a create during the first index load survives the stale GET landing last",
 	await click(createButton);
 	await settle();
 
+	assert.equal(container.querySelector("#list-localpart"), null, "the dialog closes without waiting for the held GET");
 	// The stale first-load response lands now — after the mutation already applied.
 	await act(async () => { releaseIndex(); state.deferIndex = null; await new Promise(r => setTimeout(r, 30)); });
 
@@ -424,6 +429,7 @@ test("a member write landing on a dropped detail cache restarts the in-flight GE
 
 	// The write lands: it cancels the cold GET, finds no snapshot, and must restart it.
 	await act(async () => { releaseRemove(); state.deferMembers = null; await new Promise(r => setTimeout(r, 20)); });
+	assert.equal(client.isMutating(), 0, "the write settles without waiting on the restarted GET");
 	await act(async () => { releaseDetail(); state.deferDetail = null; await new Promise(r => setTimeout(r, 30)); });
 
 	const cached = client.getQueryData(["mailing-list", "list-1"]);
@@ -511,4 +517,36 @@ test("closing a dialog while a write is pending moves focus to a focusable fallb
 
 	await act(async () => { release(); state.deferMembers = null; await new Promise(r => setTimeout(r, 30)); });
 	await unmount(root, container);
+});
+
+test("member controls re-enable while the post-write index refresh is still in flight", async t => {
+	const client = testClient();
+	t.after(() => client.clear());
+
+	// Warm index first so the scheduled refresh is a real GET we can hold.
+	const indexContainer = newContainer(t);
+	const indexRoot = await mount(t, client, MailingListsPage, indexContainer);
+	await settle();
+	assert.match(indexContainer.textContent, /team@example.com/);
+	let releaseIndex;
+	state.deferIndex = new Promise(r => { releaseIndex = r; });
+
+	const detailContainer = newContainer(t);
+	const detailRoot = await mount(t, client, MailingListDetailPage, detailContainer);
+	await settle();
+	const remove = detailContainer.querySelector('button[aria-label="mailingLists.removeMember"]');
+	await click(remove);
+	await settle();
+
+	// The write committed; the scheduled index GET is still held.
+	assert.equal(client.isMutating(), 0, "the write is not pending on the refresh GET");
+	const addButton = [...detailContainer.querySelectorAll("button")].find(b => b.textContent.includes("mailingLists.addMember"));
+	assert.equal(addButton.disabled, false, "member actions re-enable while the GET is held");
+	const deleteButton = [...detailContainer.querySelectorAll("button")].find(b => b.textContent === "mailingLists.delete");
+	assert.equal(deleteButton.disabled, false, "delete re-enables while the GET is held");
+	assert.equal(detailContainer.querySelectorAll('button[aria-label="mailingLists.removeMember"]').length, 1);
+
+	await act(async () => { releaseIndex(); state.deferIndex = null; await new Promise(r => setTimeout(r, 30)); });
+	await unmount(detailRoot, detailContainer);
+	await unmount(indexRoot, indexContainer);
 });

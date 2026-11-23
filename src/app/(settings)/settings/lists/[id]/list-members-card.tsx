@@ -29,8 +29,8 @@ export function ListMembersCard({ listId, members, loading }: ListMembersCardPro
 	const openerRef = useRef<HTMLElement | null>(null);
 	const cardRef = useRef<HTMLDivElement | null>(null);
 
-	// Every write on this list shares one mutation scope so an earlier snapshot
-	// arriving last can never overwrite a newer one.
+	// Member writes and the list delete share one mutation scope so an earlier
+	// snapshot arriving last can never overwrite a newer one.
 	const memberBusy = useIsMutating({ mutationKey: mailingListWritesKey(listId) }) > 0;
 
 	const remove = useMutation({
@@ -42,7 +42,7 @@ export function ListMembersCard({ listId, members, loading }: ListMembersCardPro
 				members: updated,
 			}));
 			updateMailingListInIndex(qc, { id: listId, memberCount: updated.length });
-			await refetchMailingListIndex(qc);
+			refetchMailingListIndex(qc);
 		},
 	});
 
@@ -54,8 +54,9 @@ export function ListMembersCard({ listId, members, loading }: ListMembersCardPro
 	}
 
 	return (
-		// tabIndex -1: programmatic focus target when dialog close finds the opener disabled.
-		<div ref={cardRef} tabIndex={-1} className="outline-none">
+		// tabIndex -1: programmatic focus target when dialog close finds the opener
+		// disabled — the ring keeps a visible indication on the fallback.
+		<div ref={cardRef} tabIndex={-1} className="focus:outline-none focus:ring-2 focus:ring-blue-600">
 		<Card className="rounded-3xl border-0 bg-white p-6">
 			<CardHeader className="py-0">
 				<div className="flex items-center justify-between gap-4">

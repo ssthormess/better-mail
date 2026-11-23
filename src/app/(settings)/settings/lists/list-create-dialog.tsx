@@ -49,9 +49,9 @@ export function ListCreateDialog() {
 				postingPolicy,
 				moderated,
 			}),
-		onSuccess: async ({ list }) => {
+		onSuccess: ({ list }) => {
 			insertMailingListIntoIndex(qc, list);
-			await refetchMailingListIndex(qc);
+			refetchMailingListIndex(qc);
 			setOpen(false);
 			setName("");
 			setLocalPart("");

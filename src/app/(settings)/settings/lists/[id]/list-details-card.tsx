@@ -52,7 +52,7 @@ export function ListDetailsCard({ list }: { list: MailingList }) {
 				list: { ...current.list, ...updated },
 			}));
 			updateMailingListInIndex(qc, updated);
-			await refetchMailingListIndex(qc);
+			refetchMailingListIndex(qc);
 		},
 	});
 

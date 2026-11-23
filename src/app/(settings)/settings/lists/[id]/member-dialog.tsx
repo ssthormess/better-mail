@@ -37,8 +37,8 @@ export function MemberDialog({ listId, member, open, onOpenChange, onCloseAutoFo
 	const [role, setRole] = useState<"owner" | "member">(member?.role ?? "member");
 	const [moderated, setModerated] = useState(member?.moderated ?? false);
 
-	// Another write on this list (a remove, even the list delete) may be in flight —
-	// writes share one mutation scope so arrival order can't undo a newer snapshot.
+	// Member writes and the list delete share one mutation scope — while any is in
+	// flight the others wait, so arrival order can't undo a newer snapshot.
 	const memberBusy = useIsMutating({ mutationKey: mailingListWritesKey(listId) }) > 0;
 	// A pending save can outlive the dialog: only close when this instance is still
 	// open. The parent remounts the dialog on every open, so the unmount cleanup
@@ -74,7 +74,7 @@ export function MemberDialog({ listId, member, open, onOpenChange, onCloseAutoFo
 				members,
 			}));
 			updateMailingListInIndex(qc, { id: listId, memberCount: members.length });
-			await refetchMailingListIndex(qc);
+			refetchMailingListIndex(qc);
 			if (openRef.current) onOpenChange(false);
 		},
 	});
