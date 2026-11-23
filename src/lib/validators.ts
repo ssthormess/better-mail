@@ -356,14 +356,14 @@ export const updateMailboxSchema = z.object({
 	useAllDomains: z.boolean().optional(),
 });
 
-// List and member names surface in mail headers and display contexts, so they
-// take the same control/format-character refusal as alias labels.
-const mailingListNameSchema = z.string().trim().min(1).max(100).regex(/^[^\p{Cc}\p{Cf}]*$/u);
+// List, member and group names surface in mail headers and display contexts,
+// so they take the same control/format-character refusal as alias labels.
+const safeDisplayNameSchema = z.string().trim().min(1).max(100).regex(/^[^\p{Cc}\p{Cf}]*$/u);
 
 export const mailingListSchema = z.object({
 	domainId: z.string().min(1),
 	localPart: z.string().min(1).max(64).regex(/^[a-zA-Z0-9._%+-]+$/),
-	name: mailingListNameSchema,
+	name: safeDisplayNameSchema,
 	description: z.string().trim().max(1000).optional(),
 	postingPolicy: z.enum(["members_only", "anyone"]).optional(),
 	moderated: z.boolean().optional(),
@@ -375,7 +375,7 @@ export const mailingListSchema = z.object({
 	});
 
 export const updateMailingListSchema = z.object({
-	name: mailingListNameSchema.optional(),
+	name: safeDisplayNameSchema.optional(),
 	description: z.string().trim().max(1000).nullable().optional(),
 	postingPolicy: z.enum(["members_only", "anyone"]).optional(),
 	moderated: z.boolean().optional(),
@@ -395,6 +395,29 @@ export const updateMailingListMemberSchema = z.object({
 	role: z.enum(["owner", "member"]).optional(),
 	moderated: z.boolean().optional(),
 });
+
+// Groups organize the mailbox owner's address book, so every call carries the
+// mailbox whose book it manages — the contacts API resolves its owner the same way.
+export const contactGroupSchema = z.object({
+	mailboxId: z.string().min(1),
+	name: safeDisplayNameSchema,
+});
+
+export const updateContactGroupSchema = z.object({
+	mailboxId: z.string().min(1),
+	name: safeDisplayNameSchema.optional(),
+});
+
+/** Members are named two ways so callers need no lookup of their own: a contact id, or its address. */
+export const contactGroupMemberSchema = z
+	.object({
+		mailboxId: z.string().min(1),
+		contactId: z.string().min(1).optional(),
+		email: z.string().trim().toLowerCase().email().optional(),
+	})
+	.refine((value) => !!value.contactId !== !!value.email, {
+		message: "Exactly one of contactId or email is required",
+	});
 
 export const folderSchema = z.object({
 	mailboxId: z.string().min(1),
