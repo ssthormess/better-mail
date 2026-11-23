@@ -464,10 +464,12 @@ export async function resolveMailboxIdentity(
  * reviewers — an owner approving a held post does so by reposting to the list.
  * A member-level `moderated` flag is honored at every role, so a moderated
  * owner's repost is re-held for the remaining owners: approval by repost
- * needs at least one unmoderated owner, and a list that moderates every
- * owner row leaves approval to the `held/` operator path. When several
- * member rows map to the sender's mailbox, any moderated one holds the post
- * and any owner one exempts the list flag.
+ * needs at least one unmoderated owner. A list that moderates every owner
+ * row still delivers its reviewer copies but has no built-in approval path —
+ * every repost re-holds, so the hold clears only when an operator acts on a
+ * delivered copy or unflags a row. When several member rows map to the
+ * sender's mailbox, any moderated one holds the post and any owner one
+ * exempts the list flag.
  *
  * Only rows that can still change the outcome are resolved: once membership
  * and every flag that matters are settled, the rest of the member list is

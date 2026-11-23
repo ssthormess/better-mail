@@ -524,6 +524,112 @@ test("a leaf reached through held and unheld paths delivers the union in either 
 	}
 });
 
+test("a full visit to a shared leaf cannot satisfy a held branch's reviewer expansion", async (t) => {
+	t.mock.method(console, "info", () => {});
+	// Diamond: eng holds ann's post and reaches ops only as an owner member;
+	// aux reaches ops unrestricted. ann is ops's owner — and the sender —
+	// so she is the designated reviewer; bob is ops's ordinary member.
+	for (const engFirst of [true, false]) {
+		const { env, database, objects, queued } = await setup(t);
+		insertList(database, {
+			id: "all",
+			localPart: "all",
+			postingPolicy: "anyone",
+			members: engFirst ? ["eng@one.test", "aux@one.test"] : ["aux@one.test", "eng@one.test"],
+		});
+		insertList(database, { id: "eng", localPart: "eng", postingPolicy: "anyone", moderated: 1, members: [{ email: "ops@one.test", role: "owner" }] });
+		insertList(database, { id: "aux", localPart: "aux", postingPolicy: "anyone", members: ["ops@one.test"] });
+		insertList(database, {
+			id: "ops",
+			localPart: "ops",
+			postingPolicy: "anyone",
+			members: [{ email: "ann@one.test", role: "owner" }, "bob@one.test"],
+		});
+
+		await intake(env, "all@one.test", "ann@one.test");
+		await processInboundMessage(env, queued[0]);
+
+		// aux-first used to expand ops "full" into the ordinary set, which the
+		// held branch then took as done — eng's reviewer pass skipped ops, ann
+		// lost her reviewer copy to suppression and the hold fell to a fallback.
+		assert.deepEqual(
+			new Set(mailByMailbox(database).map((row) => row.mailboxId)),
+			new Set(["annbox", "bobbox"]),
+			`traversal order engFirst=${engFirst} changed the delivery set`,
+		);
+		assert.equal([...objects.keys()].filter((key) => key.startsWith("held/")).length, 0);
+	}
+});
+
+test("two held parents sharing one held child both get its reviewers", async (t) => {
+	t.mock.method(console, "info", () => {});
+	const { env, database, objects, queued } = await setup(t);
+	insertList(database, { id: "all", localPart: "all", postingPolicy: "anyone", members: ["h1@one.test", "h2@one.test"] });
+	insertList(database, { id: "h1", localPart: "h1", postingPolicy: "anyone", moderated: 1, members: [{ email: "h3@one.test", role: "owner" }] });
+	insertList(database, { id: "h2", localPart: "h2", postingPolicy: "anyone", moderated: 1, members: [{ email: "h3@one.test", role: "owner" }] });
+	insertList(database, { id: "h3", localPart: "h3", postingPolicy: "anyone", moderated: 1, members: [{ email: "carol@one.test", role: "owner" }] });
+
+	// h3 holds the stranger's post for both parents; whoever expanded h3
+	// first must not consume its reviewer set on behalf of the other.
+	await intake(env, "all@one.test", "stranger@elsewhere.test");
+	await processInboundMessage(env, queued[0]);
+
+	assert.deepEqual(mailByMailbox(database).map((row) => row.mailboxId), ["carolbox"]);
+	assert.equal([...objects.keys()].filter((key) => key.startsWith("held/")).length, 0);
+});
+
+test("a held list reached too deep is still handled by a later shallow path", async (t) => {
+	t.mock.method(console, "info", () => {});
+	t.mock.method(console, "warn", () => {});
+	// eng sits at depth 5 through the c1..c4 chain — over the expansion cap —
+	// and at depth 1 as a direct member. Whichever path runs first, eng's
+	// hold must be evaluated at the depth that can actually expand it.
+	for (const deepFirst of [true, false]) {
+		const { env, database, objects, queued } = await setup(t);
+		insertList(database, {
+			id: "all",
+			localPart: "all",
+			postingPolicy: "anyone",
+			members: deepFirst ? ["c1@one.test", "eng@one.test"] : ["eng@one.test", "c1@one.test"],
+		});
+		insertList(database, { id: "c1", localPart: "c1", postingPolicy: "anyone", members: ["c2@one.test"] });
+		insertList(database, { id: "c2", localPart: "c2", postingPolicy: "anyone", members: ["c3@one.test"] });
+		insertList(database, { id: "c3", localPart: "c3", postingPolicy: "anyone", members: ["c4@one.test"] });
+		insertList(database, { id: "c4", localPart: "c4", postingPolicy: "anyone", members: ["eng@one.test"] });
+		insertList(database, { id: "eng", localPart: "eng", postingPolicy: "anyone", moderated: 1, members: [{ email: "carol@one.test", role: "owner" }] });
+
+		await intake(env, "all@one.test", "stranger@elsewhere.test");
+		await processInboundMessage(env, queued[0]);
+
+		assert.deepEqual(
+			mailByMailbox(database).map((row) => row.mailboxId),
+			["carolbox"],
+			`traversal order deepFirst=${deepFirst} changed the outcome`,
+		);
+		assert.equal([...objects.keys()].filter((key) => key.startsWith("held/")).length, 0);
+	}
+});
+
+test("a held list reachable only past the depth cap is retained", async (t) => {
+	t.mock.method(console, "info", () => {});
+	t.mock.method(console, "warn", () => {});
+	const { env, database, objects, queued } = await setup(t);
+	insertList(database, { id: "all", localPart: "all", postingPolicy: "anyone", members: ["c1@one.test"] });
+	insertList(database, { id: "c1", localPart: "c1", postingPolicy: "anyone", members: ["c2@one.test"] });
+	insertList(database, { id: "c2", localPart: "c2", postingPolicy: "anyone", members: ["c3@one.test"] });
+	insertList(database, { id: "c3", localPart: "c3", postingPolicy: "anyone", members: ["c4@one.test"] });
+	insertList(database, { id: "c4", localPart: "c4", postingPolicy: "anyone", members: ["eng@one.test"] });
+	insertList(database, { id: "eng", localPart: "eng", postingPolicy: "anyone", moderated: 1, members: [{ email: "carol@one.test", role: "owner" }] });
+
+	// eng's reviewers exist but sit one level beyond the cap, so the hold
+	// retains rather than fabricating a delivery it cannot complete.
+	await intake(env, "all@one.test", "stranger@elsewhere.test");
+	await processInboundMessage(env, queued[0]);
+
+	assert.equal(mailByMailbox(database).length, 0);
+	assert.ok([...objects.keys()].some((key) => key.startsWith("held/eng/")), "held raw retained for the capped child");
+});
+
 test("a pre-staging payload consumed after the staged copy still dedupes on the canonical key", async (t) => {
 	t.mock.method(console, "info", () => {});
 	const { env, database, objects, queued } = await setup(t);
