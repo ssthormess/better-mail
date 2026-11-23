@@ -874,6 +874,17 @@
         "ALTER TABLE `mailboxes` ADD `auto_reply_end_at` integer;",
         "ALTER TABLE `mailboxes` ADD `auto_reply_activated_at` integer;"
       ]
+    },
+    {
+      "name": "0094_mailing_lists.sql",
+      "statements": [
+        "CREATE TABLE `mailing_lists` (\n\t`id` text PRIMARY KEY NOT NULL,\n\t`user_id` text NOT NULL,\n\t`domain_id` text NOT NULL,\n\t`local_part` text NOT NULL,\n\t`name` text NOT NULL,\n\t`description` text,\n\t`disabled` integer DEFAULT false NOT NULL,\n\t`created_at` integer NOT NULL,\n\tFOREIGN KEY (`user_id`) REFERENCES `users`(`id`) ON UPDATE no action ON DELETE cascade,\n\tFOREIGN KEY (`domain_id`) REFERENCES `domains`(`id`) ON UPDATE no action ON DELETE cascade\n);",
+        "CREATE TABLE `mailing_list_members` (\n\t`id` text PRIMARY KEY NOT NULL,\n\t`list_id` text NOT NULL,\n\t`email` text NOT NULL,\n\t`name` text,\n\t`role` text DEFAULT 'member' NOT NULL,\n\t`created_at` integer NOT NULL,\n\tFOREIGN KEY (`list_id`) REFERENCES `mailing_lists`(`id`) ON UPDATE no action ON DELETE cascade\n);",
+        "CREATE UNIQUE INDEX `mailing_lists_address_idx` ON `mailing_lists` (`domain_id`,`local_part`);",
+        "CREATE INDEX `mailing_lists_user_idx` ON `mailing_lists` (`user_id`);",
+        "CREATE UNIQUE INDEX `mailing_list_members_list_email_idx` ON `mailing_list_members` (`list_id`,`email`);",
+        "CREATE INDEX `mailing_list_members_list_idx` ON `mailing_list_members` (`list_id`);"
+      ]
     }
   ]
 }

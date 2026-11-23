@@ -425,6 +425,20 @@
         "ALTER TABLE \"mailboxes\" ADD COLUMN \"auto_reply_end_at\" bigint;",
         "ALTER TABLE \"mailboxes\" ADD COLUMN \"auto_reply_activated_at\" bigint;"
       ]
+    },
+    {
+      "name": "0018_mailing_lists.sql",
+      "statements": [
+        "CREATE TABLE \"mailing_lists\" (\n\t\"id\" text PRIMARY KEY NOT NULL,\n\t\"user_id\" text NOT NULL,\n\t\"domain_id\" text NOT NULL,\n\t\"local_part\" text NOT NULL,\n\t\"name\" text NOT NULL,\n\t\"description\" text,\n\t\"disabled\" boolean DEFAULT false NOT NULL,\n\t\"created_at\" bigint NOT NULL\n);",
+        "CREATE TABLE \"mailing_list_members\" (\n\t\"id\" text PRIMARY KEY NOT NULL,\n\t\"list_id\" text NOT NULL,\n\t\"email\" text NOT NULL,\n\t\"name\" text,\n\t\"role\" text DEFAULT 'member' NOT NULL,\n\t\"created_at\" bigint NOT NULL\n);",
+        "ALTER TABLE \"mailing_lists\" ADD CONSTRAINT \"mailing_lists_user_id_users_id_fk\" FOREIGN KEY (\"user_id\") REFERENCES \"public\".\"users\"(\"id\") ON DELETE cascade ON UPDATE no action;",
+        "ALTER TABLE \"mailing_lists\" ADD CONSTRAINT \"mailing_lists_domain_id_domains_id_fk\" FOREIGN KEY (\"domain_id\") REFERENCES \"public\".\"domains\"(\"id\") ON DELETE cascade ON UPDATE no action;",
+        "ALTER TABLE \"mailing_list_members\" ADD CONSTRAINT \"mailing_list_members_list_id_mailing_lists_id_fk\" FOREIGN KEY (\"list_id\") REFERENCES \"public\".\"mailing_lists\"(\"id\") ON DELETE cascade ON UPDATE no action;",
+        "CREATE UNIQUE INDEX \"mailing_lists_address_idx\" ON \"mailing_lists\" USING btree (\"domain_id\",\"local_part\");",
+        "CREATE INDEX \"mailing_lists_user_idx\" ON \"mailing_lists\" USING btree (\"user_id\");",
+        "CREATE UNIQUE INDEX \"mailing_list_members_list_email_idx\" ON \"mailing_list_members\" USING btree (\"list_id\",\"email\");",
+        "CREATE INDEX \"mailing_list_members_list_idx\" ON \"mailing_list_members\" USING btree (\"list_id\");"
+      ]
     }
   ]
 }

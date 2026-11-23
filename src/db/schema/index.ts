@@ -1442,6 +1442,52 @@ export const importJobs = sqliteTable("import_jobs", {
 	finishedAt: timestamp("finished_at"),
 }, (t) => [index("import_jobs_user_idx").on(t.userId, t.createdAt), index("import_jobs_status_idx").on(t.status, t.updatedAt)]);
 
+/**
+ * A mailing list receives mail at localPart@domain and fans it out to every
+ * member. The address columns mirror `mailboxes` so inbound resolution looks
+ * a list up the same way it finds a mailbox.
+ */
+export const mailingLists = sqliteTable(
+	"mailing_lists",
+	{
+		id: text("id").primaryKey(),
+		userId: text("user_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "cascade" }),
+		domainId: text("domain_id")
+			.notNull()
+			.references(() => domains.id, { onDelete: "cascade" }),
+		localPart: text("local_part").notNull(),
+		name: text("name").notNull(),
+		description: text("description"),
+		disabled: bool("disabled").notNull().default(false),
+		createdAt: timestamp("created_at")
+			.notNull()
+			.$defaultFn(() => new Date()),
+	},
+	(t) => [uniqueIndex("mailing_lists_address_idx").on(t.domainId, t.localPart), index("mailing_lists_user_idx").on(t.userId)],
+);
+
+export const mailingListMembers = sqliteTable(
+	"mailing_list_members",
+	{
+		id: text("id").primaryKey(),
+		listId: text("list_id")
+			.notNull()
+			.references(() => mailingLists.id, { onDelete: "cascade" }),
+		email: text("email").notNull(),
+		name: text("name"),
+		role: text("role", { enum: ["owner", "member"] }).notNull().default("member"),
+		createdAt: timestamp("created_at")
+			.notNull()
+			.$defaultFn(() => new Date()),
+	},
+	(t) => [
+		uniqueIndex("mailing_list_members_list_email_idx").on(t.listId, t.email),
+		index("mailing_list_members_list_idx").on(t.listId),
+	],
+);
+
 export const schema = {
 	users,
 	domains,
@@ -1487,4 +1533,6 @@ export const schema = {
 	agentSendApprovals,
 	mcpKeyMailboxes,
 	importJobs,
+	mailingLists,
+	mailingListMembers,
 };

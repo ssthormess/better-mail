@@ -394,6 +394,18 @@
         "ALTER TABLE `mailboxes` ADD `auto_reply_end_at` bigint;",
         "ALTER TABLE `mailboxes` ADD `auto_reply_activated_at` bigint;"
       ]
+    },
+    {
+      "name": "0018_mailing_lists.sql",
+      "statements": [
+        "CREATE TABLE `mailing_lists` (\n\t`id` varchar(191) NOT NULL,\n\t`user_id` varchar(191) NOT NULL,\n\t`domain_id` varchar(191) NOT NULL,\n\t`local_part` varchar(191) NOT NULL,\n\t`name` longtext NOT NULL,\n\t`description` longtext,\n\t`disabled` boolean NOT NULL DEFAULT false,\n\t`created_at` bigint NOT NULL,\n\tCONSTRAINT `mailing_lists_id` PRIMARY KEY(`id`),\n\tCONSTRAINT `mailing_lists_address_idx` UNIQUE(`domain_id`,`local_part`)\n);",
+        "CREATE TABLE `mailing_list_members` (\n\t`id` varchar(191) NOT NULL,\n\t`list_id` varchar(191) NOT NULL,\n\t`email` varchar(320) NOT NULL,\n\t`name` longtext,\n\t`role` varchar(64) NOT NULL DEFAULT 'member',\n\t`created_at` bigint NOT NULL,\n\tCONSTRAINT `mailing_list_members_id` PRIMARY KEY(`id`),\n\tCONSTRAINT `mailing_list_members_list_email_idx` UNIQUE(`list_id`,`email`)\n);",
+        "ALTER TABLE `mailing_lists` ADD CONSTRAINT `mailing_lists_user_id_users_id_fk` FOREIGN KEY (`user_id`) REFERENCES `users`(`id`) ON DELETE cascade ON UPDATE no action;",
+        "ALTER TABLE `mailing_lists` ADD CONSTRAINT `mailing_lists_domain_id_domains_id_fk` FOREIGN KEY (`domain_id`) REFERENCES `domains`(`id`) ON DELETE cascade ON UPDATE no action;",
+        "ALTER TABLE `mailing_list_members` ADD CONSTRAINT `mailing_list_members_list_id_mailing_lists_id_fk` FOREIGN KEY (`list_id`) REFERENCES `mailing_lists`(`id`) ON DELETE cascade ON UPDATE no action;",
+        "CREATE INDEX `mailing_lists_user_idx` ON `mailing_lists` (`user_id`);",
+        "CREATE INDEX `mailing_list_members_list_idx` ON `mailing_list_members` (`list_id`);"
+      ]
     }
   ]
 }
