@@ -49,7 +49,7 @@ export type ContactImportPreview = {
 		existing: number;
 		invalid: number;
 		duplicates: number;
-		/** Stored contacts the delegated visibility scan could not verify — shown honestly instead of claimed new. */
+		/** Candidates the delegated visibility scan could not verify — shown honestly instead of claimed new. */
 		unknown: number;
 		/** Rows the parser dropped before classification (over-cap, unreadable cards). */
 		skipped: number;
