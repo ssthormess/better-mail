@@ -57,15 +57,15 @@ function d1(sqlite) {
 }
 
 /**
- * A migrated database; with `laterTables` false the migrations that introduced
- * LATER_MIGRATION_TABLES members like mailing_lists are skipped, standing in for
- * an installation whose database lags its code.
+ * A migrated database; `skip` marks the migrations that introduced
+ * LATER_MIGRATION_TABLES members like mailing_lists or contact_groups, standing
+ * in for an installation whose database lags its code.
  */
-function database({ laterTables = true } = {}) {
+function database({ skip = [] } = {}) {
 	const sqlite = new Database(":memory:");
 	sqlite.pragma("foreign_keys = ON");
 	for (const migration of migrations) {
-		if (!laterTables && migration.name.includes("mailing_lists")) continue;
+		if (skip.some((marker) => migration.name.includes(marker))) continue;
 		for (const statement of migration.statements) sqlite.exec(statement);
 	}
 	return sqlite;
@@ -84,7 +84,7 @@ function addUser(sqlite) {
 const buffer = (bytes) => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
 
 test("an export on a database without the mailing list tables succeeds and ships them empty", async () => {
-	const sqlite = database({ laterTables: false });
+	const sqlite = database({ skip: ["mailing_lists"] });
 	addUser(sqlite);
 	const backup = await exportDatabaseRecords(d1(sqlite));
 	const document = JSON.parse(new TextDecoder().decode(backup));
@@ -118,11 +118,58 @@ test("a document carrying list rows is rejected before any row is deleted on an 
 		INSERT INTO mailing_list_members (id, list_id, email, role, created_at) VALUES ('m1', 'l1', 'a@example.net', 'member', 1);`);
 	const backup = await exportDatabaseRecords(d1(source));
 
-	const target = database({ laterTables: false });
+	const target = database({ skip: ["mailing_lists"] });
 	addUser(target);
 	await assert.rejects(
 		restoreDatabaseRecords(d1(target), buffer(backup)),
 		/Apply pending database migrations before restoring mailing_lists, mailing_list_members/,
+	);
+	// The rejection lands before the restore's teardown: the canary user is
+	// untouched, not even marked deleted.
+	const row = target.prepare("SELECT deleted_at FROM users WHERE id = 'u1'").get();
+	assert.equal(row.deleted_at, null);
+});
+
+test("an export on a database without the contact group tables succeeds and ships them empty", async () => {
+	const sqlite = database({ skip: ["contact_groups"] });
+	addUser(sqlite);
+	const backup = await exportDatabaseRecords(d1(sqlite));
+	const document = JSON.parse(new TextDecoder().decode(backup));
+	assert.deepEqual(document.tables.contact_groups, []);
+	assert.deepEqual(document.tables.contact_group_members, []);
+});
+
+test("a backup document without the contact group tables restores onto a migrated database", async () => {
+	const source = database();
+	addUser(source);
+	const backup = await exportDatabaseRecords(d1(source));
+	const document = JSON.parse(new TextDecoder().decode(backup));
+	delete document.tables.contact_groups;
+	delete document.tables.contact_group_members;
+	document.includedTables = document.includedTables.filter((table) => !table.startsWith("contact_group"));
+	const old = new TextEncoder().encode(JSON.stringify(document));
+
+	const target = database();
+	await restoreDatabaseRecords(d1(target), buffer(old));
+	assert.equal(target.prepare("SELECT COUNT(*) AS count FROM users").get().count, 1);
+	assert.equal(target.prepare("SELECT COUNT(*) AS count FROM contact_groups").get().count, 0);
+	assert.equal(target.prepare("SELECT COUNT(*) AS count FROM contact_group_members").get().count, 0);
+});
+
+test("a document carrying group rows is rejected before any row is deleted on an unmigrated database", async () => {
+	const source = database();
+	addUser(source);
+	source.exec(`
+		INSERT INTO contacts (id, user_id, email, source, created_at) VALUES ('u1:a@x.test', 'u1', 'a@x.test', 'manual', 1);
+		INSERT INTO contact_groups (id, user_id, name, created_at) VALUES ('g1', 'u1', 'Family', 1);
+		INSERT INTO contact_group_members (id, group_id, contact_id, created_at) VALUES ('gm1', 'g1', 'u1:a@x.test', 1);`);
+	const backup = await exportDatabaseRecords(d1(source));
+
+	const target = database({ skip: ["contact_groups"] });
+	addUser(target);
+	await assert.rejects(
+		restoreDatabaseRecords(d1(target), buffer(backup)),
+		/Apply pending database migrations before restoring contact_groups, contact_group_members/,
 	);
 	// The rejection lands before the restore's teardown: the canary user is
 	// untouched, not even marked deleted.
