@@ -3,7 +3,11 @@ import type { AppDatabase } from "@/db";
 import { domains, folders, mailboxAliases, mailboxes, mailingLists, routingRules } from "@/db/schema";
 import { getEmailAddress } from "@/lib/email/address";
 import { getMailboxDomainAddresses } from "@/lib/mailboxes/domain-addresses";
-import { normalizeRecipientLocalPart, parseRecipientAddress } from "@/lib/email/recipient-address";
+import {
+	normalizeRecipientFullLocalPart,
+	normalizeRecipientLocalPart,
+	parseRecipientAddress,
+} from "@/lib/email/recipient-address";
 
 export type ResolvedMailbox = {
 	mailboxId: string;
@@ -69,7 +73,11 @@ export type ResolveInboundOptions = {
  * Domain-scope rules are evaluated in three phases so that a broad catch-all can never
  * shadow a real mailbox:
  *   1. `reject` rules (block lists) — highest precedence, evaluated before delivery.
- *   2. exact mailbox, then multi-domain mailbox aliases.
+ *   2. a literal `local+tag` mailbox or enabled mailing list claims a tagged
+ *      address first; then the `local` base claims — exact mailbox, mailbox
+ *      aliases, an enabled base mailing list. A disabled mailbox, alias or
+ *      list claims nothing. Multi-domain mailbox aliases come after all of
+ *      them.
  *   3. remaining `forward` / `store` rules — the catch-all fallback.
  * Within each phase rules run by descending priority, then oldest first.
  */
@@ -105,15 +113,30 @@ export async function resolveInboundAddress(
 		};
 	}
 
-	// Phase 2 — a real mailbox always wins over a catch-all.
+	// Phase 2 — a real mailbox always wins over a catch-all. Literal `user+tag`
+	// claims come before every `user` base claim below, the same exact-then-base
+	// order the plus-addressing pass (#416) applies to all claimants once it
+	// lands: a `user+tag` mailbox, then a `user+tag` mailing list.
 	const exactMailboxes = await db
 		.select()
 		.from(mailboxes)
 		.where(and(eq(mailboxes.domainId, domain.id), eq(mailboxes.disabled, false)));
+	const taggedMailbox = parsed.hasSubaddress
+		? exactMailboxes.find(
+			(mailbox) => normalizeRecipientFullLocalPart(mailbox.localPart) === parsed.fullLocalPart,
+		)
+		: undefined;
+	// An enabled `user+tag` list is a literal claim on the tagged address, so it
+	// also outranks the enabled mailbox and alias base claims underneath:
+	// exact tagged list > enabled alias paths > base list.
+	if (!taggedMailbox && parsed.hasSubaddress) {
+		const list = await findEnabledMailingList(db, domain.id, parsed.fullLocalPart);
+		if (list) return { action: "list", list: toResolvedList(list, domain) };
+	}
 	const exactMailbox = exactMailboxes.find(
 		(mailbox) => normalizeRecipientLocalPart(mailbox.localPart) === parsed.localPart,
 	);
-	let mailbox = exactMailbox ?? await resolveMailboxAlias(db, domain.id, parsed.localPart);
+	let mailbox = taggedMailbox ?? exactMailbox ?? await resolveMailboxAlias(db, domain.id, parsed.localPart);
 	// A disabled alias keeps owning its address: reject instead of letting a
 	// use-all-domains mailbox or a catch-all rule deliver its mail elsewhere.
 	if (!mailbox && await findDisabledAlias(db, domain.id, parsed.localPart)) {
@@ -121,7 +144,10 @@ export async function resolveInboundAddress(
 	}
 	// A mailing list claims the address the same way a mailbox or alias does, so
 	// it wins over the implicit use-all-domains claim and the catch-all rules
-	// below, and a disabled list — like a disabled mailbox — simply does not match.
+	// below, and a disabled list — like a disabled mailbox — simply does not
+	// match. For a `user+tag` address this is the `user` base fallback behind
+	// the tagged lookup above: `user+x` resolves to it only when no `user+x`
+	// list exists.
 	if (!mailbox) {
 		const list = await findEnabledMailingList(db, domain.id, parsed.localPart);
 		if (list) return { action: "list", list: toResolvedList(list, domain) };
@@ -302,12 +328,15 @@ async function findDisabledAlias(db: AppDatabase, domainId: string, localPart: s
 	return rows.some((row) => normalizeRecipientLocalPart(row.localPart) === localPart);
 }
 
+// Stored list local parts normalize with the tag kept, so a stored `team+x`
+// claims `team+x` and never the `team` base — the same treatment the
+// plus-addressing pass gives stored mailbox and alias local parts.
 async function findEnabledMailingList(db: AppDatabase, domainId: string, localPart: string) {
 	const rows = await db
 		.select()
 		.from(mailingLists)
 		.where(and(eq(mailingLists.domainId, domainId), eq(mailingLists.disabled, false)));
-	return rows.find((list) => normalizeRecipientLocalPart(list.localPart) === localPart) ?? null;
+	return rows.find((list) => normalizeRecipientFullLocalPart(list.localPart) === localPart) ?? null;
 }
 
 function toResolvedList(

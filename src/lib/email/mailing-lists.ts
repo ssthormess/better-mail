@@ -102,6 +102,19 @@ async function collectMemberDeliveries(
  * idempotent, a direct copy of the same message dedupes the member's list copy,
  * and one member deleting their copy cannot drop the object under the others.
  *
+ * Which list an envelope recipient names is decided in resolveInboundAddress:
+ * exact tagged list > enabled alias paths > base list. A stored `team+x`
+ * claims `team+x@domain` ahead of the enabled `team` mailbox and alias
+ * claims; `team+x` falls back to the `team` list only when no `team+x` list
+ * exists.
+ *
+ * A member copy carries the member's own subscribed address as its envelope
+ * recipient (`payload.to` = member address), never the list's — a member
+ * subscribed as `bob+lists@domain` re-resolves and stores under
+ * `bob+lists@domain`, so member-side tag rules see the member's own `+lists`
+ * tag. A tag on the list address (`team+x`) is list-routing metadata only and
+ * never reaches member rules.
+ *
  * External members (an address no hosted domain resolves) are skipped, not
  * forwarded: the outbound queue only sends from user-owned mailbox identities,
  * and correct off-instance list forwarding (envelope sender rewriting, posting

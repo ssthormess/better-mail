@@ -78,7 +78,7 @@ function insertList(database, { id = "team", localPart = "team", disabled = 0, m
 }
 
 function mailByMailbox(database) {
-	return database.db.prepare("SELECT mailbox_id AS mailboxId, raw_r2_key AS rawR2Key, to_addr AS toAddr, from_addr AS fromAddr FROM messages").all();
+	return database.db.prepare("SELECT mailbox_id AS mailboxId, raw_r2_key AS rawR2Key, to_addr AS toAddr, from_addr AS fromAddr, status FROM messages").all();
 }
 
 async function intake(env, to, from = "sender@ext.test") {
@@ -178,4 +178,61 @@ test("a member who is themselves a member of a nested list only gets one copy", 
 	// eng expands into all (eng's member), which expands eng again but stops:
 	// only bob is reachable without revisiting a list.
 	assert.deepEqual(mailByMailbox(database).map((row) => row.mailboxId), ["bobbox"]);
+});
+
+test("an exact tagged list wins over the base list for the tagged address", async (t) => {
+	t.mock.method(console, "info", () => {});
+	const { env, database, queued } = await setup(t);
+	insertList(database, { id: "team", localPart: "team", members: ["bob@one.test"] });
+	insertList(database, { id: "team-tag", localPart: "team+tag", members: ["ann@one.test"] });
+
+	// team+tag@one.test names the literal team+tag list, not the team base.
+	await intake(env, "team+tag@one.test");
+	await processInboundMessage(env, queued[0]);
+	assert.deepEqual(mailByMailbox(database).map((row) => row.mailboxId), ["annbox"]);
+
+	// And the base address still names only the base list: a stored team+tag
+	// list never claims team@one.test.
+	await intake(env, "team@one.test");
+	await processInboundMessage(env, queued[1]);
+	assert.deepEqual(
+		mailByMailbox(database).map((row) => row.mailboxId).sort(),
+		["annbox", "bobbox"],
+	);
+});
+
+test("a tagged address falls back to the base list when no tagged list exists", async (t) => {
+	t.mock.method(console, "info", () => {});
+	const { env, database, queued } = await setup(t);
+	insertList(database, { members: ["bob@one.test", "ann@one.test"] });
+
+	await intake(env, "team+x@one.test");
+	await processInboundMessage(env, queued[0]);
+
+	assert.deepEqual(
+		new Set(mailByMailbox(database).map((row) => row.mailboxId)),
+		new Set(["bobbox", "annbox"]),
+	);
+});
+
+test("a member copy keeps the member's own envelope address, tag and all", async (t) => {
+	t.mock.method(console, "info", () => {});
+	const { env, database, queued } = await setup(t);
+	// The rules on bob's mailbox only fire if the member copy's envelope
+	// recipient is the address he is subscribed with: his own bob+lists tag
+	// files as spam, the list's team+x tag would file as trash.
+	database.db.exec(`
+		INSERT INTO routing_rules (id, user_id, domain_id, scope, mailbox_id, pattern, match_field, match_operator, match_value, action, enabled, priority, created_at) VALUES
+			('bobs-tag', 'admin', 'one', 'mailbox', 'bobbox', '', 'recipient', 'exact', 'bob+lists@one.test', 'spam', 1, 0, 1),
+			('list-tag', 'admin', 'one', 'mailbox', 'bobbox', '', 'recipient', 'exact', 'team+x@one.test', 'trash', 1, 0, 1)
+	`);
+	insertList(database, { id: "teamx", localPart: "team+x", members: ["bob+lists@one.test", "ann@one.test"] });
+
+	await intake(env, "team+x@one.test");
+	await processInboundMessage(env, queued[0]);
+
+	const rows = mailByMailbox(database);
+	const bobs = rows.find((row) => row.mailboxId === "bobbox");
+	assert.equal(bobs.status, "spam");
+	assert.equal(rows.find((row) => row.mailboxId === "annbox").status, "received");
 });
