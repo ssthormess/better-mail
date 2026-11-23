@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import toast from "react-hot-toast";
-import { Download, Plus, Search, UsersRound } from "@/components/icons";
+import { ChevronDown, Download, Plus, Search, UsersRound } from "@/components/icons";
 import { useLanguage } from "@/components/language-provider";
 import { useCompose } from "@/components/compose/compose-context";
 import { useSelectedMailbox } from "@/components/mailbox-provider";
@@ -15,6 +15,7 @@ import { mobilePrimaryActionClass } from "@/components/page-header-utils";
 import { formatEmailAddress } from "@/lib/email/address";
 import { ContactDeleteDialog } from "./contact-delete-dialog";
 import { ContactEditDialog } from "./contact-edit-dialog";
+import { ContactExportMenu } from "./contact-export-menu";
 import { ContactRow } from "./contact-row";
 import { CONTACT_COLUMNS } from "./contacts-page-utils";
 import type { ContactListItem } from "./contacts-page-types";
@@ -55,11 +56,11 @@ export function ContactsPage() {
 		setEditOpen(true);
 	}
 
-	async function onExport() {
+	async function onExport(format: "vcf" | "csv") {
 		if (!mailboxId || exporting) return;
 		setExporting(true);
 		try {
-			await exportContacts(mailboxId);
+			await exportContacts(mailboxId, format);
 		} catch (error) {
 			toast.error(error instanceof Error ? error.message : t("contacts.exportFailed"));
 		} finally {
@@ -75,10 +76,17 @@ export function ContactsPage() {
 			<div className="flex items-center justify-between gap-4">
 				<h1 className="text-2xl font-medium md:text-3xl">{t("contacts.title")}</h1>
 				<div className="flex items-center gap-2">
-					<Button type="button" variant="outline" onClick={onExport} disabled={!mailboxId || exporting}>
-						<Download className="h-4 w-4" />
-						{t("contacts.export")}
-					</Button>
+					<ContactExportMenu
+						disabled={!mailboxId || exporting}
+						onPick={(format) => void onExport(format)}
+						trigger={
+							<Button type="button" variant="outline" disabled={!mailboxId || exporting}>
+								<Download className="h-4 w-4" />
+								{t("contacts.export")}
+								<ChevronDown className="h-4 w-4" />
+							</Button>
+						}
+					/>
 					<Button type="button" className={mobilePrimaryActionClass} onClick={openCreate} disabled={!mailboxId}>
 						<Plus className="h-4 w-4" />
 						{t("contacts.add")}

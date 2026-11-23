@@ -45,8 +45,8 @@ export async function renameContact(
 	return data.contact;
 }
 
-export async function exportContacts(mailboxId: string): Promise<void> {
-	const params = new URLSearchParams({ mailboxId });
+export async function exportContacts(mailboxId: string, format: "vcf" | "csv"): Promise<void> {
+	const params = new URLSearchParams({ mailboxId, format });
 	const response = await authFetch(`/api/export/contacts?${params.toString()}`);
 	if (!response.ok) {
 		const data = (await response.json()) as { error?: string };
@@ -55,7 +55,7 @@ export async function exportContacts(mailboxId: string): Promise<void> {
 
 	const blob = await response.blob();
 	// The server names the file; Content-Disposition keeps that the single source of truth.
-	const filename = response.headers.get("Content-Disposition")?.match(/filename="?([^";]+)"?/)?.[1] ?? "contacts.vcf";
+	const filename = response.headers.get("Content-Disposition")?.match(/filename="?([^";]+)"?/)?.[1] ?? `contacts.${format}`;
 	const url = URL.createObjectURL(blob);
 	const link = document.createElement("a");
 	link.href = url;
