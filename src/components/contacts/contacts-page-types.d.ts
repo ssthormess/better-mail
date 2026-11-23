@@ -24,6 +24,13 @@ export type ContactMutationResponse = {
 	error?: string;
 };
 
+export type ContactImportResult = {
+	imported: number;
+	updated: number;
+	skipped: number;
+	failed: number;
+};
+
 export type ContactEditDialogProps = {
 	mailboxId: string;
 	/** Set for renaming an existing contact; unset creates a new one. */

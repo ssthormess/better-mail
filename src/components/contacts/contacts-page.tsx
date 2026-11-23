@@ -16,6 +16,7 @@ import { formatEmailAddress } from "@/lib/email/address";
 import { ContactDeleteDialog } from "./contact-delete-dialog";
 import { ContactEditDialog } from "./contact-edit-dialog";
 import { ContactExportMenu } from "./contact-export-menu";
+import { ContactImportButton } from "./contact-import-button";
 import { ContactRow } from "./contact-row";
 import { CONTACT_COLUMNS } from "./contacts-page-utils";
 import type { ContactListItem } from "./contacts-page-types";
@@ -76,6 +77,7 @@ export function ContactsPage() {
 			<div className="flex items-center justify-between gap-4">
 				<h1 className="text-2xl font-medium md:text-3xl">{t("contacts.title")}</h1>
 				<div className="flex items-center gap-2">
+					<ContactImportButton mailboxId={mailboxId} onImported={refresh} />
 					{/* The trigger stays focusable while busy so Radix can return focus to it when the menu closes; onExport itself blocks a second pick mid-flight. */}
 					<ContactExportMenu
 						disabled={!mailboxId}

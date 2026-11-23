@@ -1,5 +1,6 @@
 import { authFetch } from "@/lib/auth/client";
 import type {
+	ContactImportResult,
 	ContactListItem,
 	ContactMutationResponse,
 	ContactsListResponse,
@@ -64,6 +65,21 @@ export async function exportContacts(mailboxId: string, format: "vcf" | "csv"): 
 	link.click();
 	link.remove();
 	URL.revokeObjectURL(url);
+}
+
+export async function importContacts(mailboxId: string, file: File): Promise<ContactImportResult> {
+	const body = new FormData();
+	body.set("mailboxId", mailboxId);
+	body.set("file", file);
+	const response = await authFetch("/api/import/contacts", { method: "POST", body });
+	const data = (await response.json()) as Partial<ContactImportResult> & { error?: string };
+	if (!response.ok) throw new Error(data.error ?? "Unable to import contacts");
+	return {
+		imported: data.imported ?? 0,
+		updated: data.updated ?? 0,
+		skipped: data.skipped ?? 0,
+		failed: data.failed ?? 0,
+	};
 }
 
 export async function deleteContact(mailboxId: string, address: string): Promise<void> {
