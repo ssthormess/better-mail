@@ -40,7 +40,9 @@ export function apiError(data: { error?: unknown }, fallback: string): Error {
 // cache entry was dropped while a write was in flight), restart the exact query —
 // otherwise the cancelled cold GET would leave it pending forever. The restart is
 // scheduled, not awaited: a stalled GET must not extend the mutation's pending
-// lifetime.
+// lifetime. "active" only — an unwatched key goes stale and refetches on its next
+// enabled mount, so a mailbox that lost manage rights mid-write never sees a
+// doomed read fire from this path.
 export async function patchContactGroups(
 	qc: QueryClient,
 	mailboxId: string,
@@ -49,7 +51,7 @@ export async function patchContactGroups(
 	const queryKey = contactGroupsQueryKey(mailboxId);
 	await qc.cancelQueries({ queryKey, exact: true });
 	if (qc.getQueryData(queryKey) === undefined) {
-		void qc.invalidateQueries({ queryKey, exact: true, refetchType: "all" }).catch(() => {});
+		void qc.invalidateQueries({ queryKey, exact: true, refetchType: "active" }).catch(() => {});
 		return;
 	}
 	qc.setQueryData<ContactGroup[]>(queryKey, (current) => (current ? patch(current) : current));
@@ -57,7 +59,8 @@ export async function patchContactGroups(
 
 // Same discipline for one group's member slice: the member write responses carry
 // the fresh slice, so a cached entry is overwritten; a missing entry just needs
-// the (possibly cancelled) GET restarted.
+// the (possibly cancelled) GET restarted — and the same "active" restriction, so
+// a downgraded mailbox's unwatched slice goes stale instead of firing a read.
 export async function patchContactGroupMembers(
 	qc: QueryClient,
 	mailboxId: string,
@@ -67,7 +70,7 @@ export async function patchContactGroupMembers(
 	const queryKey = contactGroupMembersQueryKey(mailboxId, groupId);
 	await qc.cancelQueries({ queryKey, exact: true });
 	if (qc.getQueryData(queryKey) === undefined) {
-		void qc.invalidateQueries({ queryKey, exact: true, refetchType: "all" }).catch(() => {});
+		void qc.invalidateQueries({ queryKey, exact: true, refetchType: "active" }).catch(() => {});
 		return;
 	}
 	qc.setQueryData<ContactGroupMember[]>(queryKey, members);

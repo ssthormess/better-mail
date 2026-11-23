@@ -28,6 +28,8 @@ const state = {
 	nextGroupId: 3,
 	deferIndex: null,
 	deferMembers: null,
+	deferCreates: null,
+	failIndex: false,
 	failMembers: new Set(),
 };
 
@@ -62,12 +64,14 @@ globalThis.__groupsCacheTestFetch = async (url, options = {}) => {
 		return response({ ok: true });
 	}
 	if (path === "/api/contacts/groups" && method === "GET") {
+		if (state.failIndex) return response({ error: "Boom" }, 500);
 		// Capture before deferring — a delayed response still returns the pre-request snapshot.
 		const data = { groups: sortedGroups().map(groupEntry) };
 		if (state.deferIndex) await state.deferIndex;
 		return response(data);
 	}
 	if (path === "/api/contacts/groups" && method === "POST") {
+		if (state.deferCreates) await state.deferCreates;
 		const group = {
 			id: `g-${state.nextGroupId++}`, userId: "u-1", name: payload.name,
 			createdAt: "2026-01-02T00:00:00.000Z",
@@ -121,7 +125,8 @@ beforeEach(() => {
 	state.members = { "g-1": [{ ...m1 }], "g-2": [] };
 	state.nextGroupId = 3;
 	state.contacts = [];
-	state.deferIndex = state.deferMembers = null;
+	state.deferIndex = state.deferMembers = state.deferCreates = null;
+	state.failIndex = false;
 	state.failMembers = new Set();
 	globalThis.__testMailbox = { id: "mb-1", permission: "full_access" };
 	requests.length = 0;
@@ -181,6 +186,7 @@ const {
 	contactGroupsQueryKey,
 	fetchContactGroupMembers,
 	fetchContactGroups,
+	patchContactGroupMembers,
 	refetchContactGroups,
 } = await loadComponent("src/components/contacts/contact-groups-utils.ts", uiStubs);
 
@@ -645,6 +651,76 @@ test("a write leaves downgraded-mailbox caches stale — no doomed reads", async
 	const stale = client.getQueryCache().find({ queryKey: contactGroupsQueryKey("mb-2") });
 	assert.ok(stale?.state.isInvalidated, "mb-2's index is marked stale for its next enabled mount");
 	await unmount(root, container);
+});
+
+test("a create landing after a downgrade fires no restart reads on the dead mailbox", async (t) => {
+	const client = testClient();
+	t.after(() => client.clear());
+	const container = newContainer(t);
+	// The initial index GET failed — no snapshot exists, so a committing write
+	// falls into the no-data restart path.
+	state.failIndex = true;
+	let releaseCreate;
+	state.deferCreates = new Promise((r) => { releaseCreate = r; });
+	const root = mount(t, client, container,
+		createElement(ContactGroupsManager, { mailboxId: "mb-1" }));
+	await settle();
+	const trigger = [...container.querySelectorAll("button")].find((b) =>
+		b.textContent.includes("contactGroups.manage"));
+	await click(trigger);
+	await settle();
+
+	const input = container.querySelector('input[aria-label="contactGroups.new"]');
+	await setInputValue(input, "Beta");
+	const createButton = [...container.querySelectorAll("button")].find((b) =>
+		b.textContent === "contactGroups.create");
+	await click(createButton);
+	assert.equal(
+		requests.filter((r) => r.method === "POST" && r.url === "/api/contacts/groups").length,
+		1,
+		"the create POST is in flight",
+	);
+
+	// The mailbox is read-only now and the surface is gone entirely — unmount
+	// drops the last observer, so only the queryFn'd cache entry remains. The
+	// mutation still commits (writes outlive their observers) and its restart
+	// must not fire a read this mailbox can no longer serve.
+	globalThis.__testMailbox = { id: "mb-1", permission: "read_only" };
+	await unmount(root, container);
+	const before = requests.length;
+	await act(async () => {
+		releaseCreate();
+		state.deferCreates = null;
+		await new Promise((r) => setTimeout(r, 40));
+	});
+
+	assert.equal(
+		requests.slice(before).length,
+		0,
+		"no read fires through the restart or refresh paths once the mailbox is read-only",
+	);
+	const stale = client.getQueryCache().find({ queryKey: contactGroupsQueryKey("mb-1") });
+	assert.ok(stale?.state.isInvalidated, "the no-data snapshot went stale-only instead of refetching");
+	await unmount(root, container);
+});
+
+test("the member-slice restart also stays stale-only on an unwatched key", async (t) => {
+	const client = testClient();
+	t.after(() => client.clear());
+	// A failed, unwatched slice keeps its queryFn — an "all" restart would refire it.
+	state.failMembers.add("g-2");
+	await client.prefetchQuery({
+		queryKey: contactGroupMembersQueryKey("mb-1", "g-2"),
+		queryFn: () => fetchContactGroupMembers("mb-1", "g-2"),
+	});
+	const before = requests.length;
+
+	await patchContactGroupMembers(client, "mb-1", "g-2", [{ ...m1, id: "cgm-9" }]);
+	await settle();
+
+	assert.equal(requests.slice(before).length, 0, "no read fires on the unwatched slice");
+	const stale = client.getQueryCache().find({ queryKey: contactGroupMembersQueryKey("mb-1", "g-2") });
+	assert.ok(stale?.state.isInvalidated, "the slice went stale-only instead of refetching");
 });
 
 test("deleting a contact refreshes the groups book — counts and slices update", async (t) => {
