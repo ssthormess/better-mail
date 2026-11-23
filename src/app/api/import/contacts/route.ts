@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { getDb } from "@/db";
-import { getContactByEmail, getExistingContactEmails, saveManualContact, uploadAddressesSeenInMailbox } from "@/app/api/contacts/utils";
+import { addressesSeenInMailbox, getContactByEmail, getExistingContactEmails, saveManualContact } from "@/app/api/contacts/utils";
 import { requireUser } from "@/lib/auth/cookies";
 import { getEnv } from "@/lib/cloudflare";
 import { RequestBodyTooLargeError } from "@/lib/http/errors";
@@ -129,13 +129,14 @@ export async function POST(request: Request) {
 		const candidates = parsed.rows.flatMap((row) => (row.status === "ok" && row.email ? [row.email] : []));
 		// Same visibility rule as GET /api/contacts and the export: a delegate
 		// only sees addresses on this mailbox's mail, so their candidates shrink
-		// to the mailbox-visible set before the book is even queried. That scan
-		// pages the mailbox's own messages — its cost tracks upload and mailbox
-		// size, never how much of the owner's private book matched, and an
-		// existing contact a delegate cannot see reads as new.
+		// to the mailbox-visible set before the book is even queried. The probe
+		// is chunked LIKE matching — its statement count tracks the candidate
+		// count only, never mailbox size or how much of the owner's private
+		// book matched, and an existing contact a delegate cannot see reads as
+		// new.
 		const visible = access.isOwner
 			? candidates
-			: [...await uploadAddressesSeenInMailbox(db, access.mailbox.id, candidates, user.id)];
+			: [...await addressesSeenInMailbox(db, access.mailbox.id, candidates, user.id)];
 		const existing = await getExistingContactEmails(db, ownerId, visible);
 		for (const row of parsed.rows) {
 			const status = row.status === "ok" ? (existing.has(row.email ?? "") ? "existing" : "new") : row.status;

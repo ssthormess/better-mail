@@ -276,6 +276,24 @@ test("a vCard with comment wrappers and a folded marker-like line still imports"
 	assert.equal(contactsOf(sqlite, "admin").length, 2);
 });
 
+test("a folded line that spells END:VCARD is note text, not the card's end", async (t) => {
+	const sqlite = await setup(t, "admin");
+	const vcf = [
+		"BEGIN:VCARD",
+		"FN:Maya",
+		"NOTE:a card delimiter folded onto its own",
+		" END:VCARD",
+		" continuation line is still note text",
+		"EMAIL:maya@example.test",
+		"END:VCARD",
+		"",
+	].join("\r\n");
+	const response = await POST(post("mb-admin", vcf, "contacts.vcf"));
+	assert.equal(response.status, 200);
+	assert.deepEqual(await response.json(), { imported: 1, updated: 0, skipped: 0, failed: 0 });
+	assert.equal(contactsOf(sqlite, "admin").find((row) => row.email === "maya@example.test").display_name, "Maya");
+});
+
 test("a quoted CSV cell holding card markers is not a format mismatch", async (t) => {
 	const sqlite = await setup(t, "admin");
 	const content = 'name,email,notes\r\nBob,bob@example.test,"about them:\nBEGIN:VCARD\nFN:Bob\nEMAIL:x@y.test\nEND:VCARD"\r\n';
@@ -439,6 +457,31 @@ test("a delegated preview's query count stays under budget and ignores private m
 	assert.equal(queries2(), delegatedQueries);
 	assert.equal(body2.counts.existing, 30);
 	assert.equal(body2.counts.new, 120 + 150);
+});
+
+test("a delegated preview on a large mailbox stays under budget when candidates are absent", async (t) => {
+	// 25,000 visible messages covering none of the upload: a paged corpus scan
+	// would need ~51 statements — over D1 Free's 50-per-invocation limit.
+	const bigMailbox = `
+		INSERT INTO contacts (id, user_id, email, display_name, source, blocked, created_at) VALUES ${Array.from({ length: 30 }, (_, i) => `('c-s${i}','admin','seen${i}@example.test','S','manual',0,1)`).join(",")};
+		INSERT INTO messages (id, user_id, mailbox_id, direction, from_addr, to_addr, subject, status, created_at) VALUES ${Array.from({ length: 30 }, (_, i) => `('m-s${i}','admin','mb-team','outbound','team@example.com','seen${i}@example.test','x','sent',1)`).join(",")};
+		INSERT INTO messages (id, user_id, mailbox_id, direction, from_addr, to_addr, subject, status, created_at)
+		WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 25000)
+		SELECT 'bulk-' || n, 'admin', 'mb-team', 'inbound', 'bulk' || n || '@example.test', 'team@example.com', 'x', 'received', 1 FROM seq;
+	`;
+	const upload = csv(
+		"name,email",
+		...Array.from({ length: 30 }, (_, i) => `S,seen${i}@example.test`),
+		...Array.from({ length: 270 }, (_, i) => `A,absent${i}@example.test`),
+	);
+
+	const sqlite = await setup(t, "delegate", bigMailbox);
+	const queries = countQueries(globalThis.csvImpEnv.DB);
+	const body = await (await POST(post("mb-team", upload, "c.csv", { preview: "1" }))).json();
+	assert.ok(queries() < 50, `delegated preview on a 25k-message mailbox ran ${queries()} queries`);
+	assert.equal(body.counts.existing, 30);
+	assert.equal(body.counts.new, 270);
+	assert.equal(contactsOf(sqlite, "admin").length, 31);
 });
 
 test("a delegate imports CSV into the shared mailbox owner's address book", async (t) => {

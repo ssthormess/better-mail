@@ -121,6 +121,13 @@ test("names longer than the API's 100-char bound are truncated", () => {
 	assert.equal(contacts[0].displayName.length, 100);
 });
 
+test("a folded line spelling END:VCARD stays card text instead of ending the card", () => {
+	const vcf = "BEGIN:VCARD\r\nFN:Maya\r\nNOTE:folded\r\n END:VCARD\r\nEMAIL:maya@example.com\r\nEND:VCARD\r\n";
+	const { contacts, skipped } = parseVcfContacts(vcf);
+	assert.deepEqual(contacts, [{ email: "maya@example.com", displayName: "Maya" }]);
+	assert.equal(skipped, 0);
+});
+
 test("the card cap stops reading and counts the rest as skipped", () => {
 	const vcf = card("EMAIL:a@example.com") + card("EMAIL:b@example.com") + card("EMAIL:c@example.com");
 	const { contacts, skipped } = parseVcfContacts(vcf, 2);

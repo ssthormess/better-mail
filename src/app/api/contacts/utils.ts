@@ -1,9 +1,9 @@
 import { and, asc, eq, inArray, or, sql } from "drizzle-orm";
 import { draftsVisibleTo } from "@/lib/email/draft-access";
-import { addressListIncludes, getEmailAddressList } from "@/lib/email/address";
+import { addressListIncludes } from "@/lib/email/address";
 import type { getDb } from "@/db";
 import { contacts, messages } from "@/db/schema";
-import { escapeLike, insensitiveLike } from "@/db/sql";
+import { concatText, containsLike, escapeLike, insensitiveLike } from "@/db/sql";
 import { getContactId } from "@/lib/contacts/utils";
 
 type Db = ReturnType<typeof getDb>;
@@ -73,18 +73,24 @@ export async function listContacts(db: Db, input: { userId: string; query: strin
  * Contacts belong to the user who owns the mailbox, so a shared mailbox's contact list is its creator's whole
  * address book. Anyone who is not that owner may only see contacts whose address appears on mail in this mailbox.
  * Returns the subset of `emails` that does (exact address match).
+ *
+ * Each candidate costs one bound parameter: it is LIKE-matched against the
+ * message's concatenated address corpus (from, to, cc — cc is nullable), so a
+ * chunk of 90 candidates plus the mailbox id and the draftsVisibleTo viewer
+ * stays under D1's 100-parameters-per-statement cap. The query count tracks
+ * the candidate count only — mailbox size cannot stretch it, unlike a paged
+ * corpus scan — and the returned rows are verified address-by-address locally,
+ * so substring hits cannot pass as real visibility. A private draft stays
+ * visible only to its author.
  */
 export async function addressesSeenInMailbox(db: Db, mailboxId: string, emails: string[], viewerUserId: string): Promise<Set<string>> {
 	const seen = new Set<string>();
 	const unique = [...new Set(emails)];
-	// D1 allows 100 bound parameters per statement: 3 per address plus the mailbox id.
-	for (let offset = 0; offset < unique.length; offset += 25) {
-		const chunk = unique.slice(offset, offset + 25);
-		const conditions = chunk.flatMap((email) => {
-			const pattern = `%${escapeLike(email)}%`;
-			return [eq(messages.fromAddr, email), insensitiveLike(messages.toAddr, pattern), insensitiveLike(messages.ccAddr, pattern)];
-		});
+	const corpus = concatText(sql`${messages.fromAddr}`, ",", sql`${messages.toAddr}`, ",", sql`coalesce(${messages.ccAddr}, '')`);
+	for (let offset = 0; offset < unique.length; offset += 90) {
+		const chunk = unique.slice(offset, offset + 90);
 		// The LIKE only narrows candidates; the verdict below is an exact address comparison.
+		const conditions = chunk.map((email) => containsLike(corpus, email));
 		const rows = await db
 			.select({ fromAddr: messages.fromAddr, toAddr: messages.toAddr, ccAddr: messages.ccAddr })
 			.from(messages)
@@ -93,39 +99,6 @@ export async function addressesSeenInMailbox(db: Db, mailboxId: string, emails: 
 		for (const email of chunk) {
 			if (rows.some((row) => [row.fromAddr, row.toAddr, row.ccAddr].some((value) => addressListIncludes(value, email)))) seen.add(email);
 		}
-	}
-	return seen;
-}
-
-/**
- * Same verdict as addressesSeenInMailbox — which of `emails` appear on this
- * mailbox's visible mail — but computed for upload-sized candidate sets by
- * paging the mailbox's own address fields and matching locally, instead of
- * LIKE-probing per address. The query count tracks the mailbox's size and the
- * paging stops the moment every candidate is found, so it never scales with
- * how many candidates are stored contacts. A private draft stays visible only
- * to its author, same as the probe path.
- */
-export async function uploadAddressesSeenInMailbox(db: Db, mailboxId: string, emails: string[], viewerUserId: string): Promise<Set<string>> {
-	const wanted = new Set(emails);
-	const seen = new Set<string>();
-	for (let offset = 0; seen.size < wanted.size; offset += 500) {
-		const rows = await db
-			.select({ fromAddr: messages.fromAddr, toAddr: messages.toAddr, ccAddr: messages.ccAddr })
-			.from(messages)
-			.where(and(eq(messages.mailboxId, mailboxId), draftsVisibleTo(viewerUserId)))
-			.orderBy(asc(messages.id))
-			.limit(500)
-			.offset(offset);
-		if (rows.length === 0) break;
-		for (const row of rows) {
-			for (const value of [row.fromAddr, row.toAddr, row.ccAddr]) {
-				for (const address of getEmailAddressList(value)) {
-					if (wanted.has(address)) seen.add(address);
-				}
-			}
-		}
-		if (rows.length < 500) break;
 	}
 	return seen;
 }
