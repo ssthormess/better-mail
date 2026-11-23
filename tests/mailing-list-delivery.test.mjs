@@ -215,6 +215,33 @@ test("a tagged address falls back to the base list when no tagged list exists", 
 	);
 });
 
+test("an empty-tag address is literal-only for lists and never reaches the base list", async (t) => {
+	t.mock.method(console, "warn", () => {});
+	const { env, database, queued } = await setup(t);
+	insertList(database, { members: ["bob@one.test"] });
+
+	// team+ carries an empty tag: only a literal team+ list could claim it, so
+	// it resolves to nothing and the queued message drops with no deliveries.
+	assert.equal(await resolveInboundAddress(getDb(env), "team+@one.test"), null);
+	await intake(env, "team+@one.test");
+	await processInboundMessage(env, queued[0]);
+	assert.equal(mailByMailbox(database).length, 0);
+});
+
+test("a literal empty-tag list claims its own address", async (t) => {
+	t.mock.method(console, "info", () => {});
+	const { env, database, queued } = await setup(t);
+	insertList(database, { id: "team-plus", localPart: "team+", members: ["bob@one.test", "ann@one.test"] });
+
+	await intake(env, "team+@one.test");
+	await processInboundMessage(env, queued[0]);
+
+	assert.deepEqual(
+		new Set(mailByMailbox(database).map((row) => row.mailboxId)),
+		new Set(["bobbox", "annbox"]),
+	);
+});
+
 test("a member copy keeps the member's own envelope address, tag and all", async (t) => {
 	t.mock.method(console, "info", () => {});
 	const { env, database, queued } = await setup(t);

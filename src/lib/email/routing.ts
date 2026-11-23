@@ -77,7 +77,8 @@ export type ResolveInboundOptions = {
  *      address first; then the `local` base claims — exact mailbox, mailbox
  *      aliases, an enabled base mailing list. A disabled mailbox, alias or
  *      list claims nothing. Multi-domain mailbox aliases come after all of
- *      them.
+ *      them. An empty-tag `local+` address is literal-only for lists: the
+ *      `local` base list never claims it.
  *   3. remaining `forward` / `store` rules — the catch-all fallback.
  * Within each phase rules run by descending priority, then oldest first.
  */
@@ -121,15 +122,21 @@ export async function resolveInboundAddress(
 		.select()
 		.from(mailboxes)
 		.where(and(eq(mailboxes.domainId, domain.id), eq(mailboxes.disabled, false)));
-	const taggedMailbox = parsed.hasSubaddress
+	const taggedMailbox = parsed.fullLocalPart !== parsed.localPart
 		? exactMailboxes.find(
 			(mailbox) => normalizeRecipientFullLocalPart(mailbox.localPart) === parsed.fullLocalPart,
 		)
 		: undefined;
-	// An enabled `user+tag` list is a literal claim on the tagged address, so it
-	// also outranks the enabled mailbox and alias base claims underneath:
-	// exact tagged list > enabled alias paths > base list.
-	if (!taggedMailbox && parsed.hasSubaddress) {
+	// An enabled list stored under the address's literal `+` form — `user+tag`,
+	// or `user+` with an empty tag — claims it before every enabled base claim
+	// underneath: exact tagged list > enabled alias paths > base list. A
+	// non-empty tag still reaches the `user` base list behind the claims below,
+	// but `user+` is literal-only for lists, mirroring the plus-addressing
+	// pass: it never falls back to `user`. On this base the mailbox and alias
+	// claims still strip `+` to base, so `user+` mail lands in the `user`
+	// mailbox when no `user+` claimant exists — lists and mailboxes behave
+	// uniformly once #416 merges.
+	if (!taggedMailbox && parsed.fullLocalPart !== parsed.localPart) {
 		const list = await findEnabledMailingList(db, domain.id, parsed.fullLocalPart);
 		if (list) return { action: "list", list: toResolvedList(list, domain) };
 	}
@@ -146,9 +153,10 @@ export async function resolveInboundAddress(
 	// it wins over the implicit use-all-domains claim and the catch-all rules
 	// below, and a disabled list — like a disabled mailbox — simply does not
 	// match. For a `user+tag` address this is the `user` base fallback behind
-	// the tagged lookup above: `user+x` resolves to it only when no `user+x`
-	// list exists.
-	if (!mailbox) {
+	// the literal lookup above: `user+x` resolves to it only when no `user+x`
+	// list exists. An empty-tag `user+` skips this pass — lists keep it
+	// literal-only like the plus-addressing pass does.
+	if (!mailbox && !parsed.fullLocalPart.endsWith("+")) {
 		const list = await findEnabledMailingList(db, domain.id, parsed.localPart);
 		if (list) return { action: "list", list: toResolvedList(list, domain) };
 	}

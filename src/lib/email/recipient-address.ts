@@ -28,8 +28,9 @@ export function parseRecipientAddress(address: string): ParsedRecipientAddress |
 
 	const fullLocalPart = normalizeRecipientFullLocalPart(parsed.local);
 	// The subaddress splits at the first "+". An empty tag (`user+@…`) does not
-	// split for routing: `hasSubaddress` is false, so `user+` keeps matching the
-	// `user` base claims below like any other untagged address on this base.
+	// split for routing: `hasSubaddress` is false and `fullLocalPart` keeps the
+	// literal `user+`, which claimants that honor literal-only empty tags (the
+	// mailing-list lookups) detect by `fullLocalPart.endsWith("+")`.
 	const separator = fullLocalPart.indexOf("+");
 
 	return {

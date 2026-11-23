@@ -106,7 +106,11 @@ async function collectMemberDeliveries(
  * exact tagged list > enabled alias paths > base list. A stored `team+x`
  * claims `team+x@domain` ahead of the enabled `team` mailbox and alias
  * claims; `team+x` falls back to the `team` list only when no `team+x` list
- * exists.
+ * exists. An empty-tag `team+@domain` is literal-only for lists — only a
+ * stored `team+` claims it, never the `team` base — matching how the
+ * plus-addressing pass treats empty tags. On this base the mailbox claims
+ * still strip `+` to base, so `team+` mail lands in the `team` mailbox when
+ * no `team+` claimant exists; the divergence disappears once #416 merges.
  *
  * A member copy carries the member's own subscribed address as its envelope
  * recipient (`payload.to` = member address), never the list's — a member
