@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Plus, Search, UsersRound } from "@/components/icons";
 import { useLanguage } from "@/components/language-provider";
@@ -14,7 +14,10 @@ import { mobilePrimaryActionClass } from "@/components/page-header-utils";
 import { formatEmailAddress } from "@/lib/email/address";
 import { ContactDeleteDialog } from "./contact-delete-dialog";
 import { ContactEditDialog } from "./contact-edit-dialog";
+import { ContactGroupsDialog } from "./contact-groups-dialog";
+import { ContactGroupsManager } from "./contact-groups-manager";
 import { ContactRow } from "./contact-row";
+import { contactGroupsQueryKey, fetchContactGroupsData, indexGroupsByContact } from "./contact-groups-utils";
 import { CONTACT_COLUMNS } from "./contacts-page-utils";
 import type { ContactListItem } from "./contacts-page-types";
 import { fetchContacts } from "./contacts-page-utils";
@@ -32,6 +35,7 @@ export function ContactsPage() {
 	const [editOpen, setEditOpen] = useState(false);
 	const [editing, setEditing] = useState<ContactListItem | null>(null);
 	const [deleting, setDeleting] = useState<ContactListItem | null>(null);
+	const [assigning, setAssigning] = useState<ContactListItem | null>(null);
 
 	useEffect(() => {
 		const timer = setTimeout(() => setQuery(input.trim()), SEARCH_DEBOUNCE_MS);
@@ -43,6 +47,16 @@ export function ContactsPage() {
 		enabled: !!mailboxId,
 		queryFn: () => fetchContacts(mailboxId, query),
 	});
+
+	// Groups live in the mailbox owner's book — the API gates them on canManage,
+	// so a read-only delegate gets neither the manage surface nor the badges.
+	const canManageGroups = selectedMailbox?.permission === "full_access";
+	const groups = useQuery({
+		queryKey: contactGroupsQueryKey(mailboxId),
+		enabled: canManageGroups,
+		queryFn: () => fetchContactGroupsData(mailboxId),
+	});
+	const groupsByContact = useMemo(() => indexGroupsByContact(groups.data), [groups.data]);
 
 	function refresh() {
 		void queryClient.invalidateQueries({ queryKey: ["contacts", mailboxId] });
@@ -60,10 +74,13 @@ export function ContactsPage() {
 		<div className="w-full max-w-3xl space-y-6">
 			<div className="flex items-center justify-between gap-4">
 				<h1 className="text-2xl font-medium md:text-3xl">{t("contacts.title")}</h1>
-				<Button type="button" className={mobilePrimaryActionClass} onClick={openCreate} disabled={!mailboxId}>
-					<Plus className="h-4 w-4" />
-					{t("contacts.add")}
-				</Button>
+				<div className="flex items-center gap-2">
+					{canManageGroups && <ContactGroupsManager mailboxId={mailboxId} />}
+					<Button type="button" className={mobilePrimaryActionClass} onClick={openCreate} disabled={!mailboxId}>
+						<Plus className="h-4 w-4" />
+						{t("contacts.add")}
+					</Button>
+				</div>
 			</div>
 
 			<div className="relative">
@@ -107,11 +124,13 @@ export function ContactsPage() {
 								key={contact.id}
 								mailboxId={mailboxId}
 								contact={contact}
+								groups={groupsByContact[contact.id]}
 								onEmail={(item) => openComposer({ to: [formatEmailAddress(item.email, item.displayName)] })}
 								onEdit={(item) => {
 									setEditing(item);
 									setEditOpen(true);
 								}}
+								onAssignGroups={canManageGroups ? setAssigning : undefined}
 								onDelete={setDeleting}
 							/>
 						))}
@@ -134,6 +153,14 @@ export function ContactsPage() {
 					if (!open) setDeleting(null);
 				}}
 				onDeleted={refresh}
+			/>
+			<ContactGroupsDialog
+				mailboxId={mailboxId}
+				contact={assigning}
+				open={assigning !== null}
+				onOpenChange={(open) => {
+					if (!open) setAssigning(null);
+				}}
 			/>
 		</div>
 	);

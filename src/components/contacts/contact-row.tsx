@@ -1,16 +1,17 @@
 "use client";
 
-import { Ban, Edit04, MailSend01, Trash2 } from "@/components/icons";
+import { Ban, Edit04, MailSend01, Tag01, Trash2 } from "@/components/icons";
 import { useLanguage } from "@/components/language-provider";
 import { Button } from "@/components/ui/button";
 import { ListRow } from "@/components/ui/list";
 import { Tooltip } from "@/components/ui/tooltip";
 import { formatUserDate } from "@/lib/time/utils";
 import { ContactAvatar } from "./contact-avatar";
+import { ContactGroupBadges } from "./contact-group-badges";
 import type { ContactRowProps } from "./contacts-page-types";
 import { CONTACT_COLUMNS } from "./contacts-page-utils";
 
-export function ContactRow({ mailboxId, contact, onEmail, onEdit, onDelete }: ContactRowProps) {
+export function ContactRow({ mailboxId, contact, groups, onEmail, onEdit, onAssignGroups, onDelete }: ContactRowProps) {
 	const { t } = useLanguage();
 	const label = contact.displayName ?? contact.email;
 
@@ -33,6 +34,7 @@ export function ContactRow({ mailboxId, contact, onEmail, onEdit, onDelete }: Co
 					)}
 				</p>
 				{contact.displayName && <p className="truncate no-font-mono text-sm text-neutral-500">{contact.email}</p>}
+				{groups && <ContactGroupBadges groups={groups} />}
 			</div>
 			<span className="hidden text-sm text-neutral-500 md:block">
 				{contact.lastSeenAt
@@ -51,6 +53,19 @@ export function ContactRow({ mailboxId, contact, onEmail, onEdit, onDelete }: Co
 						<MailSend01 className="h-4 w-4" />
 					</Button>
 				</Tooltip>
+				{onAssignGroups && (
+					<Tooltip label={t("contactGroups.editFor", { name: label })}>
+						<Button
+							type="button"
+							variant="ghost"
+							size="sm"
+							onClick={() => onAssignGroups(contact)}
+							aria-label={t("contactGroups.editFor", { name: label })}
+						>
+							<Tag01 className="h-4 w-4" />
+						</Button>
+					</Tooltip>
+				)}
 				<Tooltip label={t("contacts.edit")}>
 					<Button
 						type="button"
