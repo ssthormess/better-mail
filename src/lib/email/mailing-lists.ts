@@ -10,12 +10,13 @@ import type { InboundQueueMessage } from "@/lib/email/inbound";
  * Nested lists are expanded recursively, not just one level: a member address
  * that names another list contributes that list's members to the delivery
  * set. Expansions are cached as results rather than visited flags — cycle
- * detection lives on the DFS stack — and a member list that itself holds
- * the post contributes nothing to the caller's expansion: it registers a
- * held record instead, and all held branches settle in a single pass once
- * traversal ends, so no reach order can preempt a designated reviewer or
- * commit a fallback from incomplete information. The depth cap bounds the
- * member queries a pathological chain can cost in one inbound delivery.
+ * detection lives on the DFS stack — and the depth cap bounds the member
+ * queries a pathological chain can cost in one inbound delivery. Moderation
+ * applies only to the directly-addressed list: a nested list always expands
+ * as ordinary members, its own `moderated` flag and its member rows' flags
+ * ignored. Propagating holds through nesting is a deferred slice — making
+ * per-branch reviewer resolution order-independent under shared subtrees,
+ * cycles and the depth cap proved unsound.
  */
 const MAX_LIST_EXPANSION_DEPTH = 5;
 
@@ -36,99 +37,35 @@ export type MailingListExpansion = {
 	deliveries: MailingListDelivery[];
 	skipped: SkippedListMember[];
 	/**
-	 * Lists whose own hold produced no deliverable reviewer — neither an owner
-	 * member nor the list's owning user. The caller retains the raw object
-	 * under `held/<listId>/` for each, so a held post is never silently
-	 * discarded no matter how deeply the holding list is nested.
+	 * Lists whose hold produced no deliverable reviewer — neither an owner
+	 * member nor the list's owning user. Only the directly-addressed list
+	 * can hold today, so this carries at most that one list; the caller
+	 * retains the raw object under `held/<listId>/` so a held post is never
+	 * silently discarded.
 	 */
 	retained: ResolvedList[];
 };
 
 /**
- * The restriction an expansion ran under. "restricted" means only owner-role
- * member rows were expanded (a held post's reviewer set); "full" means every
- * member row.
+ * The member-row filter a scan ran under. "restricted" — used only for the
+ * directly-addressed list of a held post — expands owner-role rows, the
+ * reviewers. Everything beneath that first scan expands "full": restriction
+ * never propagates into nesting, so a cached result is always the ordinary
+ * one and a nested list's own moderation flags are ignored entirely.
  */
 type ExpansionRestriction = "restricted" | "full";
-
-/**
- * One resolved member mailbox plus the context that produced it. `viaHold`
- * marks a held branch's reviewer copy — sender suppression must never strip
- * those, they are the moderation notice; expansion entries never carry it
- * (held members do not merge into expansion maps) so it only appears inside
- * held records' folded reviewer sets. `ownerReachable` marks a delivery a
- * restricted pass over the same member rows would also produce, which is
- * what lets a cached full expansion answer a later restricted query.
- */
-type CachedDelivery = {
-	delivery: MailingListDelivery;
-	viaHold: boolean;
-	ownerReachable: boolean;
-};
-
-/**
- * A computed member expansion, cached separately from traversal bookkeeping:
- * an entry is reuse-safe for any query at a depth at least the one it was
- * computed at, because a deeper compute only ever had less budget — a
- * shallower query instead recomputes and overwrites, so converging paths
- * converge on the union regardless of which ran first.
- */
-type CachedExpansion = {
-	depth: number;
-	entries: Map<string, CachedDelivery>;
-	/**
-	 * Held member lists this expansion's scan reached — listId, flagged
-	 * `ownerReachable` when every row on the path was owner-role. Kept inside
-	 * the reusable result because a held record's dependency set is part of
-	 * what the scan computed: a cache hit or projection must replay the same
-	 * edges the fresh scan produced, or an enclosing hold settles from a
-	 * dependency set that never existed.
-	 */
-	heldDeps: Map<string, boolean>;
-};
-
-/**
- * Per-list record for a nested list that holds the post. Records only gather
- * inputs during traversal — the direct restricted-scan entries and the held
- * lists its member rows designated as reviewer sources — so nothing about the
- * hold is decided mid-expansion: suppression, fallback and retention all run
- * in a finalization pass once every reach is known, which is what makes an
- * over-depth reach or an in-progress cycle incapable of manufacturing a
- * fallback beside a real reviewer.
- */
-type HeldRecord = {
-	list: ResolvedList;
-	/**
-	 * Direct restricted-scan entries unioned across every eligible compute.
-	 * Held members contribute through `deps` instead — entries here are only
-	 * mailbox deliveries, so `viaHold` is always false on them.
-	 */
-	entries: Map<string, CachedDelivery>;
-	/**
-	 * Held lists this list's member scan designated as reviewer sources,
-	 * unioned from every expansion result the computes produced — including
-	 * cache hits and full-to-restricted projections — so a parent hold's
-	 * dependency set is the same no matter which reach order discovered it.
-	 */
-	deps: Set<string>;
-	/**
-	 * Shallowest depth at which the member scan ran; unset when every reach
-	 * was past the cap. Only computed records run the reviewer ladder — a
-	 * list that could never be scanned retains rather than guessing at
-	 * reviewers it was never allowed to enumerate.
-	 */
-	computedDepth?: number;
-};
 
 type ExpansionState = {
 	skipped: SkippedListMember[];
 	skippedKeys: Set<string>;
-	/** listId -> computed expansions by restriction, each carrying its compute depth. */
-	expansions: Map<string, { full?: CachedExpansion; restricted?: CachedExpansion }>;
+	/**
+	 * listId -> computed ordinary expansion, each carrying its compute
+	 * depth. Only full results are cached: the single restricted query a
+	 * delivery ever runs is the root's own scan, and it is never reused.
+	 */
+	expansions: Map<string, { depth: number; entries: Map<string, MailingListDelivery> }>;
 	/** The DFS stack — pure cycle detection; it owns no delivery state. */
 	computing: Set<string>;
-	/** listId -> the hold's handling record — the root list included when it is held. */
-	held: Map<string, HeldRecord>;
 	senderMailbox: ResolvedMailbox | null;
 };
 
@@ -139,23 +76,22 @@ type ExpansionState = {
  * The result is deduplicated by mailbox: two member rows that resolve to the
  * same mailbox (say, an address and its alias) deliver exactly one copy.
  *
- * `ownersOnly` marks the whole delivery as held for review: expansion is
- * restricted to owner members, the reviewers. A nested list that would hold
- * the sender's post itself is a held branch — nothing about it is decided
- * during traversal, so no reach order can displace its reviewers or
- * manufacture a fallback: its record just accumulates direct entries and
- * reviewer-source edges, and the complete no-reviewer handling (sole-
- * reviewer suppression protection, owning-user fallback, `retained`) runs
- * in one settlement pass at the end.
+ * `ownersOnly` marks the whole delivery as held for review: the root scan
+ * expands only owner-role member rows, the reviewers. Moderation stops at
+ * the addressed list — a member row that names another list expands it as
+ * ordinary members even inside the restricted scan, so an owner-list member
+ * contributes its full membership, and a nested list's own `moderated`
+ * flags are ignored while nested. Propagating holds through nesting is a
+ * deferred slice: making per-branch reviewer resolution order-independent
+ * under shared subtrees, cycles and the depth cap proved unsound, so today
+ * a nested moderated list delivers as ordinary members.
  *
  * The delivery set is a union over expansion branches, and traversal order
- * cannot change it: expansions are cached as results, not visited flags, so
- * a member reached only through a restricted branch is restricted while the
- * same member reached through an unheld sibling branch still receives the
- * post, a shallow reach recomputes what a deep one truncated at the cap,
- * and held records fold their dependency closure once, at the end. Skipped
- * members are reported, never subtracted — which branch a mailbox came
- * through cannot make another branch's copy undeliverable.
+ * cannot change it: expansions are cached as results, not visited flags,
+ * so the same list reached twice delivers the same members, and a shallow
+ * reach recomputes what a deep one truncated at the cap. Skipped members
+ * are reported, never subtracted — which branch a mailbox came through
+ * cannot make another branch's copy undeliverable.
  */
 export async function expandMailingListDeliveries(
 	db: AppDatabase,
@@ -169,107 +105,36 @@ export async function expandMailingListDeliveries(
 		skippedKeys: new Set(),
 		expansions: new Map(),
 		computing: new Set(),
-		held: new Map(),
 		senderMailbox: await resolveMailboxIdentity(db, envelopeFrom ?? ""),
 	};
-	const root = await expandList(db, list.listId, envelopeFrom, state, ownersOnly ? "restricted" : "full", 0);
-
-	// A held root is a held record like any nested one: its scan's entries and
-	// reviewer-source edges register here so a descendant that points back at
-	// the root deps on its real reviewer set instead of finding a record that
-	// was never computed — and the root's own ladder then runs in the same
-	// settlement pass instead of a special case.
-	const ordinary = new Map<string, MailingListDelivery>();
-	if (ownersOnly) {
-		const record: HeldRecord = state.held.get(list.listId) ?? { list, entries: new Map(), deps: new Set() };
-		for (const entry of root.entries.values()) mergeDelivery(record.entries, { ...entry });
-		for (const [depId, ownerReachable] of root.heldDeps) {
-			if (ownerReachable) record.deps.add(depId);
-		}
-		record.computedDepth = 0;
-		state.held.set(list.listId, record);
-	} else {
-		for (const entry of root.entries.values()) {
-			ordinary.set(entry.delivery.mailbox.mailboxId, entry.delivery);
-		}
-	}
-
-	// Held branches settle only now, once every reach is known. A record's
-	// reviewer set is the union of its own scan and the scans of every held
-	// list its member rows designated — the dependency closure, computed by
-	// reachability so dependency cycles find the same fixed point a
-	// converged expansion would. Each branch then runs its own ladder:
-	// suppression that cannot take the last reviewer, the list's owning
-	// user as notice-only fallback, retention when even that fails. A
-	// record never computed was reached solely past the depth cap and
-	// retains without the ladder — it was never allowed to enumerate its
-	// reviewers, so it must not guess.
-	const reviewer = new Map<string, MailingListDelivery>();
-	const retained = new Map<string, ResolvedList>();
-	const folded = new Map<string, Map<string, CachedDelivery>>();
-	for (const listId of state.held.keys()) {
-		const reviewers = new Map<string, CachedDelivery>();
-		const seen = new Set<string>();
-		const queue = [listId];
-		while (queue.length) {
-			const current = queue.pop()!;
-			if (seen.has(current)) continue;
-			seen.add(current);
-			const depRecord = state.held.get(current);
-			if (!depRecord) continue;
-			// Clone: folded copies get `viaHold`, and the flag must not leak
-			// back into the source record's direct entries.
-			for (const entry of depRecord.entries.values()) {
-				mergeDelivery(reviewers, { ...entry, viaHold: current === listId ? entry.viaHold : true });
-			}
-			for (const dep of depRecord.deps) queue.push(dep);
-		}
-		folded.set(listId, reviewers);
-	}
-	for (const [listId, record] of state.held) {
-		if (record.computedDepth === undefined) {
-			retained.set(listId, record.list);
-			continue;
-		}
-		const reviewers = folded.get(listId)!;
-		const senderId = state.senderMailbox?.mailboxId;
-		if (senderId && reviewers.size > 1 && !reviewers.get(senderId)?.viaHold) reviewers.delete(senderId);
-		if (!reviewers.size) {
-			const fallback = await resolveFallbackReviewer(db, record.list);
-			if (fallback) {
-				reviewers.set(fallback.mailboxId, {
-					delivery: { address: `${fallback.localPart}@${fallback.hostname}`, mailbox: fallback },
-					viaHold: true,
-					ownerReachable: true,
-				});
-			}
-		}
-		if (!reviewers.size) {
-			retained.set(listId, record.list);
-			continue;
-		}
-		for (const entry of reviewers.values()) reviewer.set(entry.delivery.mailbox.mailboxId, entry.delivery);
-	}
+	const { entries } = await expandList(db, list.listId, envelopeFrom, state, ownersOnly ? "restricted" : "full", 0);
+	const deliveries = new Map(entries);
 
 	// Sender dedup: a member posting to the list does not get a copy of their
 	// own post, whether their member row uses the address they sent from or an
 	// alias of the same mailbox. The identity lookup — not the delivery
 	// resolver — decides whose mailbox the sender owns, so a catch-all cannot
 	// fold an unrelated sender onto a member mailbox and suppress their copy.
-	// Suppression touches ordinary deliveries only: a held post's reviewers
-	// are the moderation notice, and for a held post it applies only while
-	// another reviewer remains — echo-free delivery must not leave a held
-	// post with nobody who can act on it.
-	if (state.senderMailbox && (!ownersOnly || ordinary.size + reviewer.size > 1)) {
-		ordinary.delete(state.senderMailbox.mailboxId);
+	// For a held post the reviewers are the moderation notice, so suppression
+	// applies only while another reviewer remains — echo-free delivery must
+	// not leave a held post with nobody who can act on it.
+	if (state.senderMailbox && (!ownersOnly || deliveries.size > 1)) {
+		deliveries.delete(state.senderMailbox.mailboxId);
 	}
 
-	// A mailbox reachable both ways keeps the ordinary subscription copy.
-	const deliveries = new Map(ordinary);
-	for (const [mailboxId, delivery] of reviewer) {
-		if (!deliveries.has(mailboxId)) deliveries.set(mailboxId, delivery);
+	// A held post must land with a reviewer: when no owner member resolves,
+	// the list's owning user's mailbox is the reviewer of last resort, and
+	// when even that fails the raw is retained under `held/<listId>/`.
+	const retained: ResolvedList[] = [];
+	if (ownersOnly && !deliveries.size) {
+		const fallback = await resolveFallbackReviewer(db, list);
+		if (fallback) {
+			deliveries.set(fallback.mailboxId, { address: `${fallback.localPart}@${fallback.hostname}`, mailbox: fallback });
+		} else {
+			retained.push(list);
+		}
 	}
-	return { deliveries: [...deliveries.values()], skipped: state.skipped, retained: [...retained.values()] };
+	return { deliveries: [...deliveries.values()], skipped: state.skipped, retained };
 }
 
 /**
@@ -313,64 +178,19 @@ function pushSkipped(state: ExpansionState, email: string, reason: SkippedListMe
 	state.skipped.push({ email, reason });
 }
 
-function mergeDelivery(entries: Map<string, CachedDelivery>, candidate: CachedDelivery): void {
-	const existing = entries.get(candidate.delivery.mailbox.mailboxId);
-	if (!existing) {
-		entries.set(candidate.delivery.mailbox.mailboxId, candidate);
-		return;
-	}
-	// Flags are OR-ed so a mailbox reachable both ways keeps the stronger
-	// claims — a reviewer copy stays protected, an owner path stays countable.
-	existing.viaHold ||= candidate.viaHold;
-	existing.ownerReachable ||= candidate.ownerReachable;
+function mergeDelivery(entries: Map<string, MailingListDelivery>, delivery: MailingListDelivery): void {
+	if (!entries.has(delivery.mailbox.mailboxId)) entries.set(delivery.mailbox.mailboxId, delivery);
 }
 
 /**
- * Records and drives the compute for a nested list that holds the post —
- * deliberately decision-free, so no reach can commit a fallback or
- * retention from incomplete information. The child's restricted member
- * scan runs when this reach has enough remaining depth; what it produces —
- * entries and the held lists its own member rows designated — unions into
- * the child's record, and the caller records the child itself as a
- * reviewer source. Returns an outcome only so the caller can report an
- * over-depth member; the actual reviewer set is settled after traversal,
- * in `expandMailingListDeliveries`.
- */
-async function reachHeld(
-	db: AppDatabase,
-	child: ResolvedList,
-	envelopeFrom: string | null | undefined,
-	state: ExpansionState,
-	depth: number,
-): Promise<"computed" | "cached" | "cycle" | "too-deep"> {
-	const record: HeldRecord = state.held.get(child.listId) ?? {
-		list: child,
-		entries: new Map(),
-		deps: new Set<string>(),
-	};
-	state.held.set(child.listId, record);
-	if (state.computing.has(child.listId)) return "cycle";
-	if (record.computedDepth !== undefined && record.computedDepth <= depth) return "cached";
-	if (depth >= MAX_LIST_EXPANSION_DEPTH) return "too-deep";
-	const { entries, heldDeps } = await expandList(db, child.listId, envelopeFrom, state, "restricted", depth);
-	for (const entry of entries.values()) mergeDelivery(record.entries, { ...entry });
-	for (const [depId, ownerReachable] of heldDeps) {
-		if (ownerReachable) record.deps.add(depId);
-	}
-	record.computedDepth = record.computedDepth === undefined ? depth : Math.min(record.computedDepth, depth);
-	return "computed";
-}
-
-/**
- * Computes (or reuses) a list's member expansion at one restriction level.
- * Caching stores the result, not a visited flag: a full pass answers a
- * restricted query for free through `ownerReachable`, a cached entry serves
- * any query at equal or greater depth, and a shallower query recomputes for
- * the richer result — the cache converges to the union of every path. A list
- * on the current DFS stack contributes nothing to the caller (its ancestor
- * scan already owns it), past the depth cap a member list resolves only
- * from cache, and a member that holds the post contributes nothing at all —
- * held branches settle from their own records after traversal.
+ * Computes (or reuses) a list's ordinary member expansion. Caching stores
+ * the result, not a visited flag: a cached entry serves any query at equal
+ * or greater depth, and a shallower query recomputes for the richer result
+ * — the cache converges to the union of every path. A list on the current
+ * DFS stack contributes nothing to the caller (its ancestor scan already
+ * owns it), and past the depth cap a member list resolves only from cache.
+ * `restricted` exists for the root scan of a held post only — it filters
+ * the member query to owner rows — and is never propagated or cached.
  */
 async function expandList(
 	db: AppDatabase,
@@ -379,33 +199,15 @@ async function expandList(
 	state: ExpansionState,
 	restriction: ExpansionRestriction,
 	depth: number,
-): Promise<{ entries: Map<string, CachedDelivery>; heldDeps: Map<string, boolean>; blocked: "cycle" | "depth" | null }> {
-	const record = state.expansions.get(listId) ?? {};
-	state.expansions.set(listId, record);
-	const cached = record[restriction];
-	if (cached && cached.depth <= depth) return { entries: cached.entries, heldDeps: cached.heldDeps, blocked: null };
-	if (restriction === "restricted" && record.full && record.full.depth <= depth) {
-		const derived = new Map<string, CachedDelivery>();
-		for (const entry of record.full.entries.values()) {
-			if (entry.ownerReachable) derived.set(entry.delivery.mailbox.mailboxId, { ...entry });
-		}
-		// A restricted rescan sees only owner rows, so it finds a held member
-		// exactly when every row on the path was one — the same projection the
-		// entries get.
-		const derivedDeps = new Map<string, boolean>();
-		for (const [depId, ownerReachable] of record.full.heldDeps) {
-			if (ownerReachable) derivedDeps.set(depId, true);
-		}
-		record.restricted = { depth: record.full.depth, entries: derived, heldDeps: derivedDeps };
-		return { entries: derived, heldDeps: derivedDeps, blocked: null };
-	}
-	if (state.computing.has(listId)) return { entries: new Map(), heldDeps: new Map(), blocked: "cycle" };
-	if (depth >= MAX_LIST_EXPANSION_DEPTH) return { entries: new Map(), heldDeps: new Map(), blocked: "depth" };
+): Promise<{ entries: Map<string, MailingListDelivery>; blocked: "cycle" | "depth" | null }> {
+	const cached = restriction === "full" ? state.expansions.get(listId) : undefined;
+	if (cached && cached.depth <= depth) return { entries: cached.entries, blocked: null };
+	if (state.computing.has(listId)) return { entries: new Map(), blocked: "cycle" };
+	if (depth >= MAX_LIST_EXPANSION_DEPTH) return { entries: new Map(), blocked: "depth" };
 
 	state.computing.add(listId);
 	try {
-		const entries = new Map<string, CachedDelivery>();
-		const heldDeps = new Map<string, boolean>();
+		const entries = new Map<string, MailingListDelivery>();
 		const members = await db
 			.select({ email: mailingListMembers.email, role: mailingListMembers.role })
 			.from(mailingListMembers)
@@ -414,50 +216,27 @@ async function expandList(
 		for (const member of members) {
 			const decision = await resolveInboundAddress(db, member.email, envelopeFrom);
 			if (decision?.mailbox) {
-				mergeDelivery(entries, {
-					delivery: { address: normalizeEmailAddress(member.email), mailbox: decision.mailbox },
-					viaHold: false,
-					ownerReachable: member.role === "owner",
-				});
+				mergeDelivery(entries, { address: normalizeEmailAddress(member.email), mailbox: decision.mailbox });
 				continue;
 			}
 			if (decision?.action === "list" && decision.list) {
-				const child = decision.list;
-				if (decision.heldForModeration) {
-					// A list that would itself hold this post is a held branch.
-					// Its reviewers are settled globally after traversal — nothing
-					// merges into this expansion — but the edge itself is part of
-					// the result: this row designated the child a reviewer source,
-					// reachable through an owner row only when the row is one.
-					heldDeps.set(child.listId, (heldDeps.get(child.listId) ?? false) || member.role === "owner");
-					const outcome = await reachHeld(db, child, envelopeFrom, state, depth + 1);
-					if (outcome === "too-deep") pushSkipped(state, member.email, "too-deep");
-					continue;
-				}
-				const childResult = await expandList(db, child.listId, envelopeFrom, state, restriction, depth + 1);
+				// A member row that names another list always expands as
+				// ordinary members: a nested list's own moderation flags
+				// (`heldForModeration`, member-level flags) do not apply here —
+				// moderation is decided only for the addressed list, and a
+				// posting decision can still reject the whole branch.
+				const childResult = await expandList(db, decision.list.listId, envelopeFrom, state, "full", depth + 1);
 				if (childResult.blocked) {
 					pushSkipped(state, member.email, childResult.blocked === "cycle" ? "already-expanded" : "too-deep");
 					continue;
 				}
-				for (const entry of childResult.entries.values()) {
-					mergeDelivery(entries, {
-						delivery: entry.delivery,
-						viaHold: entry.viaHold,
-						ownerReachable: member.role === "owner" && entry.ownerReachable,
-					});
-				}
-				// Held lists the child scan reached belong to this expansion too,
-				// owner-reachable only through a chain that is owner all the way.
-				for (const [depId, depOwnerReachable] of childResult.heldDeps) {
-					const reachable = member.role === "owner" && depOwnerReachable;
-					heldDeps.set(depId, (heldDeps.get(depId) ?? false) || reachable);
-				}
+				for (const entry of childResult.entries.values()) mergeDelivery(entries, entry);
 				continue;
 			}
 			pushSkipped(state, member.email, decision?.action === "reject" ? "rejected" : "external");
 		}
-		record[restriction] = { depth, entries, heldDeps };
-		return { entries, heldDeps, blocked: null };
+		if (restriction === "full") state.expansions.set(listId, { depth, entries });
+		return { entries, blocked: null };
 	} finally {
 		state.computing.delete(listId);
 	}
@@ -509,8 +288,8 @@ async function expandList(
  * it just has no built-in approval path — every repost re-holds, so clearing
  * the hold takes an operator acting on a delivered copy or unflagging a row.
  *
- * Every held branch — the root list or a nested list that holds the post —
- * gets a reviewer: its owner members, then its owning user's mailbox as a
+ * A held post — only the directly-addressed list can hold one — always gets
+ * a reviewer: its owner members, then its owning user's mailbox as a
  * notice-only destination, then retention under `held/<listId>/<hash>.eml`.
  * Retained objects sit outside the `inbound/` sweep and are operator-
  * recoverable from the bucket only — no in-app replay exists yet, and
