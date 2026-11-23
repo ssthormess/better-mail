@@ -630,6 +630,135 @@ test("a held list reachable only past the depth cap is retained", async (t) => {
 	assert.ok([...objects.keys()].some((key) => key.startsWith("held/eng/")), "held raw retained for the capped child");
 });
 
+test("a depth-eligible held parent's fallback waits for its held child to settle", async (t) => {
+	t.mock.method(console, "info", () => {});
+	t.mock.method(console, "warn", () => {});
+	// heldp holds the stranger's post at depth 4 and reaches the held child
+	// only at depth 5 — past the cap — while a shallow branch reaches it at
+	// depth 2. The child is the parent's only designated reviewer source, so
+	// once it settles the parent's fallback must never have existed.
+	for (const deepFirst of [true, false]) {
+		const { env, database, objects, queued } = await setup(t);
+		database.db.exec(`
+			INSERT INTO users (id, email, password_hash, name, role, is_primary_admin, created_at) VALUES ('mod', 'mod@one.test', 'hash', 'Mod', 'member', 0, 1);
+			INSERT INTO mailboxes (id, user_id, domain_id, local_part, created_at) VALUES ('modbox', 'mod', 'one', 'mod', 4);
+		`);
+		insertList(database, {
+			id: "all",
+			localPart: "all",
+			postingPolicy: "anyone",
+			members: deepFirst ? ["a1@one.test", "b1@one.test"] : ["b1@one.test", "a1@one.test"],
+		});
+		insertList(database, { id: "a1", localPart: "a1", postingPolicy: "anyone", members: ["a2@one.test"] });
+		insertList(database, { id: "a2", localPart: "a2", postingPolicy: "anyone", members: ["a3@one.test"] });
+		insertList(database, { id: "a3", localPart: "a3", postingPolicy: "anyone", members: ["heldp@one.test"] });
+		insertList(database, { id: "b1", localPart: "b1", postingPolicy: "anyone", members: ["heldc@one.test"] });
+		insertList(database, {
+			id: "heldp",
+			localPart: "heldp",
+			postingPolicy: "anyone",
+			moderated: 1,
+			userId: "mod",
+			members: [{ email: "heldc@one.test", role: "owner" }],
+		});
+		insertList(database, {
+			id: "heldc",
+			localPart: "heldc",
+			postingPolicy: "anyone",
+			moderated: 1,
+			members: [{ email: "ann@one.test", role: "owner" }],
+		});
+
+		await intake(env, "all@one.test", "stranger@elsewhere.test");
+		await processInboundMessage(env, queued[0]);
+
+		// Deep-first used to finalize heldp's fallback (modbox) before heldc
+		// could settle at its eligible reach, leaving a spurious notice copy
+		// beside Ann's reviewer copy.
+		assert.deepEqual(
+			mailByMailbox(database).map((row) => row.mailboxId),
+			["annbox"],
+			`traversal order deepFirst=${deepFirst} changed the delivery set`,
+		);
+		assert.equal([...objects.keys()].filter((key) => key.startsWith("held/")).length, 0);
+	}
+});
+
+test("a moderated list cycle does not manufacture a fallback beside a real reviewer", async (t) => {
+	t.mock.method(console, "info", () => {});
+	t.mock.method(console, "warn", () => {});
+	const { env, database, objects, queued } = await setup(t);
+	database.db.exec(`
+		INSERT INTO users (id, email, password_hash, name, role, is_primary_admin, created_at) VALUES ('mod', 'mod@one.test', 'hash', 'Mod', 'member', 0, 1);
+		INSERT INTO mailboxes (id, user_id, domain_id, local_part, created_at) VALUES ('modbox', 'mod', 'one', 'mod', 4);
+	`);
+	insertList(database, { id: "all", localPart: "all", postingPolicy: "anyone", members: ["alpha@one.test"] });
+	insertList(database, {
+		id: "alpha",
+		localPart: "alpha",
+		postingPolicy: "anyone",
+		moderated: 1,
+		userId: "admin",
+		members: [{ email: "ann@one.test", role: "owner" }, { email: "beta@one.test", role: "owner" }],
+	});
+	insertList(database, {
+		id: "beta",
+		localPart: "beta",
+		postingPolicy: "anyone",
+		moderated: 1,
+		userId: "mod",
+		members: [{ email: "alpha@one.test", role: "owner" }],
+	});
+
+	// Reaching alpha again inside beta's compute is a cycle re-entry — an
+	// in-progress expansion, not an empty reviewer set. Both records fold to
+	// the same fixed point: Ann, the only reviewer the cycle can produce.
+	await intake(env, "all@one.test", "stranger@elsewhere.test");
+	await processInboundMessage(env, queued[0]);
+
+	assert.deepEqual(mailByMailbox(database).map((row) => row.mailboxId), ["annbox"]);
+	assert.equal([...objects.keys()].filter((key) => key.startsWith("held/")).length, 0);
+});
+
+test("a moderated cycle with no reviewer falls back per held branch", async (t) => {
+	t.mock.method(console, "info", () => {});
+	t.mock.method(console, "warn", () => {});
+	const { env, database, objects, queued } = await setup(t);
+	database.db.exec(`
+		INSERT INTO users (id, email, password_hash, name, role, is_primary_admin, created_at) VALUES ('mod', 'mod@one.test', 'hash', 'Mod', 'member', 0, 1);
+		INSERT INTO mailboxes (id, user_id, domain_id, local_part, created_at) VALUES ('modbox', 'mod', 'one', 'mod', 4);
+	`);
+	insertList(database, { id: "all", localPart: "all", postingPolicy: "anyone", members: ["alpha@one.test"] });
+	insertList(database, {
+		id: "alpha",
+		localPart: "alpha",
+		postingPolicy: "anyone",
+		moderated: 1,
+		userId: "admin",
+		members: [{ email: "beta@one.test", role: "owner" }],
+	});
+	insertList(database, {
+		id: "beta",
+		localPart: "beta",
+		postingPolicy: "anyone",
+		moderated: 1,
+		userId: "mod",
+		members: [{ email: "alpha@one.test", role: "owner" }],
+	});
+
+	// Neither list can enumerate a member reviewer — the cycle is the whole
+	// membership — so each held branch lands its own notice with its owning
+	// user instead of one inheriting the other's fallback.
+	await intake(env, "all@one.test", "stranger@elsewhere.test");
+	await processInboundMessage(env, queued[0]);
+
+	assert.deepEqual(
+		new Set(mailByMailbox(database).map((row) => row.mailboxId)),
+		new Set(["bobbox", "modbox"]),
+	);
+	assert.equal([...objects.keys()].filter((key) => key.startsWith("held/")).length, 0);
+});
+
 test("a pre-staging payload consumed after the staged copy still dedupes on the canonical key", async (t) => {
 	t.mock.method(console, "info", () => {});
 	const { env, database, objects, queued } = await setup(t);
