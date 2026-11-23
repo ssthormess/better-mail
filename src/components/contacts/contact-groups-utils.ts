@@ -5,7 +5,6 @@ import type {
 	ContactGroupMember,
 	ContactGroupMembersResponse,
 	ContactGroupResponse,
-	ContactGroupsData,
 	ContactGroupsIndexResponse,
 	ContactGroupUpdateResponse,
 } from "./contact-groups-types";
@@ -14,11 +13,17 @@ export function contactGroupsQueryKey(mailboxId: string) {
 	return ["contact-groups", mailboxId] as const;
 }
 
+export function contactGroupMembersQueryKey(mailboxId: string, groupId: string) {
+	return ["contact-groups", mailboxId, "members", groupId] as const;
+}
+
 // One scope key for group and member writes, so the UI gate and the synchronous
 // rechecks serialize them — an earlier response landing last can never overwrite
-// a newer snapshot.
-export function contactGroupsWritesKey(mailboxId: string) {
-	return ["contact-groups", mailboxId, "writes"] as const;
+// a newer snapshot. It is deliberately mailbox-free: groups live on the mailbox
+// owner's contact book, so two mailbox keys can front the same book and writes
+// through either must serialize.
+export function contactGroupsWritesKey() {
+	return ["contact-groups", "writes"] as const;
 }
 
 // Validation failures arrive as flattened zod errors ({formErrors, fieldErrors}), not the
@@ -30,7 +35,7 @@ export function apiError(data: { error?: unknown }, fallback: string): Error {
 	return new Error(typeof message === "string" && message ? message : fallback);
 }
 
-// Patch the snapshot after a mutation: cancel an in-flight GET so its stale
+// Patch a snapshot after a mutation: cancel an in-flight GET so its stale
 // response can't land on top of the patch. If there is no snapshot to patch (the
 // cache entry was dropped while a write was in flight), restart the exact query —
 // otherwise the cancelled cold GET would leave it pending forever. The restart is
@@ -39,7 +44,7 @@ export function apiError(data: { error?: unknown }, fallback: string): Error {
 export async function patchContactGroups(
 	qc: QueryClient,
 	mailboxId: string,
-	patch: (current: ContactGroupsData) => ContactGroupsData,
+	patch: (current: ContactGroup[]) => ContactGroup[],
 ) {
 	const queryKey = contactGroupsQueryKey(mailboxId);
 	await qc.cancelQueries({ queryKey, exact: true });
@@ -47,22 +52,39 @@ export async function patchContactGroups(
 		void qc.invalidateQueries({ queryKey, exact: true, refetchType: "all" }).catch(() => {});
 		return;
 	}
-	qc.setQueryData<ContactGroupsData>(queryKey, (current) => (current ? patch(current) : current));
+	qc.setQueryData<ContactGroup[]>(queryKey, (current) => (current ? patch(current) : current));
+}
+
+// Same discipline for one group's member slice: the member write responses carry
+// the fresh slice, so a cached entry is overwritten; a missing entry just needs
+// the (possibly cancelled) GET restarted.
+export async function patchContactGroupMembers(
+	qc: QueryClient,
+	mailboxId: string,
+	groupId: string,
+	members: ContactGroupMember[],
+) {
+	const queryKey = contactGroupMembersQueryKey(mailboxId, groupId);
+	await qc.cancelQueries({ queryKey, exact: true });
+	if (qc.getQueryData(queryKey) === undefined) {
+		void qc.invalidateQueries({ queryKey, exact: true, refetchType: "all" }).catch(() => {});
+		return;
+	}
+	qc.setQueryData<ContactGroupMember[]>(queryKey, members);
 }
 
 // The app's QueryClient disables refetch on mount/focus/reconnect, so a bare
 // invalidation never refetches an inactive observer. Every mutation applies its
-// server response to the snapshot directly, then this refreshes all observers to
-// converge on server truth. A pending first-load GET coalesces with the
-// invalidation instead of being replaced, so cancel the exact query first —
-// a stale pre-mutation response landing last would hide a fresh write.
+// server response to the snapshot directly, then this refreshes observers to
+// converge on server truth. The contact book is owner-scoped — several mailbox
+// keys can front the same groups — so the whole "contact-groups" prefix is
+// cancelled and invalidated, not just the active mailbox's entry.
 // Fire-and-forget: a mutation's pending lifetime must not extend to this
 // post-commit refresh.
-export function refetchContactGroups(qc: QueryClient, mailboxId: string) {
-	const queryKey = contactGroupsQueryKey(mailboxId);
+export function refetchContactGroups(qc: QueryClient) {
 	void qc
-		.cancelQueries({ queryKey, exact: true })
-		.then(() => qc.invalidateQueries({ queryKey, exact: true, refetchType: "all" }))
+		.cancelQueries({ queryKey: ["contact-groups"] })
+		.then(() => qc.invalidateQueries({ queryKey: ["contact-groups"], refetchType: "all" }))
 		.catch(() => {});
 }
 
@@ -75,35 +97,20 @@ export function sortContactGroups(groups: ContactGroup[]): ContactGroup[] {
 	});
 }
 
-/** Inverts membersByGroup once for the contact rows: contact id -> its groups, already name-sorted. */
-export function indexGroupsByContact(data: ContactGroupsData | undefined): Record<string, ContactGroup[]> {
-	const index: Record<string, ContactGroup[]> = {};
-	if (!data) return index;
-	for (const group of data.groups) {
-		for (const member of data.membersByGroup[group.id] ?? []) {
-			(index[member.contactId] ??= []).push(group);
-		}
-	}
-	return index;
-}
-
 function mailboxParams(mailboxId: string): string {
 	return new URLSearchParams({ mailboxId }).toString();
 }
 
-export async function fetchContactGroupsData(mailboxId: string): Promise<ContactGroupsData> {
+export async function fetchContactGroups(mailboxId: string): Promise<ContactGroup[]> {
 	const res = await authFetch(`/api/contacts/groups?${mailboxParams(mailboxId)}`);
 	const json = (await res.json()) as ContactGroupsIndexResponse;
 	if (!res.ok) throw apiError(json, "Failed to load groups");
-	const groups = json.groups ?? [];
-	// The API exposes members only per group — there is no per-contact reverse
-	// lookup — so membership is aggregated here once for the whole page.
-	const entries = await Promise.all(
-		groups.map(async (group) => [group.id, await fetchContactGroupMembers(mailboxId, group.id)] as const),
-	);
-	return { groups, membersByGroup: Object.fromEntries(entries) };
+	return json.groups ?? [];
 }
 
+// Member lists are fetched lazily per group — only surfaces that need membership
+// (the assign dialog) run this, each group in its own query so one failure
+// degrades a single row instead of the whole surface.
 export async function fetchContactGroupMembers(mailboxId: string, groupId: string): Promise<ContactGroupMember[]> {
 	const res = await authFetch(`/api/contacts/groups/${groupId}/members?${mailboxParams(mailboxId)}`);
 	const json = (await res.json()) as ContactGroupMembersResponse;

@@ -1,6 +1,6 @@
 "use client";
 
-import { useIsMutating, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useIsMutating, useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useLanguage } from "@/components/language-provider";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
@@ -11,12 +11,16 @@ import {
 	DialogTitle,
 } from "@/components/ui/dialog";
 import { Skeleton } from "@/components/ui/skeleton";
+import { ContactGroupsManager } from "./contact-groups-manager";
 import type { ContactListItem } from "./contacts-page-types";
 import {
 	addContactGroupMember,
+	contactGroupMembersQueryKey,
 	contactGroupsQueryKey,
 	contactGroupsWritesKey,
-	fetchContactGroupsData,
+	fetchContactGroupMembers,
+	fetchContactGroups,
+	patchContactGroupMembers,
 	patchContactGroups,
 	refetchContactGroups,
 	removeContactGroupMember,
@@ -36,18 +40,29 @@ export function ContactGroupsDialog({ mailboxId, contact, open, onOpenChange }: 
 	const qc = useQueryClient();
 	const groupsQuery = useQuery({
 		queryKey: contactGroupsQueryKey(mailboxId),
-		queryFn: () => fetchContactGroupsData(mailboxId),
-		enabled: !!mailboxId,
+		queryFn: () => fetchContactGroups(mailboxId),
+		enabled: open && !!mailboxId,
 	});
-	const groups = groupsQuery.data?.groups ?? [];
-	const membersByGroup = groupsQuery.data?.membersByGroup ?? {};
+	const groups = groupsQuery.data ?? [];
 
-	// Group writes share the mailbox-wide scope: while any is in flight every
-	// toggle waits, so arrival order can't undo a newer snapshot.
-	const busy = useIsMutating({ mutationKey: contactGroupsWritesKey(mailboxId) }) > 0;
+	// Membership loads lazily, one query per group and only while this surface
+	// is open — the API exposes no per-contact reverse lookup, and there is no
+	// cheaper way to learn which groups a contact sits in. Each slice is its own
+	// query, so a failing members GET degrades just that group's row.
+	const memberQueries = useQueries({
+		queries: groups.map((group) => ({
+			queryKey: contactGroupMembersQueryKey(mailboxId, group.id),
+			queryFn: () => fetchContactGroupMembers(mailboxId, group.id),
+			enabled: open && !!mailboxId,
+		})),
+	});
+
+	// Group and member writes share one book-wide scope — while any is in
+	// flight every control waits, so arrival order can't undo a newer snapshot.
+	const busy = useIsMutating({ mutationKey: contactGroupsWritesKey() }) > 0;
 
 	const toggle = useMutation({
-		mutationKey: contactGroupsWritesKey(mailboxId),
+		mutationKey: contactGroupsWritesKey(),
 		mutationFn: ({ groupId, member }: { groupId: string; member: boolean }) => {
 			if (!contact) return Promise.reject(new Error("No contact selected"));
 			return member
@@ -55,18 +70,15 @@ export function ContactGroupsDialog({ mailboxId, contact, open, onOpenChange }: 
 				: removeContactGroupMember(mailboxId, groupId, contact.id);
 		},
 		onSuccess: async (members, { groupId }) => {
-			await patchContactGroups(qc, mailboxId, (current) => {
+			await patchContactGroupMembers(qc, mailboxId, groupId, members);
+			await patchContactGroups(qc, mailboxId, (current) =>
 				// Insert-vs-update split: a group absent from the snapshot (deleted
 				// meanwhile) gets nothing synthesized — the scheduled refetch converges.
-				if (!current.groups.some((entry) => entry.id === groupId)) return current;
-				return {
-					groups: current.groups.map((entry) =>
-						entry.id === groupId ? { ...entry, memberCount: members.length } : entry,
-					),
-					membersByGroup: { ...current.membersByGroup, [groupId]: members },
-				};
-			});
-			refetchContactGroups(qc, mailboxId);
+				current.map((entry) =>
+					entry.id === groupId ? { ...entry, memberCount: members.length } : entry,
+				),
+			);
+			refetchContactGroups(qc);
 		},
 	});
 
@@ -101,8 +113,9 @@ export function ContactGroupsDialog({ mailboxId, contact, open, onOpenChange }: 
 								{t("contactGroups.noneAssign")}
 							</p>
 						)}
-						{groups.map((group) => {
-							const member = (membersByGroup[group.id] ?? []).some((entry) => entry.contactId === contact.id);
+						{groups.map((group, index) => {
+							const membersQuery = memberQueries[index];
+							const member = (membersQuery?.data ?? []).some((entry) => entry.contactId === contact.id);
 							return (
 								<label
 									key={group.id}
@@ -110,11 +123,11 @@ export function ContactGroupsDialog({ mailboxId, contact, open, onOpenChange }: 
 								>
 									<Checkbox
 										checked={member}
-										disabled={busy}
+										disabled={busy || !membersQuery?.data}
 										onChange={(event) => {
 											// Synchronous recheck — the disabled prop only re-renders on
 											// mutation state change, so a same-tick toggle could slip through.
-											if (qc.isMutating({ mutationKey: contactGroupsWritesKey(mailboxId) }) > 0) return;
+											if (qc.isMutating({ mutationKey: contactGroupsWritesKey() }) > 0) return;
 											toggle.mutate({ groupId: group.id, member: event.target.checked });
 										}}
 									/>
@@ -124,6 +137,18 @@ export function ContactGroupsDialog({ mailboxId, contact, open, onOpenChange }: 
 											{t("contactGroups.memberCount", { count: group.memberCount })}
 										</span>
 									</span>
+									{membersQuery?.isError && (
+										<button
+											type="button"
+											className="shrink-0 text-xs text-red-600 underline underline-offset-2"
+											onClick={(event) => {
+												event.preventDefault();
+												void membersQuery.refetch();
+											}}
+										>
+											{t("undo.retry")}
+										</button>
+									)}
 								</label>
 							);
 						})}
@@ -132,6 +157,9 @@ export function ContactGroupsDialog({ mailboxId, contact, open, onOpenChange }: 
 								{toggle.error instanceof Error ? toggle.error.message : t("contactGroups.membershipFailed")}
 							</p>
 						)}
+						<div className="flex justify-end border-t border-neutral-200 pt-3">
+							<ContactGroupsManager mailboxId={mailboxId} />
+						</div>
 					</div>
 				)}
 			</DialogContent>

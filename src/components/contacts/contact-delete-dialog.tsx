@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { useLanguage } from "@/components/language-provider";
 import { Button } from "@/components/ui/button";
 import {
@@ -11,6 +12,7 @@ import {
 	DialogTitle,
 } from "@/components/ui/dialog";
 import type { ContactDeleteDialogProps, ContactListItem } from "./contacts-page-types";
+import { refetchContactGroups } from "./contact-groups-utils";
 import { deleteContact } from "./contacts-page-utils";
 
 export function ContactDeleteDialog({
@@ -56,6 +58,7 @@ function DeleteConfirm({
 	onOpenChange: ContactDeleteDialogProps["onOpenChange"];
 }) {
 	const { t } = useLanguage();
+	const queryClient = useQueryClient();
 	const [deleting, setDeleting] = useState(false);
 	const [error, setError] = useState<string | null>(null);
 
@@ -64,6 +67,9 @@ function DeleteConfirm({
 		setError(null);
 		try {
 			await deleteContact(mailboxId, contact.email);
+			// The server cascades the contact's group memberships — refresh the
+			// shared contact-groups book so counts and member slices don't stale.
+			refetchContactGroups(queryClient);
 			onDeleted(contact);
 			onOpenChange(false);
 		} catch (deleteError) {

@@ -5,6 +5,7 @@ import type { FormEvent } from "react";
 import { useIsMutating, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, Pencil, Tags, Trash2, X } from "@/components/icons";
 import { useLanguage } from "@/components/language-provider";
+import { useSelectedMailbox } from "@/components/mailbox-provider";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { confirmDestructive } from "@/components/ui/confirm-dialog";
@@ -24,84 +25,87 @@ import {
 	contactGroupsWritesKey,
 	createContactGroup,
 	deleteContactGroup,
-	fetchContactGroupsData,
+	fetchContactGroups,
 	patchContactGroups,
 	refetchContactGroups,
 	renameContactGroup,
 	sortContactGroups,
 } from "./contact-groups-utils";
 
-/** The Groups button plus the management surface: create, rename, delete, member counts. */
+/** The Manage-groups button plus the management surface: create, rename, delete, member counts. */
 export function ContactGroupsManager({ mailboxId }: { mailboxId: string }) {
 	const { t } = useLanguage();
 	const qc = useQueryClient();
+	const { selectedMailbox } = useSelectedMailbox();
 	const [open, setOpen] = useState(false);
 	const [newName, setNewName] = useState("");
 	const [renaming, setRenaming] = useState<ContactGroup | null>(null);
 	const [renameValue, setRenameValue] = useState("");
 
+	// The API gates groups on canManage: the same full_access signal the other
+	// mailbox surfaces use — a read-only delegate gets neither button nor fetch.
+	const canManage = selectedMailbox?.permission === "full_access";
 	const groupsQuery = useQuery({
 		queryKey: contactGroupsQueryKey(mailboxId),
-		queryFn: () => fetchContactGroupsData(mailboxId),
-		enabled: !!mailboxId,
+		queryFn: () => fetchContactGroups(mailboxId),
+		enabled: canManage && open,
 	});
-	const groups = groupsQuery.data?.groups ?? [];
+	const groups = groupsQuery.data ?? [];
 
-	// Group and member writes share the mailbox-wide scope — while any is in
+	// Group and member writes share one book-wide scope — while any is in
 	// flight every control waits, so arrival order can't undo a newer snapshot.
-	const busy = useIsMutating({ mutationKey: contactGroupsWritesKey(mailboxId) }) > 0;
+	const busy = useIsMutating({ mutationKey: contactGroupsWritesKey() }) > 0;
 
 	const create = useMutation({
-		mutationKey: contactGroupsWritesKey(mailboxId),
+		mutationKey: contactGroupsWritesKey(),
 		mutationFn: (name: string) => createContactGroup(mailboxId, name),
 		onSuccess: async ({ group }) => {
 			if (group) {
 				// Insert is create-only: skip an id the index already has.
-				await patchContactGroups(qc, mailboxId, (current) => ({
-					groups: current.groups.some((entry) => entry.id === group.id)
-						? current.groups
-						: sortContactGroups([...current.groups, group]),
-					membersByGroup: { ...current.membersByGroup, [group.id]: current.membersByGroup[group.id] ?? [] },
-				}));
+				await patchContactGroups(qc, mailboxId, (current) =>
+					current.some((entry) => entry.id === group.id)
+						? current
+						: sortContactGroups([...current, group]),
+				);
 			}
-			refetchContactGroups(qc, mailboxId);
+			refetchContactGroups(qc);
 			setNewName("");
 		},
 	});
 
 	const rename = useMutation({
-		mutationKey: contactGroupsWritesKey(mailboxId),
+		mutationKey: contactGroupsWritesKey(),
 		mutationFn: ({ id, name }: { id: string; name: string }) => renameContactGroup(mailboxId, id, name),
 		onSuccess: async ({ group: updated }) => {
 			if (updated) {
 				// PATCH answers the raw row without memberCount — keep the cached count.
-				await patchContactGroups(qc, mailboxId, (current) => ({
-					groups: sortContactGroups(
-						current.groups.map((entry) =>
+				await patchContactGroups(qc, mailboxId, (current) =>
+					sortContactGroups(
+						current.map((entry) =>
 							entry.id === updated.id ? { ...entry, name: updated.name } : entry,
 						),
 					),
-					membersByGroup: current.membersByGroup,
-				}));
+				);
 			}
-			refetchContactGroups(qc, mailboxId);
+			refetchContactGroups(qc);
 			setRenaming(null);
 		},
 	});
 
 	const remove = useMutation({
-		mutationKey: contactGroupsWritesKey(mailboxId),
+		mutationKey: contactGroupsWritesKey(),
 		mutationFn: (id: string) => deleteContactGroup(mailboxId, id),
 		onSuccess: async (_data, id) => {
-			await patchContactGroups(qc, mailboxId, (current) => {
-				const membersByGroup = { ...current.membersByGroup };
-				delete membersByGroup[id];
-				return {
-					groups: current.groups.filter((entry) => entry.id !== id),
-					membersByGroup,
-				};
+			await patchContactGroups(qc, mailboxId, (current) =>
+				current.filter((entry) => entry.id !== id),
+			);
+			// Its member slices die with it — drop them for every mailbox key,
+			// since several mailboxes can front this shared book.
+			qc.removeQueries({
+				queryKey: ["contact-groups"],
+				predicate: (query) => query.queryKey[2] === "members" && query.queryKey[3] === id,
 			});
-			refetchContactGroups(qc, mailboxId);
+			refetchContactGroups(qc);
 		},
 	});
 
@@ -109,15 +113,17 @@ export function ContactGroupsManager({ mailboxId }: { mailboxId: string }) {
 		event.preventDefault();
 		// Synchronous recheck — the disabled prop only re-renders on mutation
 		// state change, so a same-tick second submit could still slip through.
-		if (qc.isMutating({ mutationKey: contactGroupsWritesKey(mailboxId) }) > 0) return;
+		if (qc.isMutating({ mutationKey: contactGroupsWritesKey() }) > 0) return;
 		create.mutate(newName.trim());
 	}
 
 	function submitRename(event: FormEvent<HTMLFormElement>) {
 		event.preventDefault();
-		if (!renaming || qc.isMutating({ mutationKey: contactGroupsWritesKey(mailboxId) }) > 0) return;
+		if (!renaming || qc.isMutating({ mutationKey: contactGroupsWritesKey() }) > 0) return;
 		rename.mutate({ id: renaming.id, name: renameValue.trim() });
 	}
+
+	if (!canManage) return null;
 
 	return (
 		<Dialog open={open} onOpenChange={setOpen}>
@@ -231,7 +237,7 @@ export function ContactGroupsManager({ mailboxId }: { mailboxId: string }) {
 											onClick={async () => {
 												if (!await confirmDestructive(t("contactGroups.deleteConfirm", { name: group.name }))) return;
 												// The confirmation awaited: another write may have started meanwhile.
-												if (qc.isMutating({ mutationKey: contactGroupsWritesKey(mailboxId) }) > 0) return;
+												if (qc.isMutating({ mutationKey: contactGroupsWritesKey() }) > 0) return;
 												remove.mutate(group.id);
 											}}
 										>

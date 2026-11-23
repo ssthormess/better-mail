@@ -37,13 +37,3 @@ export type ContactGroupMembersResponse = {
 	members?: ContactGroupMember[];
 	error?: unknown;
 };
-
-/**
- * One snapshot serves the manager, the assign dialog and the row badges: the
- * index rows plus every group's member list, so membership is resolved
- * client-side instead of per contact.
- */
-export type ContactGroupsData = {
-	groups: ContactGroup[];
-	membersByGroup: Record<string, ContactGroupMember[]>;
-};
