@@ -1,7 +1,7 @@
 import { eq, and, asc, desc } from "drizzle-orm";
 import type { AppDatabase } from "@/db";
-import { domains, folders, mailboxAliases, mailboxes, mailingLists, routingRules } from "@/db/schema";
-import { getEmailAddress } from "@/lib/email/address";
+import { domains, folders, mailboxAliases, mailboxes, mailingListMembers, mailingLists, routingRules } from "@/db/schema";
+import { getEmailAddress, normalizeEmailAddress } from "@/lib/email/address";
 import { getMailboxDomainAddresses } from "@/lib/mailboxes/domain-addresses";
 import {
 	normalizeRecipientFullLocalPart,
@@ -39,6 +39,12 @@ export type RoutingDecision = {
 	rejectReason?: string;
 	/** Set when a domain-scope rule produced this decision, so the caller can record a match. */
 	ruleId?: string;
+	/**
+	 * Set on a list decision when the post is held for review: it is accepted but
+	 * fans out only to the list's owner members, not the full membership. A
+	 * moderated list holds every allowed post; a moderated member holds theirs.
+	 */
+	heldForModeration?: boolean;
 };
 
 export type InboxRuleDestination = {
@@ -65,6 +71,14 @@ export type ResolveInboundOptions = {
 	 * sender, which bulk senders set to a bounce address the user never sees.
 	 */
 	mailboxForwards?: { subject?: string | null; from?: string | null };
+	/**
+	 * Skip posting authorization and moderation on a list claim, returning the
+	 * plain list decision. Internal callers that resolve an address only to learn
+	 * whether it maps to a mailbox (the sender and member lookups inside the
+	 * posting check itself) set this so the checks cannot recurse; real delivery
+	 * decisions never do.
+	 */
+	skipPostingAuth?: boolean;
 };
 
 /**
@@ -138,7 +152,7 @@ export async function resolveInboundAddress(
 	// uniformly once #416 merges.
 	if (!taggedMailbox && parsed.fullLocalPart !== parsed.localPart) {
 		const list = await findEnabledMailingList(db, domain.id, parsed.fullLocalPart);
-		if (list) return { action: "list", list: toResolvedList(list, domain) };
+		if (list) return listClaimDecision(db, list, domain, fromAddress, options);
 	}
 	const exactMailbox = exactMailboxes.find(
 		(mailbox) => normalizeRecipientLocalPart(mailbox.localPart) === parsed.localPart,
@@ -159,7 +173,7 @@ export async function resolveInboundAddress(
 	// fall back to `user` like any other subaddress.
 	if (!mailbox && (parsed.hasSubaddress || !parsed.fullLocalPart.endsWith("+"))) {
 		const list = await findEnabledMailingList(db, domain.id, parsed.localPart);
-		if (list) return { action: "list", list: toResolvedList(list, domain) };
+		if (list) return listClaimDecision(db, list, domain, fromAddress, options);
 	}
 	mailbox ??= await resolveMailboxDomainAlias(db, parsed.localPart, parsed.normalizedAddress);
 
@@ -360,6 +374,83 @@ function toResolvedList(
 		hostname: domain.hostname,
 		name: list.name,
 	};
+}
+
+/**
+ * A list claim is a posting: the sender's right to post is decided here, before
+ * fan-out, so an unauthorized post gets the same reject decision a domain block
+ * rule produces (an SMTP-level reject where the receiver can still issue one).
+ */
+async function listClaimDecision(
+	db: AppDatabase,
+	list: typeof mailingLists.$inferSelect,
+	domain: typeof domains.$inferSelect,
+	fromAddress: string | null | undefined,
+	options: ResolveInboundOptions,
+): Promise<RoutingDecision> {
+	if (options.skipPostingAuth) return { action: "list", list: toResolvedList(list, domain) };
+	const posting = await checkListPosting(db, list, fromAddress);
+	if (posting === "deny") {
+		return { action: "reject", rejectReason: "Sender is not a member of this mailing list" };
+	}
+	return { action: "list", list: toResolvedList(list, domain), heldForModeration: posting === "hold" };
+}
+
+type ListPostingOutcome = "allow" | "hold" | "deny";
+
+/**
+ * Who may post to a list. Membership is established two ways, matching the
+ * sender-dedup semantics in the delivery engine: the envelope sender's address
+ * literally appears as a member email, or it resolves to the same mailbox a
+ * member email resolves to — a member subscribed under one address can post
+ * from any other address or alias of that mailbox, plus-tags included.
+ *
+ * A `members_only` list denies a sender matching neither path, including an
+ * empty or unparseable envelope sender. `anyone` posts freely — the member scan
+ * still runs there only when a moderated flag exists, because a moderated
+ * member's posts are held under every policy. A list-level `moderated` flag
+ * holds every allowed post. When several member rows map to the sender's
+ * mailbox, any moderated one holds the post.
+ *
+ * Only useful member rows are resolved: once membership is proven, unmoderated
+ * rows cannot change the outcome, and an open list with no moderation anywhere
+ * never resolves at all.
+ */
+async function checkListPosting(
+	db: AppDatabase,
+	list: typeof mailingLists.$inferSelect,
+	envelopeFrom: string | null | undefined,
+): Promise<ListPostingOutcome> {
+	const membersOnly = list.postingPolicy === "members_only";
+	const members = await db
+		.select({ email: mailingListMembers.email, moderated: mailingListMembers.moderated })
+		.from(mailingListMembers)
+		.where(eq(mailingListMembers.listId, list.id));
+
+	const sender = normalizeEmailAddress(envelopeFrom ?? "");
+	const matched = new Set(members.filter((member) => normalizeEmailAddress(member.email) === sender));
+	let memberFound = matched.size > 0;
+	let hold = list.moderated || [...matched].some((member) => member.moderated);
+
+	// Member resolution can still change the outcome while a members-only
+	// sender has no match yet, or an unmatched moderated row could still hold.
+	const worthScanning = (membersOnly && !memberFound) || (!hold && members.some((member) => member.moderated && !matched.has(member)));
+	if (worthScanning && sender) {
+		const senderMailbox = (await resolveInboundAddress(db, sender, null, { skipPostingAuth: true }))?.mailbox;
+		if (senderMailbox) {
+			for (const member of members) {
+				if (matched.has(member)) continue;
+				if (!((membersOnly && !memberFound) || (member.moderated && !hold))) continue;
+				const decision = await resolveInboundAddress(db, member.email, null, { skipPostingAuth: true });
+				if (decision?.mailbox?.mailboxId !== senderMailbox.mailboxId) continue;
+				matched.add(member);
+				memberFound = true;
+				if (member.moderated) hold = true;
+			}
+		}
+	}
+	if (membersOnly && !memberFound) return "deny";
+	return hold ? "hold" : "allow";
 }
 
 async function resolveMailboxDomainAlias(

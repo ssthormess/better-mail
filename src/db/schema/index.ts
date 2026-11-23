@@ -1460,6 +1460,10 @@ export const mailingLists = sqliteTable(
 		localPart: text("local_part").notNull(),
 		name: text("name").notNull(),
 		description: text("description"),
+		postingPolicy: text("posting_policy", { enum: ["members_only", "anyone"] })
+			.notNull()
+			.default("members_only"),
+		moderated: bool("moderated").notNull().default(false),
 		disabled: bool("disabled").notNull().default(false),
 		createdAt: timestamp("created_at")
 			.notNull()
@@ -1478,6 +1482,7 @@ export const mailingListMembers = sqliteTable(
 		email: text("email").notNull(),
 		name: text("name"),
 		role: text("role", { enum: ["owner", "member"] }).notNull().default("member"),
+		moderated: bool("moderated").notNull().default(false),
 		createdAt: timestamp("created_at")
 			.notNull()
 			.$defaultFn(() => new Date()),

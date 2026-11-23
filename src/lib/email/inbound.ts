@@ -74,7 +74,7 @@ export async function processInboundMessage(
 			await dropRaw();
 			return;
 		}
-		await deliverToMailingList(env, payload, decision.list, (memberPayload, mailbox) => storeInboundMessage(env, memberPayload, mailbox));
+		await deliverToMailingList(env, payload, decision.list, (memberPayload, mailbox) => storeInboundMessage(env, memberPayload, mailbox), { ownersOnly: decision.heldForModeration });
 		return;
 	}
 
@@ -308,20 +308,6 @@ async function storeInboundMessage(
 	try {
 		await scheduleAutoDraft(env, { mailboxId: mailbox.mailboxId, sourceMessageId: messageId, ownerUserId: mailbox.userId, sender: fromAddr, headers: payload.headers, status, folderId, spamVerdict: spamAnalysis?.verdict, spamAnalysisError });
 	} catch (error) { console.error("Auto-draft scheduling failed", error); }
-}
-
-export async function storeRawToR2(
-	env: CloudflareEnv,
-	from: string,
-	to: string,
-	raw: ArrayBuffer,
-): Promise<string> {
-	const key = `inbound/${Date.now()}-${newId()}.eml`;
-	await env.BUCKET.put(key, raw, {
-		httpMetadata: { contentType: "message/rfc822" },
-		customMetadata: { from, to },
-	});
-	return key;
 }
 
 export async function getMessageWithBody(env: CloudflareEnv, userId: string, messageId: string) {

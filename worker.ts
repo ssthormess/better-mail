@@ -4,9 +4,9 @@ import { withStorage } from "./src/lib/storage";
 import vinextHandler from "vinext/server/fetch-handler";
 import {
 	processInboundMessage,
-	storeRawToR2,
 	type InboundQueueMessage,
 } from "./src/lib/email/inbound";
+import { inboundStorageKey, inboundStorageScope } from "./src/lib/email/inbound-id";
 import { processOutboundQueue, type OutboundQueueMessage } from "./src/lib/email/send";
 import {
 	isImportJobMessage,
@@ -113,7 +113,14 @@ export default {
 					await forwardMessage(env, message, forwardingDestination);
 				}
 			}
-			const rawR2Key = await storeRawToR2(env, message.from, message.to, raw);
+			// Same keying as the intake path: a content hash scoped by the routing
+			// decision, so a member reached directly and through a list dedupes to
+			// one copy instead of storing a second under a random key.
+			const rawR2Key = await inboundStorageKey(raw, inboundStorageScope(decision));
+			await env.BUCKET.put(rawR2Key, raw, {
+				httpMetadata: { contentType: "message/rfc822" },
+				customMetadata: { from: message.from, to: message.to },
+			});
 			const payload: InboundQueueMessage = {
 				from: message.from,
 				to: message.to,

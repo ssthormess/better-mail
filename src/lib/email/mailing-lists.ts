@@ -1,4 +1,4 @@
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { getDb, type AppDatabase } from "@/db";
 import { mailingListMembers } from "@/db/schema";
 import { normalizeEmailAddress } from "@/lib/email/address";
@@ -39,20 +39,26 @@ export type MailingListExpansion = {
  * recipient would, so aliases, catch-alls and block rules behave identically.
  * The result is deduplicated by mailbox: two member rows that resolve to the
  * same mailbox (say, an address and its alias) deliver exactly one copy.
+ *
+ * `ownersOnly` restricts the expansion to `owner` members — the delivery set
+ * for a post held for review. It propagates through nested lists, and a nested
+ * list that would itself hold the sender's post also restricts that branch to
+ * its owners, so a held post only ever reaches mailboxes that can review it.
  */
 export async function expandMailingListDeliveries(
 	db: AppDatabase,
 	list: ResolvedList,
 	envelopeFrom?: string | null,
+	options: { ownersOnly?: boolean } = {},
 ): Promise<MailingListExpansion> {
 	const deliveries = new Map<string, MailingListDelivery>();
 	const skipped: SkippedListMember[] = [];
-	await collectMemberDeliveries(db, list.listId, envelopeFrom, deliveries, skipped, new Set([list.listId]), 0);
+	await collectMemberDeliveries(db, list.listId, envelopeFrom, deliveries, skipped, new Set([list.listId]), 0, options.ownersOnly ?? false);
 
 	// Sender dedup: a member posting to the list does not get a copy of their
 	// own post, whether their member row uses the address they sent from or an
 	// alias of the same mailbox.
-	const sender = await resolveInboundAddress(db, envelopeFrom ?? "");
+	const sender = await resolveInboundAddress(db, envelopeFrom ?? "", null, { skipPostingAuth: true });
 	if (sender?.mailbox) deliveries.delete(sender.mailbox.mailboxId);
 
 	return { deliveries: [...deliveries.values()], skipped };
@@ -66,11 +72,12 @@ async function collectMemberDeliveries(
 	skipped: SkippedListMember[],
 	visitedListIds: Set<string>,
 	depth: number,
+	ownersOnly: boolean,
 ): Promise<void> {
 	const members = await db
 		.select({ email: mailingListMembers.email })
 		.from(mailingListMembers)
-		.where(eq(mailingListMembers.listId, listId));
+		.where(and(eq(mailingListMembers.listId, listId), ...(ownersOnly ? [eq(mailingListMembers.role, "owner")] : [])));
 
 	for (const member of members) {
 		const decision = await resolveInboundAddress(db, member.email, envelopeFrom);
@@ -88,7 +95,7 @@ async function collectMemberDeliveries(
 				continue;
 			}
 			visitedListIds.add(decision.list.listId);
-			await collectMemberDeliveries(db, decision.list.listId, envelopeFrom, deliveries, skipped, visitedListIds, depth + 1);
+			await collectMemberDeliveries(db, decision.list.listId, envelopeFrom, deliveries, skipped, visitedListIds, depth + 1, ownersOnly || !!decision.heldForModeration);
 			continue;
 		}
 		skipped.push({ email: member.email, reason: decision?.action === "reject" ? "rejected" : "external" });
@@ -129,15 +136,25 @@ async function collectMemberDeliveries(
  * A member failure does not lose the sibling deliveries: every member is
  * attempted, then the first error is rethrown so the queue retry replays the
  * payload — already-stored members are skipped by the storage-key dedup.
+ *
+ * A post the routing decision held for review (`ownersOnly`) goes only to the
+ * list's owner members — the reviewers — instead of the full membership. The
+ * owner copy is the moderation notice: approving means reposting or forwarding
+ * to the list as an owner. A real pending-posts queue with approve/discard is
+ * a later slice.
  */
 export async function deliverToMailingList(
 	env: CloudflareEnv,
 	payload: InboundQueueMessage,
 	list: ResolvedList,
 	deliver: (payload: InboundQueueMessage, mailbox: ResolvedMailbox) => Promise<void>,
+	options: { ownersOnly?: boolean } = {},
 ): Promise<void> {
 	const db = getDb(env);
-	const { deliveries, skipped } = await expandMailingListDeliveries(db, list, payload.from);
+	const { deliveries, skipped } = await expandMailingListDeliveries(db, list, payload.from, options);
+	if (options.ownersOnly) {
+		console.info(`Mailing list ${list.localPart}@${list.hostname}: post from ${payload.from} held for owner review`);
+	}
 	if (skipped.length) {
 		console.info(`Mailing list ${list.localPart}@${list.hostname}: skipped ${skipped.map((member) => `${member.email} (${member.reason})`).join(", ")}`);
 	}

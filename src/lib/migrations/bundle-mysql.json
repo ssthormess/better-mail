@@ -406,6 +406,14 @@
         "CREATE INDEX `mailing_lists_user_idx` ON `mailing_lists` (`user_id`);",
         "CREATE INDEX `mailing_list_members_list_idx` ON `mailing_list_members` (`list_id`);"
       ]
+    },
+    {
+      "name": "0019_mailing_lists_posting.sql",
+      "statements": [
+        "ALTER TABLE `mailing_lists` ADD `posting_policy` varchar(64) NOT NULL DEFAULT 'members_only';",
+        "ALTER TABLE `mailing_lists` ADD `moderated` boolean NOT NULL DEFAULT false;",
+        "ALTER TABLE `mailing_list_members` ADD `moderated` boolean NOT NULL DEFAULT false;"
+      ]
     }
   ]
 }

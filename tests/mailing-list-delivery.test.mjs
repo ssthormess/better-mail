@@ -68,9 +68,9 @@ async function setup(t) {
 	return { env, database, objects, queued };
 }
 
-function insertList(database, { id = "team", localPart = "team", disabled = 0, members = [] }) {
-	database.db.prepare(`INSERT INTO mailing_lists (id, user_id, domain_id, local_part, name, disabled, created_at) VALUES (?, 'admin', 'one', ?, ?, ?, 1)`)
-		.run(id, localPart, id, disabled);
+function insertList(database, { id = "team", localPart = "team", disabled = 0, members = [], postingPolicy = "anyone" }) {
+	database.db.prepare(`INSERT INTO mailing_lists (id, user_id, domain_id, local_part, name, posting_policy, disabled, created_at) VALUES (?, 'admin', 'one', ?, ?, ?, ?, 1)`)
+		.run(id, localPart, id, postingPolicy, disabled);
 	for (const [index, email] of members.entries()) {
 		database.db.prepare(`INSERT INTO mailing_list_members (id, list_id, email, created_at) VALUES (?, ?, ?, 1)`)
 			.run(`${id}-m${index}`, id, email);

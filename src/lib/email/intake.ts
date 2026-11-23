@@ -1,6 +1,6 @@
 import { forwardedMarker, getAccountForwardingDestination, isForwardedMarkerValid, MAILFLARE_FORWARDED_HEADER } from "@/lib/email/account-forwarding";
 import { resolveIncomingMail } from "@/lib/email/incoming";
-import { inboundStorageKey } from "@/lib/email/inbound-id";
+import { inboundStorageKey, inboundStorageScope } from "@/lib/email/inbound-id";
 import type { InboundQueueMessage } from "@/lib/email/inbound";
 import type { IntakeActions, IntakeInput, IntakeResult } from "@/lib/email/intake-types";
 
@@ -38,11 +38,9 @@ export async function intakeIncomingMail(env: CloudflareEnv, input: IntakeInput,
 	}
 
 	// A relay retry replays the same bytes, so key the object on a content hash
-	// (scoped by mailbox, or by list for list-addressed mail): the consumer
-	// dedupes by `(mailboxId, rawR2Key)`. List scoping also stops two lists
-	// receiving identical bytes from sharing one source object — the first
-	// fan-out deletes it after expanding.
-	const rawR2Key = await inboundStorageKey(input.raw, decision?.mailbox?.mailboxId ?? decision?.list?.listId);
+	// scoped by the routing decision (mailbox, or list for list-addressed mail):
+	// the consumer dedupes by `(mailboxId, rawR2Key)`.
+	const rawR2Key = await inboundStorageKey(input.raw, inboundStorageScope(decision));
 	await env.BUCKET.put(rawR2Key, input.raw, {
 		httpMetadata: { contentType: "message/rfc822" },
 		customMetadata: { from: input.from, to: input.to },

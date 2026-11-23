@@ -885,6 +885,14 @@
         "CREATE UNIQUE INDEX `mailing_list_members_list_email_idx` ON `mailing_list_members` (`list_id`,`email`);",
         "CREATE INDEX `mailing_list_members_list_idx` ON `mailing_list_members` (`list_id`);"
       ]
+    },
+    {
+      "name": "0095_mailing_lists_posting.sql",
+      "statements": [
+        "ALTER TABLE `mailing_lists` ADD `posting_policy` text DEFAULT 'members_only' NOT NULL;",
+        "ALTER TABLE `mailing_lists` ADD `moderated` integer DEFAULT false NOT NULL;",
+        "ALTER TABLE `mailing_list_members` ADD `moderated` integer DEFAULT false NOT NULL;"
+      ]
     }
   ]
 }

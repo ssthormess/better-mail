@@ -134,6 +134,13 @@
       "when": 1795417977947,
       "tag": "0018_mailing_lists",
       "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1795422154708,
+      "tag": "0019_mailing_lists_posting",
+      "breakpoints": true
     }
   ]
 }
