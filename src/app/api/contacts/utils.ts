@@ -1,4 +1,4 @@
-import { and, asc, eq, or, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, or, sql } from "drizzle-orm";
 import { draftsVisibleTo } from "@/lib/email/draft-access";
 import { addressListIncludes } from "@/lib/email/address";
 import type { getDb } from "@/db";
@@ -25,6 +25,25 @@ export async function getContactByEmail(db: Db, userId: string, email: string) {
 		.where(and(eq(contacts.userId, userId), eq(contacts.email, email)))
 		.limit(1);
 	return contact ?? null;
+}
+
+/**
+ * Which of `emails` already exist in `userId`'s address book — one batched IN()
+ * statement per 90 addresses (D1's 100 bound-parameter cap minus userId) instead
+ * of a getContactByEmail round-trip per row, so a 2,000-row import preview stays
+ * inside D1's per-invocation query budget.
+ */
+export async function getExistingContactEmails(db: Db, userId: string, emails: string[]): Promise<Set<string>> {
+	const found = new Set<string>();
+	const unique = [...new Set(emails)];
+	for (let offset = 0; offset < unique.length; offset += 90) {
+		const rows = await db
+			.select({ email: contacts.email })
+			.from(contacts)
+			.where(and(eq(contacts.userId, userId), inArray(contacts.email, unique.slice(offset, offset + 90))));
+		for (const row of rows) found.add(row.email);
+	}
+	return found;
 }
 
 export async function listContacts(db: Db, input: { userId: string; query: string; limit: number }) {

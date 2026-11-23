@@ -9,7 +9,12 @@ import { parseAddress } from "@/lib/utils";
 // Column mapping is heuristic, because real CSV exports disagree on headers:
 //   - a first record naming a name/email/blocked column (and carrying no "@")
 //     is a header, and columns are bound by name — the "E-mail 1 - Value" style
-//     headers Google and Outlook write are matched by the same email regex;
+//     headers Google and Outlook write are matched by the same email regex, but
+//     only value/address columns bind: "… - Label"/"… - Type" columns hold the
+//     address's kind ("Home"), never the address;
+//   - a first record whose vocabulary matches but binds no email column is NOT
+//     a header — it reads as data under the positional fallback, so one
+//     "Name,missing" row cannot consume the file's column mapping;
 //   - without one, columns fall back to the order our own export writes
 //     (name, email, …), and a single-column file is read as a bare email list.
 // The blocked column is detected but its values are ignored, matching the vCard
@@ -19,6 +24,14 @@ import { parseAddress } from "@/lib/utils";
 export const CSV_IMPORT_MAX_ROWS = 2000;
 /** Same bound POST /api/contacts applies to a display name. */
 const DISPLAY_NAME_MAX_LENGTH = 100;
+/**
+ * An address cell longer than this cannot be an address (an addr-spec tops out
+ * at 254; the slack covers a "Name <a@b>" form). Oversized cells classify as
+ * invalid instead of being normalized, matched or echoed whole into a preview.
+ */
+const EMAIL_CELL_MAX_LENGTH = 320;
+/** An invalid row echoes its raw cell into the preview bounded to this length. */
+const INVALID_ECHO_MAX_LENGTH = 120;
 
 export interface ParsedCsvContact {
 	email: string;
@@ -107,6 +120,11 @@ function* iterRecords(text: string): Generator<{ row: number; fields: string[] }
 }
 
 const EMAIL_HEADER = /\be-?mails?\b/i;
+// Google and Outlook write a kind column next to the address one — "E-mail 1 -
+// Label"/"E-mail 1 - Type" holds "Home", "E-mail 1 - Value"/"E-mail Address"
+// holds the address. A label/type column must never bind as the email column.
+const EMAIL_KIND_HEADER = /[\s-](?:label|type)$/i;
+const EMAIL_VALUE_HEADER = /[\s-](?:value|address)$/i;
 const NAME_HEADERS_PRIMARY = new Set(["name", "display name", "full name"]);
 const NAME_HEADERS_SECONDARY = new Set(["first name", "given name", "family name", "last name", "nickname"]);
 const BLOCKED_HEADER = /^blocked$/i;
@@ -115,6 +133,18 @@ const normalizeHeader = (cell: string) => cell.trim().toLowerCase().replace(/\s+
 
 function findColumn(headers: string[], match: (cell: string) => boolean): number {
 	return headers.findIndex((cell) => match(normalizeHeader(cell)));
+}
+
+/** The address-bearing email column: the first *- Value/*- Address one, else the first that is not a label/type. */
+function findEmailColumn(headers: string[]): number {
+	let fallback = -1;
+	for (let i = 0; i < headers.length; i++) {
+		const header = normalizeHeader(headers[i]);
+		if (!EMAIL_HEADER.test(header) || EMAIL_KIND_HEADER.test(header)) continue;
+		if (EMAIL_VALUE_HEADER.test(header)) return i;
+		if (fallback === -1) fallback = i;
+	}
+	return fallback;
 }
 
 /** Whether the first record names columns rather than carrying a contact. */
@@ -134,9 +164,14 @@ interface ColumnMap {
 
 function mapColumns(fields: string[]): { columns: ColumnMap; header: boolean } {
 	if (isHeaderRow(fields)) {
-		let name = findColumn(fields, (cell) => NAME_HEADERS_PRIMARY.has(cell));
-		if (name === -1) name = findColumn(fields, (cell) => NAME_HEADERS_SECONDARY.has(cell));
-		return { columns: { email: findColumn(fields, (cell) => EMAIL_HEADER.test(cell)), name }, header: true };
+		const email = findEmailColumn(fields);
+		if (email >= 0) {
+			let name = findColumn(fields, (cell) => NAME_HEADERS_PRIMARY.has(cell));
+			if (name === -1) name = findColumn(fields, (cell) => NAME_HEADERS_SECONDARY.has(cell));
+			return { columns: { email, name }, header: true };
+		}
+		// A "header" that binds no email column cannot map the file — it reads as
+		// ordinary data so a stray first row does not poison every later row.
 	}
 	// No header: the export's own column order. A one-column file is a bare
 	// address list — reading it as name,email would invalidate every row.
@@ -145,9 +180,11 @@ function mapColumns(fields: string[]): { columns: ColumnMap; header: boolean } {
 
 function contactFromRow(fields: string[], columns: ColumnMap): ParsedCsvContact | null {
 	const raw = fields[columns.email];
-	if (raw === undefined) return null;
+	if (raw === undefined || raw.length > EMAIL_CELL_MAX_LENGTH) return null;
 	const email = normalizeEmailAddress(raw);
-	if (!parseAddress(email)) return null;
+	// A surviving ":" means the cell was prefixed garbage ("EMAIL:a@b",
+	// "mailto:a@b") rather than an address or a "Name <a@b>" form — reject it.
+	if (email.includes(":") || !parseAddress(email)) return null;
 	let displayName = columns.name >= 0 ? fields[columns.name]?.trim() : undefined;
 	if (!displayName) displayName = undefined;
 	// A 100+ char name is truncated to the same bound POST /api/contacts enforces.
@@ -187,7 +224,10 @@ export function parseCsvContacts(text: string, maxRows = CSV_IMPORT_MAX_ROWS): C
 		}
 		const contact = contactFromRow(record.fields, columns);
 		if (!contact) {
-			rows.push({ row: record.row, email: record.fields[columns.email]?.trim() || null, displayName: undefined, status: "invalid" });
+			// The echo lets a preview show what was there, bounded so a huge cell
+			// cannot inflate the response.
+			const echo = record.fields[columns.email]?.trim().slice(0, INVALID_ECHO_MAX_LENGTH);
+			rows.push({ row: record.row, email: echo || null, displayName: undefined, status: "invalid" });
 			continue;
 		}
 		if (seen.has(contact.email)) {
@@ -199,4 +239,13 @@ export function parseCsvContacts(text: string, maxRows = CSV_IMPORT_MAX_ROWS): C
 		rows.push({ row: record.row, email: contact.email, displayName: contact.displayName, status: "ok" });
 	}
 	return { contacts, rows, skipped };
+}
+
+/**
+ * Whether the text carries a bare vCard marker line — a .vcf saved under a .csv
+ * name, or a card embedded so its BEGIN/END land on their own lines. Either way
+ * the file is not trusted as CSV, whatever its declared or sniffed format.
+ */
+export function hasVCardMarkers(text: string): boolean {
+	return /^\s*(?:begin|end):vcard\s*$/im.test(text);
 }

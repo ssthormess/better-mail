@@ -9,10 +9,23 @@ import { ContactImportDialog } from "./contact-import-dialog";
 import { importContacts, reportImportResult } from "./contacts-page-utils";
 
 /**
- * "Import" button plus its hidden file picker. A .vcf posts straight to the
- * import route and the counts land in a toast; a .csv opens the two-step dialog
- * (preview and a conflict policy) before anything is written. `onImported` runs
- * when at least one contact was written so the list can refresh.
+ * Whether the import route will read this pick as CSV — the same precedence the
+ * route's resolveFormat uses (extension, then content type). Anything it treats
+ * as CSV goes through the preview dialog; only the vCard path writes directly,
+ * so a MIME-sniffed CSV with a neutral name cannot skip the confirm step.
+ */
+function opensImportPreview(file: File): boolean {
+	if (/\.csv$/i.test(file.name)) return true;
+	if (/\.(vcf|vcard)$/i.test(file.name)) return false;
+	return /^(text\/csv|application\/vnd\.ms-excel)$/i.test(file.type);
+}
+
+/**
+ * "Import" button plus its hidden file picker. A vCard posts straight to the
+ * import route and the counts land in a toast; anything the route will read as
+ * CSV opens the two-step dialog (preview and a conflict policy) before anything
+ * is written. `onImported` runs when at least one contact was written so the
+ * list can refresh.
  */
 export function ContactImportButton({ mailboxId, onImported }: { mailboxId: string; onImported: () => void }) {
 	const { t } = useLanguage();
@@ -21,13 +34,13 @@ export function ContactImportButton({ mailboxId, onImported }: { mailboxId: stri
 	const [csvFile, setCsvFile] = useState<File | null>(null);
 
 	async function onPick(file: File) {
-		if (/\.csv$/i.test(file.name)) {
+		if (opensImportPreview(file)) {
 			setCsvFile(file);
 			return;
 		}
 		setImporting(true);
 		try {
-			const result = await importContacts(mailboxId, file);
+			const result = await importContacts(mailboxId, file, { format: "vcf" });
 			if (reportImportResult(t, result)) onImported();
 		} catch (error) {
 			toast.error(error instanceof Error ? error.message : t("contacts.importFailed"));

@@ -28,8 +28,8 @@ const seed = `${sharedMailboxSeed("full_access")}
 		('c-1', 'admin', 'existing@example.com', 'Old Name', 'manual', 0, 1);
 `;
 const user = (id) => ({ id, email: `${id}@example.com`, role: "user" });
-async function setup(t, who) {
-	const { env, sqlite } = await newDatabase(t, seed);
+async function setup(t, who, extraSeed = "") {
+	const { env, sqlite } = await newDatabase(t, seed + extraSeed);
 	globalThis.csvImpEnv = env;
 	globalThis.csvImpUser = user(who);
 	return sqlite;
@@ -94,10 +94,33 @@ test("Google and Outlook style headers bind columns by name", () => {
 	]);
 });
 
-test("a header naming only a name column leaves every row without an email", () => {
+test("a label or type column before the value column never binds as the address", () => {
+	// The exact Google export shape: "E-mail 1 - Label" holds the kind ("Home"),
+	// "E-mail 1 - Value" holds the address — the label must not win the binding.
+	const { contacts, rows } = parseCsvContacts(csv(
+		"Name,E-mail 1 - Label,E-mail 1 - Value,E-mail 2 - Type,E-mail 2 - Value",
+		"Sample,Home,sample@example.test,Work,other@example.test",
+	));
+	assert.deepEqual(contacts, [{ email: "sample@example.test", displayName: "Sample" }]);
+	assert.equal(rows[0].status, "ok");
+
+	// Outlook's plain "E-mail Address" header binds the same way.
+	assert.deepEqual(
+		parseCsvContacts(csv("Name,E-mail Address", "Out,o@example.test")).contacts,
+		[{ email: "o@example.test", displayName: "Out" }],
+	);
+});
+
+test("a first record that binds no email column reads as positional data", () => {
+	// "Name,Phone" cannot map the file, so it is data — and a stray first row
+	// cannot consume the mapping and reject the valid rows behind it.
 	const { contacts, rows } = parseCsvContacts(csv("Name,Phone", "Maya,123"));
 	assert.equal(contacts.length, 0);
-	assert.deepEqual(rows.map((row) => row.status), ["invalid"]);
+	assert.deepEqual(rows.map((row) => row.status), ["invalid", "invalid"]);
+
+	const guarded = parseCsvContacts(csv("Name,missing", "Maya,maya@example.com"));
+	assert.deepEqual(guarded.contacts, [{ email: "maya@example.com", displayName: "Maya" }]);
+	assert.deepEqual(guarded.rows.map((row) => row.status), ["invalid", "ok"]);
 });
 
 test("rows without a usable email are invalid, repeats are dup, the first wins", () => {
@@ -123,6 +146,19 @@ test("the row cap classifies the first batch and counts the rest as skipped", ()
 test("names longer than the API's 100-char bound are truncated", () => {
 	const { contacts } = parseCsvContacts(csv(`${"x".repeat(150)},a@example.com`));
 	assert.equal(contacts[0].displayName.length, 100);
+});
+
+test("prefixed and oversized address cells are invalid, and invalid echoes stay bounded", () => {
+	const { contacts, rows } = parseCsvContacts(csv(
+		"A,EMAIL:one@example.com",
+		"B,mailto:two@example.com",
+		`C,${"x".repeat(5000)}@example.com`,
+		"D,fine@example.com",
+	));
+	assert.deepEqual(contacts, [{ email: "fine@example.com", displayName: "D" }]);
+	assert.deepEqual(rows.map((row) => row.status), ["invalid", "invalid", "invalid", "ok"]);
+	// The 5000-char cell echoes into the preview truncated, not in full.
+	assert.ok(rows[2].email.length <= 120);
 });
 
 test("a UTF-8 BOM and a UTF-16 file both parse", () => {
@@ -154,13 +190,31 @@ test("a .csv upload imports new rows, updates existing, and reports bad rows", a
 
 test("the explicit format field wins over the filename sniff", async (t) => {
 	const sqlite = await setup(t, "admin");
-	// A .txt upload declared as csv still parses; a declared vcf of csv content finds no cards.
+	// A .txt upload declared as csv still parses.
 	const csvResponse = await POST(post("mb-admin", "a@example.com\n", "list.txt", { format: "csv" }));
 	assert.deepEqual(await csvResponse.json(), { imported: 1, updated: 0, skipped: 0, failed: 0 });
 	assert.equal(contactsOf(sqlite, "admin").length, 2);
+});
 
-	const vcfResponse = await POST(post("mb-admin", "a2@example.com\n", "list.txt", { format: "vcf" }));
-	assert.deepEqual(await vcfResponse.json(), { imported: 0, updated: 0, skipped: 0, failed: 0 });
+test("a vCard body selected as csv is rejected before any write", async (t) => {
+	const sqlite = await setup(t, "admin");
+	const vcf = "BEGIN:VCARD\r\nFN:Person One\r\nEMAIL:person1@example.test\r\nEND:VCARD\r\n";
+	// Whether the mismatch arrives by filename or by the declared format, the
+	// card markers must not degrade into "email:person1@…" cells.
+	assert.equal((await POST(post("mb-admin", vcf, "cards.csv"))).status, 400);
+	assert.equal((await POST(post("mb-admin", vcf, "list.txt", { format: "csv" }))).status, 400);
+	assert.deepEqual(contactsOf(sqlite, "admin"), [{ email: "existing@example.com", display_name: "Old Name", source: "manual" }]);
+});
+
+test("a CSV body selected as vcf is rejected, including a card hidden in a quoted cell", async (t) => {
+	const sqlite = await setup(t, "admin");
+	// Bare BEGIN/END lines inside a quoted cell used to import the notes' card.
+	const embedded = 'name,notes\r\nBob,"\nBEGIN:VCARD\nFN:Bob\nEMAIL:bob@example.test\nEND:VCARD\n"\r\n';
+	assert.equal((await POST(post("mb-admin", embedded, "contacts.vcf"))).status, 400);
+	// A plain CSV is not a vCard document either — it used to no-op with a 200.
+	assert.equal((await POST(post("mb-admin", csv("Maya,maya@example.test"), "contacts.vcf"))).status, 400);
+	assert.equal((await POST(post("mb-admin", csv("Maya,maya@example.test"), "list.txt", { format: "vcf" }))).status, 400);
+	assert.deepEqual(contactsOf(sqlite, "admin"), [{ email: "existing@example.com", display_name: "Old Name", source: "manual" }]);
 });
 
 test("an unknown format or conflict policy is a 400", async (t) => {
@@ -230,6 +284,52 @@ test("a .vcf preview reports new and existing cards without writing", async (t) 
 		{ row: 1, email: "maya@example.com", name: "Maya", status: "new" },
 		{ row: 2, email: "existing@example.com", name: null, status: "existing" },
 	]);
+	assert.equal(contactsOf(sqlite, "admin").length, 1);
+});
+
+test("a delegate's preview only marks contacts they can already see as existing", async (t) => {
+	const sqlite = await setup(t, "delegate", `
+		INSERT INTO contacts (id, user_id, email, display_name, source, blocked, created_at) VALUES
+			('c-2', 'admin', 'seen@example.com', 'Seen Person', 'manual', 0, 1);
+		INSERT INTO messages (id, user_id, mailbox_id, direction, from_addr, to_addr, subject, status, created_at) VALUES
+			('m-1', 'admin', 'mb-team', 'outbound', 'team@example.com', 'seen@example.com', 'Hi', 'sent', 1);
+	`);
+	const body = await (await POST(post("mb-team", csv(
+		"name,email",
+		"Hidden,existing@example.com",
+		"Visible,seen@example.com",
+		"Brand New,fresh@example.com",
+	), "c.csv", { preview: "1" }))).json();
+	assert.deepEqual(body.rows.map((row) => [row.email, row.status]), [
+		// In the owner's book but absent from this mailbox's mail: reads as new,
+		// so a delegate cannot probe membership of the owner's private book.
+		["existing@example.com", "new"],
+		["seen@example.com", "existing"],
+		["fresh@example.com", "new"],
+	]);
+	// The owner still gets the unfiltered classification.
+	globalThis.csvImpUser = user("admin");
+	const ownerBody = await (await POST(post("mb-team", csv(
+		"name,email",
+		"Hidden,existing@example.com",
+		"Visible,seen@example.com",
+		"Brand New,fresh@example.com",
+	), "c.csv", { preview: "1" }))).json();
+	assert.deepEqual(ownerBody.rows.map((row) => row.status), ["existing", "existing", "new"]);
+	// Neither call wrote anything.
+	assert.equal(contactsOf(sqlite, "admin").length, 2);
+});
+
+test("a preview over many rows classifies all of them with batched lookups", async (t) => {
+	const sqlite = await setup(t, "admin");
+	// 150 addresses span more than one IN() chunk; a per-row loop would be one
+	// SELECT each, over D1's per-invocation budget.
+	const lines = Array.from({ length: 150 }, (_, i) => `u${i}@example.test`);
+	const response = await POST(post("mb-admin", `existing@example.com\n${lines.join("\n")}\n`, "big.csv", { preview: "1" }));
+	const body = await response.json();
+	assert.equal(body.counts.existing, 1);
+	assert.equal(body.counts.new, 150);
+	assert.equal(body.rows.length, 151);
 	assert.equal(contactsOf(sqlite, "admin").length, 1);
 });
 
