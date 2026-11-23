@@ -1,6 +1,6 @@
 import { eq, and, asc, desc } from "drizzle-orm";
 import type { AppDatabase } from "@/db";
-import { domains, folders, mailboxAliases, mailboxes, routingRules } from "@/db/schema";
+import { domains, folders, mailboxAliases, mailboxes, mailingLists, routingRules } from "@/db/schema";
 import { getEmailAddress } from "@/lib/email/address";
 import { getMailboxDomainAddresses } from "@/lib/mailboxes/domain-addresses";
 import { normalizeRecipientLocalPart, parseRecipientAddress } from "@/lib/email/recipient-address";
@@ -15,9 +15,20 @@ export type ResolvedMailbox = {
 	displayName: string | null;
 };
 
+export type ResolvedList = {
+	listId: string;
+	userId: string;
+	domainId: string;
+	localPart: string;
+	hostname: string;
+	name: string;
+};
+
 export type RoutingDecision = {
-	action: "store" | "forward" | "reject";
+	action: "store" | "forward" | "reject" | "list";
 	mailbox?: ResolvedMailbox;
+	/** Set when the recipient is a mailing list; the queue fans it out to members. */
+	list?: ResolvedList;
 	forwardTo?: string;
 	/** Forward rules drop the message unless the rule also keeps a copy in the mailbox. */
 	keepCopy?: boolean;
@@ -107,6 +118,13 @@ export async function resolveInboundAddress(
 	// use-all-domains mailbox or a catch-all rule deliver its mail elsewhere.
 	if (!mailbox && await findDisabledAlias(db, domain.id, parsed.localPart)) {
 		return { action: "reject", rejectReason: "Mailbox unavailable" };
+	}
+	// A mailing list claims the address the same way a mailbox or alias does, so
+	// it wins over the implicit use-all-domains claim and the catch-all rules
+	// below, and a disabled list — like a disabled mailbox — simply does not match.
+	if (!mailbox) {
+		const list = await findEnabledMailingList(db, domain.id, parsed.localPart);
+		if (list) return { action: "list", list: toResolvedList(list, domain) };
 	}
 	mailbox ??= await resolveMailboxDomainAlias(db, parsed.localPart, parsed.normalizedAddress);
 
@@ -282,6 +300,28 @@ async function findDisabledAlias(db: AppDatabase, domainId: string, localPart: s
 		.from(mailboxAliases)
 		.where(and(eq(mailboxAliases.domainId, domainId), eq(mailboxAliases.enabled, false)));
 	return rows.some((row) => normalizeRecipientLocalPart(row.localPart) === localPart);
+}
+
+async function findEnabledMailingList(db: AppDatabase, domainId: string, localPart: string) {
+	const rows = await db
+		.select()
+		.from(mailingLists)
+		.where(and(eq(mailingLists.domainId, domainId), eq(mailingLists.disabled, false)));
+	return rows.find((list) => normalizeRecipientLocalPart(list.localPart) === localPart) ?? null;
+}
+
+function toResolvedList(
+	list: typeof mailingLists.$inferSelect,
+	domain: typeof domains.$inferSelect,
+): ResolvedList {
+	return {
+		listId: list.id,
+		userId: list.userId,
+		domainId: domain.id,
+		localPart: list.localPart,
+		hostname: domain.hostname,
+		name: list.name,
+	};
 }
 
 async function resolveMailboxDomainAlias(

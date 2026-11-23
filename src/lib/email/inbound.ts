@@ -4,7 +4,8 @@ import { messages, outboundJobs, users } from "@/db/schema";
 import { newId } from "@/lib/ids";
 import { buildSnippet, parseRawMime } from "@/lib/email/parse";
 import { boundParsedEmail } from "@/lib/email/inbound-limits";
-import { resolveInboundAddress, resolveInboxRuleDestination } from "@/lib/email/routing";
+import { resolveInboundAddress, resolveInboxRuleDestination, type ResolvedMailbox } from "@/lib/email/routing";
+import { deliverToMailingList } from "@/lib/email/mailing-lists";
 import { dispatchWebhooks } from "@/lib/email/webhooks";
 import { getMessageContactNames, upsertContactFromAddress } from "@/lib/contacts/service";
 import { getEmailAddress } from "@/lib/email/address";
@@ -66,20 +67,41 @@ export async function processInboundMessage(
 		return;
 	}
 
+	// A list decision fans out at the queue, where one member delivery is one
+	// stored message — the same path a direct recipient takes.
+	if (decision.action === "list") {
+		if (!decision.list) {
+			await dropRaw();
+			return;
+		}
+		await deliverToMailingList(env, payload, decision.list, (memberPayload, mailbox) => storeInboundMessage(env, memberPayload, mailbox));
+		return;
+	}
+
 	// A forward decision reaches the queue when the rule keeps a copy or the forward
 	// failed; either way it is stored if there is a mailbox to store it in.
 	if (!decision.mailbox) {
 		await dropRaw();
 		return;
 	}
+	await storeInboundMessage(env, payload, decision.mailbox);
+}
+
+/** Stores the queued raw message in `mailbox`, applying that mailbox's rules, spam analysis and notifications. */
+async function storeInboundMessage(
+	env: CloudflareEnv,
+	payload: InboundQueueMessage,
+	mailbox: ResolvedMailbox,
+): Promise<void> {
+	const db = getDb(env);
 	const [stored] = await db.select({ id: messages.id }).from(messages).where(and(
-		eq(messages.mailboxId, decision.mailbox.mailboxId),
+		eq(messages.mailboxId, mailbox.mailboxId),
 		eq(messages.rawR2Key, payload.rawR2Key),
 	)).limit(1);
 	if (stored) {
 		try {
 			const [existing] = await db.select().from(messages).where(eq(messages.id, stored.id)).limit(1);
-			if (existing && Date.now() - existing.createdAt.getTime() < 30 * 60_000) await scheduleAutoDraft(env, { mailboxId: decision.mailbox.mailboxId, sourceMessageId: existing.id, ownerUserId: decision.mailbox.userId, sender: existing.fromAddr, headers: payload.headers, status: existing.status, folderId: existing.folderId, spamVerdict: existing.spamVerdict, spamAnalysisError: existing.spamAnalysisError });
+			if (existing && Date.now() - existing.createdAt.getTime() < 30 * 60_000) await scheduleAutoDraft(env, { mailboxId: mailbox.mailboxId, sourceMessageId: existing.id, ownerUserId: mailbox.userId, sender: existing.fromAddr, headers: payload.headers, status: existing.status, folderId: existing.folderId, spamVerdict: existing.spamVerdict, spamAnalysisError: existing.spamAnalysisError });
 		} catch (error) { console.error("Auto-draft recovery failed", error); }
 		return;
 	}
@@ -108,13 +130,13 @@ export async function processInboundMessage(
 	}
 	const messageId = await inboundMessageId(payload.rawR2Key);
 	const snippet = buildSnippet(parsed.text, parsed.html);
-	const deliveredAddress = getEmailAddress(payload.to) || `${decision.mailbox.localPart}@${decision.mailbox.hostname}`;
+	const deliveredAddress = getEmailAddress(payload.to) || `${mailbox.localPart}@${mailbox.hostname}`;
 	// Keep the whole To header so reply-all can address everyone; rules and
 	// webhooks still see the envelope recipient the message was delivered to.
 	const toAddr = parsed.toAddr ?? payload.to;
 	const fromAddr = parsed.fromAddr ?? payload.from;
 	const destination = await resolveInboxRuleDestination(db, {
-		mailboxId: decision.mailbox.mailboxId,
+		mailboxId: mailbox.mailboxId,
 		toAddress: payload.to,
 		fromAddress: fromAddr,
 		subject: parsed.subject,
@@ -122,13 +144,13 @@ export async function processInboundMessage(
 	});
 	let spamAnalysis: Awaited<ReturnType<typeof analyzeSpam>> | null = null;
 	let spamAnalysisError: string | null = null;
-	const [owner] = await db.select({ enabled: users.spamProtectionEnabled }).from(users).where(eq(users.id, decision.mailbox.userId)).limit(1);
+	const [owner] = await db.select({ enabled: users.spamProtectionEnabled }).from(users).where(eq(users.id, mailbox.userId)).limit(1);
 	if (owner?.enabled !== false) {
 		try {
 			const intelligence = await getSpamIntelligenceConfig(env);
 			spamAnalysis = await analyzeSpam(db, {
-				mailboxId: decision.mailbox.mailboxId,
-				userId: decision.mailbox.userId,
+				mailboxId: mailbox.mailboxId,
+				userId: mailbox.userId,
 				envelopeFrom: payload.from,
 				headers: payload.headers,
 				verdicts: payload.verdicts,
@@ -156,7 +178,7 @@ export async function processInboundMessage(
 	const folderId = status === "spam" ? null : destination.folderId;
 	// A contact the database cannot hold (e.g. an over-long address) must not lose the mail.
 	const contact = await upsertContactFromAddress(env, {
-		userId: decision.mailbox.userId,
+		userId: mailbox.userId,
 		address: fromAddr,
 		source: "inbound",
 		// Spam senders are strangers at best; do not announce them to Gravatar.
@@ -168,7 +190,7 @@ export async function processInboundMessage(
 	let threadId: string;
 	try {
 		threadId = await resolveThreadId(db, {
-			mailboxId: decision.mailbox.mailboxId,
+			mailboxId: mailbox.mailboxId,
 			messageId: parsed.messageId,
 			inReplyTo: parsed.inReplyTo,
 			references: parsed.references,
@@ -187,8 +209,8 @@ export async function processInboundMessage(
 	try {
 		const inserted = await db.insert(messages).values({
 			id: messageId,
-			userId: decision.mailbox.userId,
-			mailboxId: decision.mailbox.mailboxId,
+			userId: mailbox.userId,
+			mailboxId: mailbox.mailboxId,
 			folderId,
 			direction: "inbound",
 			providerMessageId: parsed.messageId,
@@ -218,11 +240,11 @@ export async function processInboundMessage(
 
 		await storeMessageAttachments(env, messageId, parsed.attachments);
 		if (status !== "spam" && status !== "trash") {
-			await registerInboundInvite(env, { userId: decision.mailbox.userId, mailboxId: decision.mailbox.mailboxId, messageId, senderAddress: fromAddr, attachments: parsed.attachments });
+			await registerInboundInvite(env, { userId: mailbox.userId, mailboxId: mailbox.mailboxId, messageId, senderAddress: fromAddr, attachments: parsed.attachments });
 		}
 		if (spamAnalysis) {
 			try {
-				await recordReputationObservation(env, decision.mailbox.mailboxId, getReputationKeys(parsed, spamAnalysis.fingerprint));
+				await recordReputationObservation(env, mailbox.mailboxId, getReputationKeys(parsed, spamAnalysis.fingerprint));
 			} catch (error) {
 				console.error(`Spam reputation observation failed for ${messageId}`, error);
 			}
@@ -241,8 +263,8 @@ export async function processInboundMessage(
 	if (status === "received") {
 		try {
 			await sendMailboxAutoReply(env, {
-				mailboxId: decision.mailbox.mailboxId,
-				userId: decision.mailbox.userId,
+				mailboxId: mailbox.mailboxId,
+				userId: mailbox.userId,
 				deliveredAddress,
 				fromAddress: fromAddr,
 				envelopeFrom: payload.from,
@@ -250,7 +272,7 @@ export async function processInboundMessage(
 				headers: payload.headers,
 			});
 		} catch (error) {
-			console.error(`Auto-reply failed for mailbox ${decision.mailbox.mailboxId}`, error);
+			console.error(`Auto-reply failed for mailbox ${mailbox.mailboxId}`, error);
 		}
 	}
 
@@ -259,12 +281,12 @@ export async function processInboundMessage(
 	} else {
 		const notificationUserIds = await getMailboxNotificationUserIds(
 			env,
-			decision.mailbox.mailboxId,
-			decision.mailbox.userId,
+			mailbox.mailboxId,
+			mailbox.userId,
 		);
 		await notifyUsersOfNewMessage(env, notificationUserIds, buildNewMessageNotification({
 			messageId,
-			mailboxId: decision.mailbox.mailboxId,
+			mailboxId: mailbox.mailboxId,
 			fromAddr,
 			contact,
 			subject: parsed.subject,
@@ -272,7 +294,7 @@ export async function processInboundMessage(
 	}
 	// Spam and blocked mail carry an unauthenticated From; consumers acting on it would be fooled.
 	if (status !== "spam" && status !== "trash") {
-		await dispatchWebhooks(env, decision.mailbox.userId, "message.inbound", {
+		await dispatchWebhooks(env, mailbox.userId, "message.inbound", {
 			messageId,
 			from: fromAddr,
 			to: payload.to,
@@ -284,7 +306,7 @@ export async function processInboundMessage(
 		});
 	}
 	try {
-		await scheduleAutoDraft(env, { mailboxId: decision.mailbox.mailboxId, sourceMessageId: messageId, ownerUserId: decision.mailbox.userId, sender: fromAddr, headers: payload.headers, status, folderId, spamVerdict: spamAnalysis?.verdict, spamAnalysisError });
+		await scheduleAutoDraft(env, { mailboxId: mailbox.mailboxId, sourceMessageId: messageId, ownerUserId: mailbox.userId, sender: fromAddr, headers: payload.headers, status, folderId, spamVerdict: spamAnalysis?.verdict, spamAnalysisError });
 	} catch (error) { console.error("Auto-draft scheduling failed", error); }
 }
 
