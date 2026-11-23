@@ -15,6 +15,7 @@ import { formatEmailAddress } from "@/lib/email/address";
 import { ContactDeleteDialog } from "./contact-delete-dialog";
 import { ContactEditDialog } from "./contact-edit-dialog";
 import { ContactRow } from "./contact-row";
+import { ContactGroupsManager } from "./contact-groups-manager";
 import { CONTACT_COLUMNS } from "./contacts-page-utils";
 import type { ContactListItem } from "./contacts-page-types";
 import { fetchContacts } from "./contacts-page-utils";
@@ -77,6 +78,12 @@ export function ContactsPage() {
 					className="bg-white pl-9"
 				/>
 			</div>
+
+			{selectedMailbox?.permission === "full_access" && (
+				<div className="flex justify-end">
+					<ContactGroupsManager mailboxId={mailboxId} />
+				</div>
+			)}
 
 			<section className="space-y-3">
 				{contacts.isLoading && <SectionRowSkeleton />}

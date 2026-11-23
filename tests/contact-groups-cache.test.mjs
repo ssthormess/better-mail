@@ -24,6 +24,7 @@ const contact = {
 const state = {
 	groups: [g1, g2],
 	members: { "g-1": [m1], "g-2": [] },
+	contacts: [],
 	nextGroupId: 3,
 	deferIndex: null,
 	deferMembers: null,
@@ -50,6 +51,9 @@ globalThis.__groupsCacheTestFetch = async (url, options = {}) => {
 	requests.push({ url, method, payload });
 	const parsed = new URL(url, "https://mail.example");
 	const path = parsed.pathname;
+	if (path === "/api/contacts" && method === "GET") {
+		return response({ contacts: state.contacts });
+	}
 	if (path === "/api/contacts" && method === "DELETE") {
 		// Contact deletes cascade group memberships server-side.
 		state.members = Object.fromEntries(
@@ -116,6 +120,7 @@ beforeEach(() => {
 	state.groups = [{ ...g1 }, { ...g2 }];
 	state.members = { "g-1": [{ ...m1 }], "g-2": [] };
 	state.nextGroupId = 3;
+	state.contacts = [];
 	state.deferIndex = state.deferMembers = null;
 	state.failMembers = new Set();
 	globalThis.__testMailbox = { id: "mb-1", permission: "full_access" };
@@ -139,7 +144,8 @@ const uiStubs = {
 	"@/components/mailbox-provider": mailboxStub,
 	"@/lib/auth/client": `export function authFetch(...args){return globalThis.__groupsCacheTestFetch(...args);}`,
 	"@/components/icons": `import React from "react"; const i = () => null;
-		export const Check = i, Pencil = i, Tags = i, Trash2 = i, X = i, Tag01 = i;`,
+		export const Check = i, Pencil = i, Tags = i, Trash2 = i, X = i, Tag01 = i,
+		Plus = i, Search = i, UsersRound = i;`,
 	"@/components/ui/badge": `import React from "react"; export function Badge({children,...p}){return React.createElement("span",p,children);}`,
 	"@/components/ui/button": `import React from "react"; export const Button = React.forwardRef(function Button({children,size,variant,pill,asChild,...props},ref){return React.createElement("button",{...props,ref},children);});`,
 	"@/components/ui/checkbox": `import React from "react"; export const Checkbox = React.forwardRef(function Checkbox(props,ref){return React.createElement("input",{type:"checkbox",...props,ref});});`,
@@ -170,7 +176,29 @@ const { ContactGroupsManager } = await loadComponent("src/components/contacts/co
 const { ContactGroupsDialog } = await loadComponent("src/components/contacts/contact-groups-dialog.tsx", uiStubs);
 const { ContactGroupsAction } = await loadComponent("src/components/contacts/contact-groups-action.tsx", uiStubs);
 const { ContactDeleteDialog } = await loadComponent("src/components/contacts/contact-delete-dialog.tsx", uiStubs);
-const { refetchContactGroups } = await loadComponent("src/components/contacts/contact-groups-utils.ts", uiStubs);
+const {
+	contactGroupMembersQueryKey,
+	contactGroupsQueryKey,
+	fetchContactGroupMembers,
+	fetchContactGroups,
+	refetchContactGroups,
+} = await loadComponent("src/components/contacts/contact-groups-utils.ts", uiStubs);
+
+// The page mounts the REAL groups manager — only its row and sibling dialogs
+// (irrelevant to a zero-contacts render) are stubbed out.
+const pageStubs = {
+	...uiStubs,
+	"@/components/compose/compose-context": `export function useCompose(){return {openComposer(){}};}`,
+	"@/lib/email/address": `export function formatEmailAddress(email){return email;}`,
+	"@/components/page-skeletons": `import React from "react"; export function SectionRowSkeleton(){return React.createElement("div",null);}`,
+	"@/components/page-header-utils": `export const mobilePrimaryActionClass = "";`,
+	"@/components/ui/list": `import React from "react"; export function List({children}){return React.createElement("div",null,children);} export function ListRow({children,...p}){return React.createElement("div",p,children);}`,
+	"./contact-row": `export function ContactRow(){return null;}`,
+	"./contact-edit-dialog": `export function ContactEditDialog(){return null;}`,
+	"./contact-delete-dialog": `export function ContactDeleteDialog(){return null;}`,
+};
+const { ContactsPage } = await loadComponent("src/components/contacts/contacts-page.tsx", pageStubs);
+
 const { createElement, act } = await import("react");
 const { createRoot } = await import("react-dom/client");
 const { QueryClient, QueryClientProvider } = await import("@tanstack/react-query");
@@ -242,6 +270,52 @@ async function setInputValue(input, value) {
 }
 
 const memberRequests = () => requests.filter((r) => r.method === "GET" && r.url.includes("/members"));
+
+test("a full-access page with zero visible contacts still exposes the groups entry", async (t) => {
+	const client = testClient();
+	t.after(() => client.clear());
+	const container = newContainer(t);
+	const root = mount(t, client, container, createElement(ContactsPage));
+	await settle();
+
+	// The contact list is empty — no row can carry the affordance.
+	assert.match(container.textContent, /contacts\.empty/);
+	const manage = [...container.querySelectorAll("button")].find((b) =>
+		b.textContent.includes("contactGroups.manage"));
+	assert.ok(manage, "the standalone manage entry renders without any contacts");
+	await click(manage);
+	await settle();
+
+	assert.ok(
+		requests.some((r) => r.url === "/api/contacts/groups?mailboxId=mb-1"),
+		"opening the manager fetches the group index",
+	);
+	assert.match(container.textContent, /Family/);
+	assert.match(container.textContent, /contactGroups.memberCount 1/);
+	await unmount(root, container);
+});
+
+test("a read-only page hides the standalone groups entry", async (t) => {
+	globalThis.__testMailbox = { id: "mb-1", permission: "read_only" };
+	const client = testClient();
+	t.after(() => client.clear());
+	const container = newContainer(t);
+	const root = mount(t, client, container, createElement(ContactsPage));
+	await settle();
+
+	assert.equal(
+		[...container.querySelectorAll("button")].filter((b) =>
+			b.textContent.includes("contactGroups.manage")).length,
+		0,
+		"no manage entry without manage rights",
+	);
+	assert.equal(
+		requests.filter((r) => r.url.includes("/api/contacts/groups")).length,
+		0,
+		"no groups request fires",
+	);
+	await unmount(root, container);
+});
 
 test("a read-only mount fires no groups requests and renders no affordances", async (t) => {
 	globalThis.__testMailbox = { id: "mb-1", permission: "read_only" };
@@ -490,17 +564,23 @@ test("deleting a group drops it and every mailbox's member slice for it", async 
 	await unmount(root, container);
 });
 
-test("refetchContactGroups refreshes the whole book scope, not one mailbox", async (t) => {
+test("refetchContactGroups refreshes live observers, stales the rest of the book", async (t) => {
 	const client = testClient();
 	t.after(() => client.clear());
 	const container = newContainer(t);
 	// The open dialog observes mb-1's index and member slices; a second mailbox
-	// fronting the same owner book only has cached entries (no observer — those
-	// refetch when a surface next mounts them, so the check is invalidation).
+	// fronting the same owner book has fetchable but unwatched caches — prefetch
+	// leaves a real queryFn on each, so an "all"-type refetch would fire reads.
 	const root = mount(t, client, container, assignDialog());
 	await settle();
-	client.setQueryData(["contact-groups", "mb-2"], sortedGroups().map(groupEntry));
-	client.setQueryData(["contact-groups", "mb-2", "members", "g-1"], [{ ...m1 }]);
+	await client.prefetchQuery({
+		queryKey: contactGroupsQueryKey("mb-2"),
+		queryFn: () => fetchContactGroups("mb-2"),
+	});
+	await client.prefetchQuery({
+		queryKey: contactGroupMembersQueryKey("mb-2", "g-1"),
+		queryFn: () => fetchContactGroupMembers("mb-2", "g-1"),
+	});
 	const before = requests.length;
 
 	refetchContactGroups(client);
@@ -509,17 +589,61 @@ test("refetchContactGroups refreshes the whole book scope, not one mailbox", asy
 	const refetched = requests.slice(before).filter((r) => r.method === "GET");
 	assert.ok(
 		refetched.some((r) => r.url === "/api/contacts/groups?mailboxId=mb-1"),
-		"the active mailbox's list refetches",
+		"the observed mailbox's list refetches",
 	);
-	assert.ok(refetched.some((r) => r.url.includes("/members")), "active member slices refetch");
+	assert.ok(refetched.some((r) => r.url.includes("/members")), "observed member slices refetch");
+	assert.equal(
+		refetched.filter((r) => r.url.includes("mailboxId=mb-2")).length,
+		0,
+		"unwatched keys on the shared book do not refetch",
+	);
 	const otherBook = client
 		.getQueryCache()
-		.findAll({ queryKey: ["contact-groups", "mb-2"] });
+		.findAll({ queryKey: contactGroupsQueryKey("mb-2") });
 	assert.equal(otherBook.length, 2);
 	assert.ok(
 		otherBook.every((query) => query.state.isInvalidated),
-		"keys outside the active mailbox are invalidated too — the book is shared",
+		"keys outside the observed mailbox are invalidated — they refetch on next enabled mount",
 	);
+	await unmount(root, container);
+});
+
+test("a write leaves downgraded-mailbox caches stale — no doomed reads", async (t) => {
+	const client = testClient();
+	t.after(() => client.clear());
+	const container = newContainer(t);
+	// mb-2 was browsed while it was manageable, then lost manage rights: its
+	// cached queries still carry a working queryFn but no observer.
+	await client.prefetchQuery({
+		queryKey: contactGroupsQueryKey("mb-2"),
+		queryFn: () => fetchContactGroups("mb-2"),
+	});
+	await client.prefetchQuery({
+		queryKey: contactGroupMembersQueryKey("mb-2", "g-1"),
+		queryFn: () => fetchContactGroupMembers("mb-2", "g-1"),
+	});
+	const root = mount(t, client, container, assignDialog());
+	await settle();
+	const before = requests.length;
+
+	// A member write in mb-1 commits; the shared-book refresh then runs.
+	const boxes = [...container.querySelectorAll('input[type="checkbox"]')];
+	await click(boxes[1]);
+	await settle();
+
+	const after = requests.slice(before);
+	assert.ok(after.some((r) => r.method === "POST"), "the member write committed");
+	assert.ok(
+		after.some((r) => r.url === "/api/contacts/groups?mailboxId=mb-1"),
+		"the writable mailbox's index refetches",
+	);
+	assert.equal(
+		after.filter((r) => r.url.includes("mailboxId=mb-2")).length,
+		0,
+		"the downgraded mailbox fires no reads — its keys only go stale",
+	);
+	const stale = client.getQueryCache().find({ queryKey: contactGroupsQueryKey("mb-2") });
+	assert.ok(stale?.state.isInvalidated, "mb-2's index is marked stale for its next enabled mount");
 	await unmount(root, container);
 });
 

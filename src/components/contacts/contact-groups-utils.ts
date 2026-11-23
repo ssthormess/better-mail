@@ -79,12 +79,17 @@ export async function patchContactGroupMembers(
 // converge on server truth. The contact book is owner-scoped — several mailbox
 // keys can front the same groups — so the whole "contact-groups" prefix is
 // cancelled and invalidated, not just the active mailbox's entry.
+// refetchType "active" is deliberate: a query only counts as active while an
+// enabled observer watches it, and enabled observers exist only inside
+// manage-gated surfaces — so a mailbox that lost manage rights (or whose
+// surface unmounted) gets its keys marked stale without firing reads it can no
+// longer serve. They refetch on their next enabled mount.
 // Fire-and-forget: a mutation's pending lifetime must not extend to this
 // post-commit refresh.
 export function refetchContactGroups(qc: QueryClient) {
 	void qc
 		.cancelQueries({ queryKey: ["contact-groups"] })
-		.then(() => qc.invalidateQueries({ queryKey: ["contact-groups"], refetchType: "all" }))
+		.then(() => qc.invalidateQueries({ queryKey: ["contact-groups"], refetchType: "active" }))
 		.catch(() => {});
 }
 
