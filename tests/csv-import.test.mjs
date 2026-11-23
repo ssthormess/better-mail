@@ -46,11 +46,13 @@ const csv = (...lines) => `${lines.join("\r\n")}\r\n`;
 const contactsOf = (sqlite, userId) => sqlite.prepare("SELECT email, display_name, source FROM contacts WHERE user_id = ? ORDER BY email").all(userId);
 
 // Counts every statement execution through the D1-shaped prepare() surface —
-// the test stand-in for D1's per-invocation query budget.
+// the test stand-in for D1's per-invocation query budget. `all()` is left out:
+// the stand-in's all() delegates to run(), so counting both charges one real
+// query twice.
 function countQueries(db) {
 	let count = 0;
 	const wrap = (statement) => {
-		for (const method of ["first", "run", "all", "raw"]) {
+		for (const method of ["first", "run", "raw"]) {
 			const original = statement[method].bind(statement);
 			statement[method] = (...args) => {
 				count++;
@@ -457,6 +459,46 @@ test("a delegated preview's query count stays under budget and ignores private m
 	assert.equal(queries2(), delegatedQueries);
 	assert.equal(body2.counts.existing, 30);
 	assert.equal(body2.counts.new, 120 + 150);
+});
+
+test("a frequent correspondent cannot crowd out a rare one in the same chunk", async (t) => {
+	// 510 messages to one contact and exactly one to another: a flat LIMIT over
+	// the union of corpus hits drops the rare contact's row and misclassifies
+	// it as new. Per-candidate row bounds keep it visible.
+	const sqlite = await setup(t, "delegate", `
+		INSERT INTO contacts (id, user_id, email, display_name, source, blocked, created_at) VALUES
+			('c-f','admin','frequent@example.test','F','manual',0,1),
+			('c-r','admin','rare@example.test','R','manual',0,1);
+		INSERT INTO messages (id, user_id, mailbox_id, direction, from_addr, to_addr, subject, status, created_at)
+		WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 510)
+		SELECT 'fm-' || n, 'admin', 'mb-team', 'inbound', 'frequent@example.test', 'team@example.com', 'x', 'received', 1 FROM seq;
+		INSERT INTO messages (id, user_id, mailbox_id, direction, from_addr, to_addr, subject, status, created_at) VALUES
+			('rm-1','admin','mb-team','inbound','rare@example.test','team@example.com','x','received',1);
+	`);
+	const upload = csv("name,email", "F,frequent@example.test", "R,rare@example.test");
+	const body = await (await POST(post("mb-team", upload, "c.csv", { preview: "1" }))).json();
+	assert.equal(body.counts.existing, 2);
+	assert.equal(body.counts.new, 0);
+});
+
+test("a delegated preview of a maximum 2000-row upload stays well under the statement budget", async (t) => {
+	// Worst case: every candidate is stored AND mailbox-visible. The count
+	// covers the whole POST including auth and access reads.
+	const sqlite = await setup(t, "delegate", `
+		INSERT INTO contacts (id, user_id, email, display_name, source, blocked, created_at)
+		WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 2000)
+		SELECT 'cm-' || n, 'admin', 'max' || n || '@example.test', 'M', 'manual', 0, 1 FROM seq;
+		INSERT INTO messages (id, user_id, mailbox_id, direction, from_addr, to_addr, subject, status, created_at)
+		WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 2000)
+		SELECT 'mm-' || n, 'admin', 'mb-team', 'inbound', 'max' || n || '@example.test', 'team@example.com', 'x', 'received', 1 FROM seq;
+	`);
+	const upload = csv("name,email", ...Array.from({ length: 2000 }, (_, i) => `M,max${i + 1}@example.test`));
+	const queries = countQueries(globalThis.csvImpEnv.DB);
+	const body = await (await POST(post("mb-team", upload, "c.csv", { preview: "1" }))).json();
+	assert.ok(queries() <= 45, `delegated 2000-candidate preview ran ${queries()} statements`);
+	assert.equal(body.counts.existing, 2000);
+	assert.equal(body.counts.new, 0);
+	assert.equal(contactsOf(sqlite, "admin").length, 2001);
 });
 
 test("a delegated preview on a large mailbox stays under budget when candidates are absent", async (t) => {

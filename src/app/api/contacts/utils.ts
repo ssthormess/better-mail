@@ -3,7 +3,8 @@ import { draftsVisibleTo } from "@/lib/email/draft-access";
 import { addressListIncludes } from "@/lib/email/address";
 import type { getDb } from "@/db";
 import { contacts, messages } from "@/db/schema";
-import { concatText, containsLike, escapeLike, insensitiveLike } from "@/db/sql";
+import { concatText, escapeLike, insensitiveLike } from "@/db/sql";
+import { schemaDialect } from "@/db/dialect";
 import { getContactId } from "@/lib/contacts/utils";
 
 type Db = ReturnType<typeof getDb>;
@@ -69,38 +70,112 @@ export async function listContacts(db: Db, input: { userId: string; query: strin
 		.limit(input.limit);
 }
 
+// 97 candidates plus the mailbox id, the draftsVisibleTo viewer and the owner
+// id reach exactly D1's 100 bound parameters per statement — 21 statements for
+// a capped 2000-row upload, with the rows-per-candidate bound inlined (never a
+// bound parameter). Statement count tracks candidates only: mailbox size,
+// private hit counts and auth can never stretch it past headroom.
+const VISIBILITY_CHUNK = 97;
+const VISIBILITY_ROWS_PER_CANDIDATE = 16;
+
+interface CandidateRow {
+	email: string;
+	isContact: boolean;
+	fromAddr: string;
+	toAddr: string;
+	ccAddr: string | null;
+}
+
+/**
+ * Mailbox-corpus scan shared by the visibility checks below. Each statement
+ * carries up to VISIBILITY_CHUNK candidates as a UNION-derived table, joins
+ * mailbox messages on a case-folded substring hit inside the concatenated
+ * from/to/cc corpus, and keeps only the first few matching rows PER CANDIDATE
+ * via ROW_NUMBER — a flat LIMIT would let one frequent correspondent crowd
+ * another's hits out and misreport a stored contact as new. When `ownerUserId`
+ * is given, the same pass also flags candidates that are stored contacts of
+ * that user, so preview gets visibility and book membership in one stage.
+ *
+ * The SQL prefilter is deliberately loose: lower() folds ASCII case, so a
+ * non-ASCII candidate whose case differs from the stored header can
+ * under-match and then fail closed as `new` — the verdict never goes the other
+ * way, and a private draft stays visible only to its author. The exact
+ * visibility verdict is the local addressListIncludes parse below; substring
+ * hits and LIKE false positives cannot pass as real visibility.
+ */
+async function mailboxCandidateRows(db: Db, mailboxId: string, viewerUserId: string, ownerUserId: string | null, chunk: string[]): Promise<CandidateRow[]> {
+	if (chunk.length === 0) return [];
+	const corpus = concatText(sql`${messages.fromAddr}`, ",", sql`${messages.toAddr}`, ",", sql`coalesce(${messages.ccAddr}, '')`);
+	const hit =
+		schemaDialect() === "postgres"
+			? sql`strpos(lower(${corpus}), lower(v.email)) > 0`
+			: sql`instr(lower(${corpus}), lower(v.email)) > 0`;
+	const candidates = sql.join(
+		chunk.map((email) => sql`select ${email} as email`),
+		sql` union all `,
+	);
+	const contactJoin = ownerUserId === null ? sql`` : sql`left join ${contacts} on ${contacts.userId} = ${ownerUserId} and ${contacts.email} = v.email`;
+	const contactFlag = ownerUserId === null ? sql`0` : sql`case when ${contacts.email} is null then 0 else 1 end`;
+	const rows = await db.all(sql`
+		select email, is_contact, from_addr, to_addr, cc_addr from (
+			select v.email as email, ${contactFlag} as is_contact,
+				${messages.fromAddr} as from_addr, ${messages.toAddr} as to_addr, ${messages.ccAddr} as cc_addr,
+				row_number() over (partition by v.email order by ${messages.id}) as rn
+			from (${candidates}) v
+			join ${messages} on ${messages.mailboxId} = ${mailboxId} and ${draftsVisibleTo(viewerUserId)} and ${hit}
+			${contactJoin}
+		) ranked where ranked.rn <= ${sql.raw(String(VISIBILITY_ROWS_PER_CANDIDATE))}
+	`);
+	return (rows as Array<Record<string, unknown>>).map((row) => ({
+		email: row.email as string,
+		isContact: row.is_contact === 1 || row.is_contact === true,
+		fromAddr: row.from_addr as string,
+		toAddr: row.to_addr as string,
+		ccAddr: row.cc_addr as string | null,
+	}));
+}
+
+/** Rows where `email` appears as a real address in that same row's from/to/cc — the exact verdict, not the prefilter's. */
+function candidateSeen(rows: CandidateRow[], seen: Set<string>, contacts?: Set<string>) {
+	for (const row of rows) {
+		if (row.isContact) contacts?.add(row.email);
+		if ([row.fromAddr, row.toAddr, row.ccAddr].some((value) => addressListIncludes(value, row.email))) seen.add(row.email);
+	}
+}
+
 /**
  * Contacts belong to the user who owns the mailbox, so a shared mailbox's contact list is its creator's whole
  * address book. Anyone who is not that owner may only see contacts whose address appears on mail in this mailbox.
  * Returns the subset of `emails` that does (exact address match).
- *
- * Each candidate costs one bound parameter: it is LIKE-matched against the
- * message's concatenated address corpus (from, to, cc — cc is nullable), so a
- * chunk of 90 candidates plus the mailbox id and the draftsVisibleTo viewer
- * stays under D1's 100-parameters-per-statement cap. The query count tracks
- * the candidate count only — mailbox size cannot stretch it, unlike a paged
- * corpus scan — and the returned rows are verified address-by-address locally,
- * so substring hits cannot pass as real visibility. A private draft stays
- * visible only to its author.
  */
 export async function addressesSeenInMailbox(db: Db, mailboxId: string, emails: string[], viewerUserId: string): Promise<Set<string>> {
 	const seen = new Set<string>();
 	const unique = [...new Set(emails)];
-	const corpus = concatText(sql`${messages.fromAddr}`, ",", sql`${messages.toAddr}`, ",", sql`coalesce(${messages.ccAddr}, '')`);
-	for (let offset = 0; offset < unique.length; offset += 90) {
-		const chunk = unique.slice(offset, offset + 90);
-		// The LIKE only narrows candidates; the verdict below is an exact address comparison.
-		const conditions = chunk.map((email) => containsLike(corpus, email));
-		const rows = await db
-			.select({ fromAddr: messages.fromAddr, toAddr: messages.toAddr, ccAddr: messages.ccAddr })
-			.from(messages)
-			.where(and(eq(messages.mailboxId, mailboxId), draftsVisibleTo(viewerUserId), or(...conditions)!))
-			.limit(500);
-		for (const email of chunk) {
-			if (rows.some((row) => [row.fromAddr, row.toAddr, row.ccAddr].some((value) => addressListIncludes(value, email)))) seen.add(email);
-		}
+	for (let offset = 0; offset < unique.length; offset += VISIBILITY_CHUNK) {
+		candidateSeen(await mailboxCandidateRows(db, mailboxId, viewerUserId, null, unique.slice(offset, offset + VISIBILITY_CHUNK)), seen);
 	}
 	return seen;
+}
+
+/**
+ * The intersection of `emails`, the owner's stored contacts and the addresses
+ * visible to `viewerUserId` on this mailbox's mail — what a delegated import
+ * preview may call "existing". One stage: visibility and book membership are
+ * computed by the same chunked scan, so a full 2000-candidate upload costs ~21
+ * statements end to end, well under D1's per-invocation limit even with auth
+ * and access reads counted.
+ */
+export async function existingContactsSeenInMailbox(db: Db, mailboxId: string, ownerUserId: string, emails: string[], viewerUserId: string): Promise<Set<string>> {
+	const seen = new Set<string>();
+	const stored = new Set<string>();
+	const unique = [...new Set(emails)];
+	for (let offset = 0; offset < unique.length; offset += VISIBILITY_CHUNK) {
+		candidateSeen(await mailboxCandidateRows(db, mailboxId, viewerUserId, ownerUserId, unique.slice(offset, offset + VISIBILITY_CHUNK)), seen, stored);
+	}
+	stored.forEach((email) => {
+		if (!seen.has(email)) stored.delete(email);
+	});
+	return stored;
 }
 
 export function toContactDetails(contact: Awaited<ReturnType<typeof getContactByEmail>>) {

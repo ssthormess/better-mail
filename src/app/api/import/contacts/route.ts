@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { getDb } from "@/db";
-import { addressesSeenInMailbox, getContactByEmail, getExistingContactEmails, saveManualContact } from "@/app/api/contacts/utils";
+import { existingContactsSeenInMailbox, getContactByEmail, getExistingContactEmails, saveManualContact } from "@/app/api/contacts/utils";
 import { requireUser } from "@/lib/auth/cookies";
 import { getEnv } from "@/lib/cloudflare";
 import { RequestBodyTooLargeError } from "@/lib/http/errors";
@@ -128,16 +128,14 @@ export async function POST(request: Request) {
 		const rows: { row: number; email: string | null; name: string | null; status: string }[] = [];
 		const candidates = parsed.rows.flatMap((row) => (row.status === "ok" && row.email ? [row.email] : []));
 		// Same visibility rule as GET /api/contacts and the export: a delegate
-		// only sees addresses on this mailbox's mail, so their candidates shrink
-		// to the mailbox-visible set before the book is even queried. The probe
-		// is chunked LIKE matching — its statement count tracks the candidate
-		// count only, never mailbox size or how much of the owner's private
-		// book matched, and an existing contact a delegate cannot see reads as
-		// new.
-		const visible = access.isOwner
-			? candidates
-			: [...await addressesSeenInMailbox(db, access.mailbox.id, candidates, user.id)];
-		const existing = await getExistingContactEmails(db, ownerId, visible);
+		// only sees addresses on this mailbox's mail, so their "existing" set is
+		// book membership intersected with the mailbox-visible set — one chunked
+		// scan computes both, its statement count tracks candidates only, and an
+		// existing contact a delegate cannot see reads as new. Owners classify
+		// against their whole book directly.
+		const existing = access.isOwner
+			? await getExistingContactEmails(db, ownerId, candidates)
+			: await existingContactsSeenInMailbox(db, access.mailbox.id, ownerId, candidates, user.id);
 		for (const row of parsed.rows) {
 			const status = row.status === "ok" ? (existing.has(row.email ?? "") ? "existing" : "new") : row.status;
 			if (status === "new") counts.new++;
