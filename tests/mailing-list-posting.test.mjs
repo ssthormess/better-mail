@@ -720,6 +720,94 @@ test("a moderated list cycle does not manufacture a fallback beside a real revie
 	assert.equal([...objects.keys()].filter((key) => key.startsWith("held/")).length, 0);
 });
 
+test("a cached intermediate still supplies the held parent's dependency edge", async (t) => {
+	t.mock.method(console, "info", () => {});
+	t.mock.method(console, "warn", () => {});
+	// eng holds the stranger's post and reaches the unheld list u only
+	// through an owner row; u's only member is the held child. aux reaches
+	// u unrestricted — whichever order runs, eng's dependency on the child
+	// must be replayed from u's cached expansion, not only from a live scan.
+	for (const engFirst of [true, false]) {
+		const { env, database, objects, queued } = await setup(t);
+		database.db.exec(`
+			INSERT INTO users (id, email, password_hash, name, role, is_primary_admin, created_at) VALUES ('mod', 'mod@one.test', 'hash', 'Mod', 'member', 0, 1);
+			INSERT INTO mailboxes (id, user_id, domain_id, local_part, created_at) VALUES ('modbox', 'mod', 'one', 'mod', 4);
+		`);
+		insertList(database, {
+			id: "all",
+			localPart: "all",
+			postingPolicy: "anyone",
+			members: engFirst ? ["eng@one.test", "aux@one.test"] : ["aux@one.test", "eng@one.test"],
+		});
+		insertList(database, {
+			id: "eng",
+			localPart: "eng",
+			postingPolicy: "anyone",
+			moderated: 1,
+			userId: "mod",
+			members: [{ email: "u@one.test", role: "owner" }],
+		});
+		insertList(database, { id: "aux", localPart: "aux", postingPolicy: "anyone", members: ["u@one.test"] });
+		insertList(database, { id: "u", localPart: "u", postingPolicy: "anyone", members: [{ email: "heldc@one.test", role: "owner" }] });
+		insertList(database, {
+			id: "heldc",
+			localPart: "heldc",
+			postingPolicy: "anyone",
+			moderated: 1,
+			members: [{ email: "ann@one.test", role: "owner" }],
+		});
+
+		await intake(env, "all@one.test", "stranger@elsewhere.test");
+		await processInboundMessage(env, queued[0]);
+
+		// Ordinary-first cached u's full expansion without its held-member
+		// edge, so eng's dependency set came up empty and its fallback was
+		// stored beside Ann's reviewer copy.
+		assert.deepEqual(
+			mailByMailbox(database).map((row) => row.mailboxId),
+			["annbox"],
+			`traversal order engFirst=${engFirst} changed the delivery set`,
+		);
+		assert.equal([...objects.keys()].filter((key) => key.startsWith("held/")).length, 0);
+	}
+});
+
+test("a held root on a moderation cycle registers its own reviewer record", async (t) => {
+	t.mock.method(console, "info", () => {});
+	t.mock.method(console, "warn", () => {});
+	const { env, database, objects, queued } = await setup(t);
+	database.db.exec(`
+		INSERT INTO users (id, email, password_hash, name, role, is_primary_admin, created_at) VALUES ('mod', 'mod@one.test', 'hash', 'Mod', 'member', 0, 1);
+		INSERT INTO mailboxes (id, user_id, domain_id, local_part, created_at) VALUES ('modbox', 'mod', 'one', 'mod', 4);
+	`);
+	insertList(database, {
+		id: "alpha",
+		localPart: "alpha",
+		postingPolicy: "anyone",
+		moderated: 1,
+		userId: "admin",
+		members: [{ email: "ann@one.test", role: "owner" }, { email: "beta@one.test", role: "owner" }],
+	});
+	insertList(database, {
+		id: "beta",
+		localPart: "beta",
+		postingPolicy: "anyone",
+		moderated: 1,
+		userId: "mod",
+		members: [{ email: "alpha@one.test", role: "owner" }],
+	});
+
+	// The addressed list itself holds the post: beta's cycle back to alpha
+	// must dep on alpha's real scan — owner Ann included — not a record that
+	// never computed, or alpha retains under held/ and beta invents a
+	// fallback beside the reviewer alpha already has.
+	await intake(env, "alpha@one.test", "stranger@elsewhere.test");
+	await processInboundMessage(env, queued[0]);
+
+	assert.deepEqual(mailByMailbox(database).map((row) => row.mailboxId), ["annbox"]);
+	assert.equal([...objects.keys()].filter((key) => key.startsWith("held/")).length, 0);
+});
+
 test("a moderated cycle with no reviewer falls back per held branch", async (t) => {
 	t.mock.method(console, "info", () => {});
 	t.mock.method(console, "warn", () => {});
