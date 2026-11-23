@@ -356,6 +356,46 @@ export const updateMailboxSchema = z.object({
 	useAllDomains: z.boolean().optional(),
 });
 
+// List and member names surface in mail headers and display contexts, so they
+// take the same control/format-character refusal as alias labels.
+const mailingListNameSchema = z.string().trim().min(1).max(100).regex(/^[^\p{Cc}\p{Cf}]*$/u);
+
+export const mailingListSchema = z.object({
+	domainId: z.string().min(1),
+	localPart: z.string().min(1).max(64).regex(/^[a-zA-Z0-9._%+-]+$/),
+	name: mailingListNameSchema,
+	description: z.string().trim().max(1000).optional(),
+	postingPolicy: z.enum(["members_only", "anyone"]).optional(),
+	moderated: z.boolean().optional(),
+})
+	// A local part made only of dots or a +tag normalizes to nothing: inbound
+	// routing could never match it, so the list address would be unreachable.
+	.refine((value) => normalizeRecipientLocalPart(value.localPart).length > 0, {
+		message: "List address needs at least one letter or digit outside dots and +tags",
+	});
+
+export const updateMailingListSchema = z.object({
+	name: mailingListNameSchema.optional(),
+	description: z.string().trim().max(1000).nullable().optional(),
+	postingPolicy: z.enum(["members_only", "anyone"]).optional(),
+	moderated: z.boolean().optional(),
+	disabled: z.boolean().optional(),
+});
+
+export const mailingListMemberSchema = z.object({
+	email: z.string().trim().toLowerCase().email(),
+	name: z.string().trim().max(100).regex(/^[^\p{Cc}\p{Cf}]*$/u).optional(),
+	role: z.enum(["owner", "member"]).optional(),
+	moderated: z.boolean().optional(),
+});
+
+export const updateMailingListMemberSchema = z.object({
+	memberId: z.string().min(1),
+	name: z.string().trim().max(100).regex(/^[^\p{Cc}\p{Cf}]*$/u).nullable().optional(),
+	role: z.enum(["owner", "member"]).optional(),
+	moderated: z.boolean().optional(),
+});
+
 export const folderSchema = z.object({
 	mailboxId: z.string().min(1),
 	name: z.string().trim().min(1).max(80),
