@@ -9,9 +9,11 @@ import type { InboundQueueMessage } from "@/lib/email/inbound";
 /**
  * Nested lists are expanded recursively, not just one level: a member address
  * that names another list contributes that list's members to the delivery set.
- * A visited set of list ids makes a cycle (a -> b -> a, or a list subscribed to
- * itself) a no-op instead of a loop, and the depth cap bounds the member
- * queries a pathological chain can cost in one inbound delivery.
+ * Each list records the restriction it was already expanded under, which both
+ * makes a cycle (a -> b -> a, or a list subscribed to itself) a no-op instead
+ * of a loop and lets a weaker restriction re-expand a list a held branch
+ * consumed first; the depth cap bounds the member queries a pathological
+ * chain can cost in one inbound delivery.
  */
 const MAX_LIST_EXPANSION_DEPTH = 5;
 
@@ -31,6 +33,32 @@ export type SkippedListMember = {
 export type MailingListExpansion = {
 	deliveries: MailingListDelivery[];
 	skipped: SkippedListMember[];
+	/**
+	 * Lists whose own hold produced no deliverable reviewer — neither an owner
+	 * member nor the list's owning user. The caller retains the raw object
+	 * under `held/<listId>/` for each, so a held post is never silently
+	 * discarded no matter how deeply the holding list is nested.
+	 */
+	retained: ResolvedList[];
+};
+
+/**
+ * The restriction an expansion ran under. "restricted" means only owner-role
+ * member rows were expanded (a held post's reviewer set); "full" means every
+ * member row. Tracking it per list — separately from cycle prevention — is
+ * what makes traversal order irrelevant: a list first expanded restricted
+ * through a held branch is re-expanded in full when an unheld path reaches
+ * it, while a list already expanded in full needs no restricted pass.
+ */
+type ExpansionRestriction = "restricted" | "full";
+
+type ExpansionState = {
+	skipped: SkippedListMember[];
+	retained: ResolvedList[];
+	/** listId -> the weakest restriction it has already been expanded under. */
+	expanded: Map<string, ExpansionRestriction>;
+	/** Lists whose own hold was already evaluated once — a held list never expands fully. */
+	heldHandled: Set<string>;
 };
 
 /**
@@ -40,17 +68,21 @@ export type MailingListExpansion = {
  * The result is deduplicated by mailbox: two member rows that resolve to the
  * same mailbox (say, an address and its alias) deliver exactly one copy.
  *
- * `ownersOnly` restricts the expansion to `owner` members — the delivery set
- * for a post held for review. It propagates through nested lists, and a nested
- * list that would itself hold the sender's post also restricts that branch to
- * its owners, so a held post only ever reaches mailboxes that can review it.
+ * `ownersOnly` marks the whole delivery as held for review: expansion is
+ * restricted to owner members, the reviewers. A nested list that would hold
+ * the sender's post itself is a held branch — it expands its own reviewers
+ * privately and gets the complete no-reviewer handling: it keeps a sole
+ * reviewer past sender suppression, falls back to its own list's owning user,
+ * and is reported in `retained` when even that fails, all without disturbing
+ * ordinary deliveries from sibling branches.
  *
- * The delivery set is a union over expansion branches, not traversal order:
- * a mailbox deliverable through any branch gets the copy, so a member reached
- * only through a held branch is skipped while the same member reached through
- * an unheld sibling branch still receives the post. Skipped members are
- * reported, never subtracted — which branch a mailbox came through cannot
- * make another branch's copy undeliverable.
+ * The delivery set is a union over expansion branches, and traversal order
+ * cannot change it: a member reached only through a restricted branch is
+ * restricted, while the same member reached through an unheld sibling branch
+ * still receives the post — expansion state is tracked per list so the
+ * weaker restriction wins rather than whichever ran first. Skipped members
+ * are reported, never subtracted — which branch a mailbox came through
+ * cannot make another branch's copy undeliverable.
  */
 export async function expandMailingListDeliveries(
 	db: AppDatabase,
@@ -58,38 +90,62 @@ export async function expandMailingListDeliveries(
 	envelopeFrom?: string | null,
 	options: { ownersOnly?: boolean } = {},
 ): Promise<MailingListExpansion> {
-	const deliveries = new Map<string, MailingListDelivery>();
-	const skipped: SkippedListMember[] = [];
-	await collectMemberDeliveries(db, list.listId, envelopeFrom, deliveries, skipped, new Set([list.listId]), 0, options.ownersOnly ?? false);
+	const ownersOnly = options.ownersOnly ?? false;
+	// Ordinary deliveries and reviewer deliveries are collected apart so echo
+	// suppression — which only ever applies to an unheld delivery — can never
+	// strip a held branch's reviewer copy.
+	const ordinary = new Map<string, MailingListDelivery>();
+	const reviewer = new Map<string, MailingListDelivery>();
+	const state: ExpansionState = {
+		skipped: [],
+		retained: [],
+		expanded: new Map([[list.listId, ownersOnly ? "restricted" : "full"]]),
+		heldHandled: new Set(ownersOnly ? [list.listId] : []),
+	};
+	const senderMailbox = await resolveMailboxIdentity(db, envelopeFrom ?? "");
+	await collectMemberDeliveries(db, list.listId, envelopeFrom, state, ordinary, reviewer, 0, ownersOnly, senderMailbox);
 
 	// Sender dedup: a member posting to the list does not get a copy of their
 	// own post, whether their member row uses the address they sent from or an
 	// alias of the same mailbox. The identity lookup — not the delivery
 	// resolver — decides whose mailbox the sender owns, so a catch-all cannot
 	// fold an unrelated sender onto a member mailbox and suppress their copy.
-	// For a held post the reviewers are the deliveries: suppression only
-	// applies while at least one other reviewer remains, since echo-free
-	// delivery must not leave a held post with nobody who can act on it.
-	const senderMailbox = await resolveMailboxIdentity(db, envelopeFrom ?? "");
-	if (senderMailbox && (!options.ownersOnly || deliveries.size > 1)) {
-		deliveries.delete(senderMailbox.mailboxId);
+	// Suppression touches ordinary deliveries only: a held post's reviewers
+	// are the moderation notice, and for a held post it applies only while
+	// another reviewer remains — echo-free delivery must not leave a held
+	// post with nobody who can act on it.
+	if (senderMailbox && (!ownersOnly || ordinary.size + reviewer.size > 1)) {
+		ordinary.delete(senderMailbox.mailboxId);
 	}
 
-	if (options.ownersOnly && !deliveries.size) {
+	if (ownersOnly && !ordinary.size && !reviewer.size) {
 		// A held post must land with a reviewer: when no owner member resolves,
 		// the list's owning user's mailbox is the reviewer of last resort.
 		const fallback = await resolveFallbackReviewer(db, list);
-		if (fallback) deliveries.set(fallback.mailboxId, { address: `${fallback.localPart}@${fallback.hostname}`, mailbox: fallback });
+		if (fallback) {
+			reviewer.set(fallback.mailboxId, { address: `${fallback.localPart}@${fallback.hostname}`, mailbox: fallback });
+		} else {
+			state.retained.push(list);
+		}
 	}
 
-	return { deliveries: [...deliveries.values()], skipped };
+	// A mailbox reachable both ways keeps the ordinary subscription copy.
+	const deliveries = new Map(ordinary);
+	for (const [mailboxId, delivery] of reviewer) {
+		if (!deliveries.has(mailboxId)) deliveries.set(mailboxId, delivery);
+	}
+	return { deliveries: [...deliveries.values()], skipped: state.skipped, retained: state.retained };
 }
 
 /**
  * The reviewer of last resort for a held post: the list's owning user's
  * mailbox, preferring one on the list's domain but accepting any of their
  * mailboxes — the point is only that a held copy reaches someone who can act
- * on it. Returns null when the owner has no enabled mailbox at all; the caller
+ * on it. This is a notice destination, not a reviewer identity: the fallback
+ * mailbox need not be a member of the list at all, so its owner seeing the
+ * held copy does not by itself provide an approve path — approval still takes
+ * an unmoderated owner reposting, or an operator acting on a `held/` object.
+ * Returns null when the owning user has no enabled mailbox at all; the caller
  * then retains the raw object instead of delivering.
  */
 async function resolveFallbackReviewer(
@@ -119,11 +175,12 @@ async function collectMemberDeliveries(
 	db: AppDatabase,
 	listId: string,
 	envelopeFrom: string | null | undefined,
-	deliveries: Map<string, MailingListDelivery>,
-	skipped: SkippedListMember[],
-	visitedListIds: Set<string>,
+	state: ExpansionState,
+	target: Map<string, MailingListDelivery>,
+	heldTarget: Map<string, MailingListDelivery>,
 	depth: number,
 	ownersOnly: boolean,
+	senderMailbox: ResolvedMailbox | null,
 ): Promise<void> {
 	const members = await db
 		.select({ email: mailingListMembers.email })
@@ -133,24 +190,75 @@ async function collectMemberDeliveries(
 	for (const member of members) {
 		const decision = await resolveInboundAddress(db, member.email, envelopeFrom);
 		if (decision?.mailbox) {
-			deliveries.set(decision.mailbox.mailboxId, { address: normalizeEmailAddress(member.email), mailbox: decision.mailbox });
+			if (!target.has(decision.mailbox.mailboxId)) {
+				target.set(decision.mailbox.mailboxId, { address: normalizeEmailAddress(member.email), mailbox: decision.mailbox });
+			}
 			continue;
 		}
 		if (decision?.action === "list" && decision.list) {
-			if (visitedListIds.has(decision.list.listId)) {
-				skipped.push({ email: member.email, reason: "already-expanded" });
+			const child = decision.list;
+			if (decision.heldForModeration) {
+				// A list that would itself hold this post is a held branch: it is
+				// evaluated once, privately, and gets the same no-reviewer
+				// guarantee the root held post gets — its own sole-reviewer
+				// protection, its own owner's fallback mailbox, and its own
+				// `held/` retention — no matter which branch reached it first
+				// or what else delivered normally.
+				if (state.heldHandled.has(child.listId)) {
+					state.skipped.push({ email: member.email, reason: "already-expanded" });
+					continue;
+				}
+				state.heldHandled.add(child.listId);
+				if (depth + 1 >= MAX_LIST_EXPANSION_DEPTH) {
+					// The reviewers are unreachable, so retain rather than skip.
+					state.retained.push(child);
+					continue;
+				}
+				markExpanded(state, child.listId, "restricted");
+				// Reviewer copies nested held branches contribute live apart from
+				// the child's own deliveries, so suppression below cannot strip a
+				// reviewer a sub-branch already decided to keep.
+				const branch = new Map<string, MailingListDelivery>();
+				const branchHeld = new Map<string, MailingListDelivery>();
+				await collectMemberDeliveries(db, child.listId, envelopeFrom, state, branch, branchHeld, depth + 1, true, senderMailbox);
+				if (senderMailbox && branch.size + branchHeld.size > 1) branch.delete(senderMailbox.mailboxId);
+				if (!branch.size && !branchHeld.size) {
+					const fallback = await resolveFallbackReviewer(db, child);
+					if (fallback) {
+						branch.set(fallback.mailboxId, { address: `${fallback.localPart}@${fallback.hostname}`, mailbox: fallback });
+					} else {
+						state.retained.push(child);
+						continue;
+					}
+				}
+				for (const [mailboxId, delivery] of branchHeld) {
+					if (!heldTarget.has(mailboxId)) heldTarget.set(mailboxId, delivery);
+				}
+				for (const [mailboxId, delivery] of branch) {
+					if (!heldTarget.has(mailboxId)) heldTarget.set(mailboxId, delivery);
+				}
+				continue;
+			}
+			const desired: ExpansionRestriction = ownersOnly ? "restricted" : "full";
+			const seen = state.expanded.get(child.listId);
+			if (seen === "full" || (seen === "restricted" && desired === "restricted")) {
+				state.skipped.push({ email: member.email, reason: "already-expanded" });
 				continue;
 			}
 			if (depth + 1 >= MAX_LIST_EXPANSION_DEPTH) {
-				skipped.push({ email: member.email, reason: "too-deep" });
+				state.skipped.push({ email: member.email, reason: "too-deep" });
 				continue;
 			}
-			visitedListIds.add(decision.list.listId);
-			await collectMemberDeliveries(db, decision.list.listId, envelopeFrom, deliveries, skipped, visitedListIds, depth + 1, ownersOnly || !!decision.heldForModeration);
+			markExpanded(state, child.listId, desired);
+			await collectMemberDeliveries(db, child.listId, envelopeFrom, state, target, heldTarget, depth + 1, ownersOnly, senderMailbox);
 			continue;
 		}
-		skipped.push({ email: member.email, reason: decision?.action === "reject" ? "rejected" : "external" });
+		state.skipped.push({ email: member.email, reason: decision?.action === "reject" ? "rejected" : "external" });
 	}
+}
+
+function markExpanded(state: ExpansionState, listId: string, restriction: ExpansionRestriction): void {
+	if (state.expanded.get(listId) !== "full") state.expanded.set(listId, restriction);
 }
 
 /**
@@ -190,13 +298,23 @@ async function collectMemberDeliveries(
  *
  * A post the routing decision held for review (`ownersOnly`) goes only to the
  * list's owner members — the reviewers — instead of the full membership. The
- * reviewer copy is the moderation notice: an owner approves by reposting or
- * forwarding the message to the list, which a list-level `moderated` flag
- * does not re-hold because owner senders are exempt from it (a member-level
- * `moderated` flag on the owner still holds). When no owner member resolves,
- * the list's owning user's mailbox reviews it; when even that fails, the raw
- * is retained under `held/` so the post is never silently discarded. A real
- * pending-posts queue with approve/discard is a later slice.
+ * reviewer copy is the moderation notice: an owner approves by reposting the
+ * message to the list, which a list-level `moderated` flag does not re-hold
+ * because owner senders are exempt from it. A member-level `moderated` flag
+ * is honored at every role, so a moderated owner's repost is re-held for the
+ * remaining owners — approve-via-repost needs at least one unmoderated owner,
+ * with the `held/` object as the operator fallback when none exists.
+ *
+ * Every held branch — the root list or a nested list that holds the post —
+ * gets a reviewer: its owner members, then its owning user's mailbox as a
+ * notice-only destination, then retention under `held/<listId>/<hash>.eml`.
+ * Retained objects sit outside the `inbound/` sweep and are operator-
+ * recoverable from the bucket only — no in-app replay exists yet, and
+ * bounded retention plus operator alerting are deferred to the
+ * approve/discard-queue slice. A list with no reachable reviewer
+ * accepts-and-holds rather than bouncing: the sender sees silence either
+ * way today, and a recoverable copy beats a bounce for a post the list
+ * owner may still want. A real pending-posts queue is a later slice.
  */
 export async function deliverToMailingList(
 	env: CloudflareEnv,
@@ -206,33 +324,14 @@ export async function deliverToMailingList(
 	options: { ownersOnly?: boolean } = {},
 ): Promise<void> {
 	const db = getDb(env);
-	const { deliveries, skipped } = await expandMailingListDeliveries(db, list, payload.from, options);
+	const { deliveries, skipped, retained } = await expandMailingListDeliveries(db, list, payload.from, options);
 	if (options.ownersOnly) {
 		console.info(`Mailing list ${list.localPart}@${list.hostname}: post from ${payload.from} held for owner review`);
 	}
 	if (skipped.length) {
 		console.info(`Mailing list ${list.localPart}@${list.hostname}: skipped ${skipped.map((member) => `${member.email} (${member.reason})`).join(", ")}`);
 	}
-	if (!deliveries.length) {
-		if (options.ownersOnly) {
-			// A held post must never vanish silently: retain the raw under a
-			// content-keyed `held/` object (retries idempotent) where ops or a
-			// later moderation surface can recover it.
-			const raw = await env.BUCKET.get(payload.rawR2Key);
-			if (!raw) {
-				console.error(`Missing R2 object: ${payload.rawR2Key}`);
-				return;
-			}
-			const buffer = await raw.arrayBuffer();
-			const heldKey = await heldInboundKey(list.listId, buffer);
-			await env.BUCKET.put(heldKey, buffer, {
-				httpMetadata: { contentType: "message/rfc822" },
-				customMetadata: { from: payload.from, to: payload.to },
-			});
-			await deleteUnreferencedRawMail(env, db, payload.rawR2Key);
-			console.warn(`Mailing list ${list.localPart}@${list.hostname}: held post retained at ${heldKey} — no reviewer could receive it`);
-			return;
-		}
+	if (!deliveries.length && !retained.length) {
 		console.warn(`Mailing list ${list.localPart}@${list.hostname} has no deliverable members`);
 		await deleteUnreferencedRawMail(env, db, payload.rawR2Key);
 		return;
@@ -244,6 +343,22 @@ export async function deliverToMailingList(
 		return;
 	}
 	const buffer = await raw.arrayBuffer();
+
+	// A held branch with no reviewer must never vanish silently: retain the
+	// raw under a content-keyed `held/` object per holding list (retries
+	// idempotent) where ops or a later moderation surface can recover it.
+	for (const heldList of retained) {
+		const heldKey = await heldInboundKey(heldList.listId, buffer);
+		await env.BUCKET.put(heldKey, buffer, {
+			httpMetadata: { contentType: "message/rfc822" },
+			customMetadata: { from: payload.from, to: payload.to },
+		});
+		console.warn(`Mailing list ${heldList.localPart}@${heldList.hostname}: held post retained at ${heldKey} — no reviewer could receive it`);
+	}
+	if (!deliveries.length) {
+		await deleteUnreferencedRawMail(env, db, payload.rawR2Key);
+		return;
+	}
 
 	let firstError: unknown = null;
 	for (const delivery of deliveries) {

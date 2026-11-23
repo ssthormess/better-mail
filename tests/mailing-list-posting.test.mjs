@@ -21,6 +21,7 @@ await build({
 			export { intakeIncomingMail } from "./src/lib/email/intake.ts";
 			export { processInboundMessage } from "./src/lib/email/inbound.ts";
 			export { resolveInboundAddress, resolveMailboxIdentity } from "./src/lib/email/routing.ts";
+			export { inboundStorageKey } from "./src/lib/email/inbound-id.ts";
 			export { getDb } from "./src/db/index.ts";
 		`,
 		resolveDir: root,
@@ -36,7 +37,7 @@ await build({
 	alias: { "cloudflare:workers": "./server/runtime/cloudflare-workers.ts" },
 	logLevel: "silent",
 });
-const { SqliteDatabase, applyMigrations, intakeIncomingMail, processInboundMessage, resolveInboundAddress, resolveMailboxIdentity, getDb } =
+const { SqliteDatabase, applyMigrations, intakeIncomingMail, processInboundMessage, resolveInboundAddress, resolveMailboxIdentity, inboundStorageKey, getDb } =
 	await import(pathToFileURL(join(directory, "entry.mjs")).href);
 
 const raw = new TextEncoder().encode("From: sender@ext.test\r\nTo: team@one.test\r\nSubject: hi\r\nMessage-ID: <1@ext.test>\r\n\r\nbody\r\n").buffer;
@@ -428,5 +429,119 @@ test("an owner repost on a moderated list is not re-held", async (t) => {
 
 	await intake(env, "team@one.test", "bob@one.test");
 	await processInboundMessage(env, queued[0]);
-	assert.deepEqual(new Set(mailByMailbox(database).map((row) => row.mailboxId)), new Set(["annbox", "carolbox"]));
+	assert.deepEqual(
+		new Set(mailByMailbox(database).map((row) => row.mailboxId)),
+		new Set(["annbox", "carolbox"]),
+	);
+});
+
+test("a moderated child list with no reviewer retains the post under its own held key", async (t) => {
+	t.mock.method(console, "info", () => {});
+	t.mock.method(console, "warn", () => {});
+	const { env, database, objects, queued } = await setup(t);
+	// eng's owner has no mailbox anywhere, so the branch cannot fall back.
+	database.db.prepare("INSERT INTO users (id, email, password_hash, name, role, is_primary_admin, created_at) VALUES ('ghost', 'ghost@one.test', 'hash', 'Ghost', 'member', 0, 1)").run();
+	insertList(database, { id: "all", localPart: "all", postingPolicy: "anyone", members: ["eng@one.test"] });
+	insertList(database, { id: "eng", localPart: "eng", postingPolicy: "anyone", moderated: 1, userId: "ghost", members: ["ann@one.test"] });
+
+	// The parent accepts and is unheld; the child holds and has no owner
+	// member — the branch used to be accepted then discarded entirely.
+	await intake(env, "all@one.test", "stranger@elsewhere.test");
+	await processInboundMessage(env, queued[0]);
+
+	assert.equal(mailByMailbox(database).length, 0);
+	assert.ok([...objects.keys()].some((key) => key.startsWith("held/eng/")), "held raw retained for the child");
+	assert.equal(objects.has(queued[0].rawR2Key), false, "staging object is consumed");
+});
+
+test("a held child falls back to its own list's owner while ordinary siblings still deliver", async (t) => {
+	t.mock.method(console, "info", () => {});
+	const { env, database, objects, queued } = await setup(t);
+	// eng's owning user has a mailbox but is no member anywhere: the fallback
+	// reviewer is notice-only, not a member identity.
+	database.db.exec(`
+		INSERT INTO users (id, email, password_hash, name, role, is_primary_admin, created_at) VALUES ('mod', 'mod@one.test', 'hash', 'Mod', 'member', 0, 1);
+		INSERT INTO mailboxes (id, user_id, domain_id, local_part, created_at) VALUES ('modbox', 'mod', 'one', 'mod', 4);
+	`);
+	insertList(database, { id: "all", localPart: "all", postingPolicy: "anyone", members: ["eng@one.test", "bob@one.test"] });
+	insertList(database, { id: "eng", localPart: "eng", postingPolicy: "anyone", moderated: 1, userId: "mod", members: ["ann@one.test"] });
+
+	await intake(env, "all@one.test", "stranger@elsewhere.test");
+	await processInboundMessage(env, queued[0]);
+
+	// eng holds the stranger's post: its member ann does not get a copy, but
+	// eng's owning user's mailbox does — and bob's ordinary parent copy is
+	// unaffected by the hold on the sibling branch.
+	assert.deepEqual(new Set(mailByMailbox(database).map((row) => row.mailboxId)), new Set(["bobbox", "modbox"]));
+	assert.equal([...objects.keys()].filter((key) => key.startsWith("held/")).length, 0);
+});
+
+test("root sender suppression cannot strip a held child's only reviewer", async (t) => {
+	t.mock.method(console, "info", () => {});
+	const { env, database, queued } = await setup(t);
+	insertList(database, { id: "all", localPart: "all", postingPolicy: "anyone", members: ["eng@one.test", "carol@one.test"] });
+	insertList(database, { id: "eng", localPart: "eng", postingPolicy: "anyone", members: [{ email: "carol@one.test", role: "owner", moderated: 1 }] });
+
+	// carol's post is held by eng (her owner row there is moderated), and she
+	// is eng's only reviewer — the parent fan-out's echo suppression must
+	// leave her reviewer copy standing.
+	await intake(env, "all@one.test", "carol@one.test");
+	await processInboundMessage(env, queued[0]);
+
+	assert.deepEqual(mailByMailbox(database).map((row) => row.mailboxId), ["carolbox"]);
+});
+
+test("a leaf reached through held and unheld paths delivers the union in either order", async (t) => {
+	t.mock.method(console, "info", () => {});
+	for (const engFirst of [true, false]) {
+		const { env, database, queued } = await setup(t);
+		// eng holds the stranger's post and reaches ops only as its owner member;
+		// aux reaches ops unrestricted. ops's owner is carol, its member bob —
+		// bob's copy exists only if the unrestricted path still expands ops.
+		insertList(database, {
+			id: "all",
+			localPart: "all",
+			postingPolicy: "anyone",
+			members: engFirst ? ["eng@one.test", "aux@one.test"] : ["aux@one.test", "eng@one.test"],
+		});
+		insertList(database, { id: "eng", localPart: "eng", postingPolicy: "anyone", moderated: 1, members: [{ email: "ops@one.test", role: "owner" }] });
+		insertList(database, { id: "aux", localPart: "aux", postingPolicy: "anyone", members: ["ops@one.test"] });
+		insertList(database, {
+			id: "ops",
+			localPart: "ops",
+			postingPolicy: "anyone",
+			members: [{ email: "carol@one.test", role: "owner" }, "bob@one.test"],
+		});
+
+		await intake(env, "all@one.test", "stranger@elsewhere.test");
+		await processInboundMessage(env, queued[0]);
+
+		assert.deepEqual(
+			new Set(mailByMailbox(database).map((row) => row.mailboxId)),
+			new Set(["bobbox", "carolbox"]),
+			`traversal order engFirst=${engFirst} changed the delivery set`,
+		);
+	}
+});
+
+test("a pre-staging payload consumed after the staged copy still dedupes on the canonical key", async (t) => {
+	t.mock.method(console, "info", () => {});
+	const { env, database, objects, queued } = await setup(t);
+	const bytes = rawFor("cross-format");
+
+	await intake(env, "bob@one.test", "sender@ext.test", bytes);
+	await processInboundMessage(env, queued[0]);
+	const [row] = mailByMailbox(database);
+	assert.equal(row.mailboxId, "bobbox");
+
+	// A payload produced before staging keys existed carries the old-format
+	// canonical key: its row was already stored under the new scoped key, so
+	// dedupe has to look up both variants.
+	const legacyKey = await inboundStorageKey(bytes, "bobbox");
+	assert.notEqual(legacyKey, row.rawR2Key);
+	objects.set(legacyKey, bytes);
+	await processInboundMessage(env, { from: "sender@ext.test", to: "bob@one.test", rawR2Key: legacyKey });
+
+	assert.equal(mailByMailbox(database).filter((entry) => entry.mailboxId === "bobbox").length, 1);
+	assert.equal(objects.has(legacyKey), false, "the duplicate's object is consumed");
 });

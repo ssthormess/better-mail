@@ -115,15 +115,19 @@ async function storeInboundMessage(
 	// The stored object lives at the canonical content key for this mailbox —
 	// unless the payload already carries one (a member copy the fan-out wrote,
 	// or a payload produced before staging keys existed, whose key IS the
-	// stored key). Rows written before scope prefixes carry the unprefixed
-	// form, so a replay across the format change still dedupes on both.
+	// stored key). Dedupe checks every key a row for these bytes could carry:
+	// the payload's own key, the current mailbox-scoped canonical key (a
+	// pre-change payload arriving after the equivalent staged event stored
+	// under it), and the legacy unprefixed key (a replay across the format
+	// change in the other direction).
+	const canonicalKey = await inboundStorageKey(buffer, mailboxInboundScope(mailbox.mailboxId));
 	const storedKey = payload.rawR2Key.startsWith(INBOUND_STAGING_PREFIX)
-		? await inboundStorageKey(buffer, mailboxInboundScope(mailbox.mailboxId))
+		? canonicalKey
 		: payload.rawR2Key;
 	const legacyKey = await inboundStorageKey(buffer, mailbox.mailboxId);
 	const [stored] = await db.select({ id: messages.id, rawR2Key: messages.rawR2Key }).from(messages).where(and(
 		eq(messages.mailboxId, mailbox.mailboxId),
-		inArray(messages.rawR2Key, [...new Set([storedKey, legacyKey])]),
+		inArray(messages.rawR2Key, [...new Set([storedKey, canonicalKey, legacyKey])]),
 	)).limit(1);
 	if (stored) {
 		// The source object is a duplicate delivery artifact: a staging key or

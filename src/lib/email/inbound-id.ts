@@ -73,6 +73,14 @@ export function inboundStagingKey(): string {
  * The `held/` prefix sits outside the `inbound/` orphan sweep on purpose:
  * these objects are the retention, and a later moderation slice owns their
  * lifecycle.
+ *
+ * The contract today is deliberately thin: a `held/` object is an
+ * operator-recoverable copy at a known bucket path — there is no in-app
+ * replay or approve action, and bounded retention plus operator alerting are
+ * deferred to the pending-posts-queue slice that will own this prefix. The
+ * behavior chosen for a no-reviewer hold is accept-and-hold, not a bounce:
+ * the sender gets silence either way at this stage of the feature, and a
+ * recoverable copy preserves the post for an owner who may still want it.
  */
 export async function heldInboundKey(listId: string, raw: ArrayBuffer): Promise<string> {
 	return `held/${listId}/${await sha256Hex([new Uint8Array(raw)])}.eml`;
