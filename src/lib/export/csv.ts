@@ -13,7 +13,9 @@ function csvField(value: string): string {
 	// Spreadsheet-formula injection guard (OWASP): Excel and Sheets evaluate a
 	// cell starting with = + - @ as a formula, and strip leading whitespace
 	// first, so a hostile contact name could otherwise run commands or phone
-	// home. A leading ' makes importers read the cell as literal text.
+	// home. A leading ' makes importers read the cell as literal text; it stays
+	// visible on import, so a genuinely formula-looking name diverges from its
+	// stored value — the vCard export keeps the raw character instead.
 	if (/^\s*[=+\-@]/.test(value)) value = `'${value}`;
 	return /[",\r\n]/.test(value) ? `"${value.replaceAll('"', '""')}"` : value;
 }

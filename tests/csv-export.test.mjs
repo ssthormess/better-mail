@@ -110,6 +110,14 @@ test("cells that would run as spreadsheet formulas are prefixed with a quote", (
 	assert.equal(ok[0], "A - B = C");
 });
 
+test("a formula-looking name survives verbatim behind the ' marker", () => {
+	const csv = contactsToCsv([{ email: "a@example.com", displayName: "+Anna", blocked: false }]);
+	// Exact bytes: the marker is an unquoted leading ' and +Anna is preserved as-is.
+	assert.ok(csv.endsWith("'+Anna,a@example.com,false\r\n"));
+	const [, row] = parse(csv);
+	assert.equal(row[0], "'+Anna");
+});
+
 test("the owner exports the whole address book as CSV, blocked contacts included", async (t) => {
 	await setup(t, "admin");
 	const response = await GET(get("/api/export/contacts?mailboxId=mb-team&format=csv"));

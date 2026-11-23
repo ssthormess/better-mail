@@ -76,11 +76,12 @@ export function ContactsPage() {
 			<div className="flex items-center justify-between gap-4">
 				<h1 className="text-2xl font-medium md:text-3xl">{t("contacts.title")}</h1>
 				<div className="flex items-center gap-2">
+					{/* The trigger stays focusable while busy so Radix can return focus to it when the menu closes; onExport itself blocks a second pick mid-flight. */}
 					<ContactExportMenu
-						disabled={!mailboxId || exporting}
+						disabled={!mailboxId}
 						onPick={(format) => void onExport(format)}
 						trigger={
-							<Button type="button" variant="outline" disabled={!mailboxId || exporting}>
+							<Button type="button" variant="outline" disabled={!mailboxId}>
 								<Download className="h-4 w-4" />
 								{t("contacts.export")}
 								<ChevronDown className="h-4 w-4" />
