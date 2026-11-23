@@ -5,19 +5,17 @@ import toast from "react-hot-toast";
 import { Upload } from "@/components/icons";
 import { useLanguage } from "@/components/language-provider";
 import { Button } from "@/components/ui/button";
+import { resolveContactImportFormat } from "@/lib/import/format";
 import { ContactImportDialog } from "./contact-import-dialog";
 import { importContacts, reportImportResult } from "./contacts-page-utils";
 
 /**
- * Whether the import route will read this pick as CSV — the same precedence the
- * route's resolveFormat uses (extension, then content type). Anything it treats
- * as CSV goes through the preview dialog; only the vCard path writes directly,
- * so a MIME-sniffed CSV with a neutral name cannot skip the confirm step.
+ * Whether the import route will read this pick as CSV — the same classifier the
+ * route uses, so the preview dialog can never disagree with it. Only the known
+ * vCard path writes directly.
  */
 function opensImportPreview(file: File): boolean {
-	if (/\.csv$/i.test(file.name)) return true;
-	if (/\.(vcf|vcard)$/i.test(file.name)) return false;
-	return /^(text\/csv|application\/vnd\.ms-excel)$/i.test(file.type);
+	return resolveContactImportFormat("", file.name, file.type) === "csv";
 }
 
 /**

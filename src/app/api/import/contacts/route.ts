@@ -1,11 +1,12 @@
 import { NextResponse } from "next/server";
 import { getDb } from "@/db";
-import { addressesSeenInMailbox, getContactByEmail, getExistingContactEmails, saveManualContact } from "@/app/api/contacts/utils";
+import { getContactByEmail, getExistingContactEmails, saveManualContact, uploadAddressesSeenInMailbox } from "@/app/api/contacts/utils";
 import { requireUser } from "@/lib/auth/cookies";
 import { getEnv } from "@/lib/cloudflare";
 import { RequestBodyTooLargeError } from "@/lib/http/errors";
 import { readFormDataBody } from "@/lib/http/request";
 import { hasVCardMarkers, parseCsvContacts } from "@/lib/import/csv";
+import { resolveContactImportFormat, type ContactImportFormat } from "@/lib/import/format";
 import { decodeTextBytes } from "@/lib/import/text";
 import { isVCardDocument, parseVcfContacts } from "@/lib/import/vcard";
 import { getMailboxAccessLevel } from "@/lib/mailboxes/access";
@@ -15,7 +16,6 @@ import { getPersonalIdentityForAddress, syncPersonalIdentity } from "@/lib/profi
 // request time, and the parsers' card/row caps bound the write loop.
 const MAX_CONTACT_IMPORT_BYTES = 5 * 1024 * 1024;
 
-type ImportFormat = "vcf" | "csv";
 type ConflictPolicy = "update" | "skip";
 
 interface ParsedImport {
@@ -30,18 +30,11 @@ interface ParsedImport {
 
 /**
  * The `format` form field selects the parser, mirroring the export route's
- * `?format=` convention. Without one the upload is sniffed — the filename's
- * extension first, then the content type (browsers send both unreliably), and
- * otherwise vCard so existing clients, which only ever sent .vcf, stay put.
+ * `?format=` convention — and the file picker's branch to the preview dialog
+ * runs the same `resolveContactImportFormat`, so neither can drift.
  */
-function resolveFormat(form: FormData, file: File): ImportFormat | null {
-	const declared = String(form.get("format") ?? "").trim().toLowerCase();
-	if (declared === "csv" || declared === "vcf") return declared;
-	if (declared) return null;
-	if (/\.csv$/i.test(file.name)) return "csv";
-	if (/\.(vcf|vcard)$/i.test(file.name)) return "vcf";
-	if (/^(text\/csv|application\/vnd\.ms-excel)$/i.test(file.type)) return "csv";
-	return "vcf";
+function resolveFormat(form: FormData, file: File): ContactImportFormat | null {
+	return resolveContactImportFormat(String(form.get("format") ?? ""), file.name, file.type);
 }
 
 /** `conflict` decides what an already-known address does: `update` rewrites its name like POST /api/contacts, `skip` leaves it alone. */
@@ -51,7 +44,7 @@ function resolveConflict(form: FormData): ConflictPolicy | null {
 	return value === "skip" ? "skip" : null;
 }
 
-function parseUpload(format: ImportFormat, text: string): ParsedImport {
+function parseUpload(format: ContactImportFormat, text: string): ParsedImport {
 	if (format === "csv") {
 		const parsed = parseCsvContacts(text);
 		return {
@@ -133,18 +126,17 @@ export async function POST(request: Request) {
 	if (preview) {
 		const counts = { new: 0, existing: 0, invalid: 0, duplicates: 0, skipped: parsed.previewSkipped };
 		const rows: { row: number; email: string | null; name: string | null; status: string }[] = [];
-		let existing = await getExistingContactEmails(
-			db,
-			ownerId,
-			parsed.rows.flatMap((row) => (row.status === "ok" && row.email ? [row.email] : [])),
-		);
-		if (!access.isOwner) {
-			// Same visibility rule as GET /api/contacts and the export: a delegate
-			// only sees addresses on this mailbox's mail. An existing contact they
-			// cannot see reads as new, so the preview cannot probe the owner's
-			// private book membership.
-			existing = await addressesSeenInMailbox(db, access.mailbox.id, [...existing], user.id);
-		}
+		const candidates = parsed.rows.flatMap((row) => (row.status === "ok" && row.email ? [row.email] : []));
+		// Same visibility rule as GET /api/contacts and the export: a delegate
+		// only sees addresses on this mailbox's mail, so their candidates shrink
+		// to the mailbox-visible set before the book is even queried. That scan
+		// pages the mailbox's own messages — its cost tracks upload and mailbox
+		// size, never how much of the owner's private book matched, and an
+		// existing contact a delegate cannot see reads as new.
+		const visible = access.isOwner
+			? candidates
+			: [...await uploadAddressesSeenInMailbox(db, access.mailbox.id, candidates, user.id)];
+		const existing = await getExistingContactEmails(db, ownerId, visible);
 		for (const row of parsed.rows) {
 			const status = row.status === "ok" ? (existing.has(row.email ?? "") ? "existing" : "new") : row.status;
 			if (status === "new") counts.new++;

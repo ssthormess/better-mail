@@ -1,6 +1,6 @@
 import { and, asc, eq, inArray, or, sql } from "drizzle-orm";
 import { draftsVisibleTo } from "@/lib/email/draft-access";
-import { addressListIncludes } from "@/lib/email/address";
+import { addressListIncludes, getEmailAddressList } from "@/lib/email/address";
 import type { getDb } from "@/db";
 import { contacts, messages } from "@/db/schema";
 import { escapeLike, insensitiveLike } from "@/db/sql";
@@ -93,6 +93,39 @@ export async function addressesSeenInMailbox(db: Db, mailboxId: string, emails: 
 		for (const email of chunk) {
 			if (rows.some((row) => [row.fromAddr, row.toAddr, row.ccAddr].some((value) => addressListIncludes(value, email)))) seen.add(email);
 		}
+	}
+	return seen;
+}
+
+/**
+ * Same verdict as addressesSeenInMailbox — which of `emails` appear on this
+ * mailbox's visible mail — but computed for upload-sized candidate sets by
+ * paging the mailbox's own address fields and matching locally, instead of
+ * LIKE-probing per address. The query count tracks the mailbox's size and the
+ * paging stops the moment every candidate is found, so it never scales with
+ * how many candidates are stored contacts. A private draft stays visible only
+ * to its author, same as the probe path.
+ */
+export async function uploadAddressesSeenInMailbox(db: Db, mailboxId: string, emails: string[], viewerUserId: string): Promise<Set<string>> {
+	const wanted = new Set(emails);
+	const seen = new Set<string>();
+	for (let offset = 0; seen.size < wanted.size; offset += 500) {
+		const rows = await db
+			.select({ fromAddr: messages.fromAddr, toAddr: messages.toAddr, ccAddr: messages.ccAddr })
+			.from(messages)
+			.where(and(eq(messages.mailboxId, mailboxId), draftsVisibleTo(viewerUserId)))
+			.orderBy(asc(messages.id))
+			.limit(500)
+			.offset(offset);
+		if (rows.length === 0) break;
+		for (const row of rows) {
+			for (const value of [row.fromAddr, row.toAddr, row.ccAddr]) {
+				for (const address of getEmailAddressList(value)) {
+					if (wanted.has(address)) seen.add(address);
+				}
+			}
+		}
+		if (rows.length < 500) break;
 	}
 	return seen;
 }

@@ -20,8 +20,9 @@ const { app, newDatabase } = await loadApp("csv-import", `
 	export { POST } from "./src/app/api/import/contacts/route.ts";
 	export { parseCsvContacts, CSV_IMPORT_MAX_ROWS } from "./src/lib/import/csv.ts";
 	export { decodeTextBytes } from "./src/lib/import/text.ts";
+	export { resolveContactImportFormat } from "./src/lib/import/format.ts";
 `, { mocks });
-const { POST, parseCsvContacts, CSV_IMPORT_MAX_ROWS, decodeTextBytes } = app;
+const { POST, parseCsvContacts, CSV_IMPORT_MAX_ROWS, decodeTextBytes, resolveContactImportFormat } = app;
 
 const seed = `${sharedMailboxSeed("full_access")}
 	INSERT INTO contacts (id, user_id, email, display_name, source, blocked, created_at) VALUES
@@ -43,6 +44,27 @@ function post(mailboxId, content, filename = "contacts.csv", fields = {}) {
 }
 const csv = (...lines) => `${lines.join("\r\n")}\r\n`;
 const contactsOf = (sqlite, userId) => sqlite.prepare("SELECT email, display_name, source FROM contacts WHERE user_id = ? ORDER BY email").all(userId);
+
+// Counts every statement execution through the D1-shaped prepare() surface —
+// the test stand-in for D1's per-invocation query budget.
+function countQueries(db) {
+	let count = 0;
+	const wrap = (statement) => {
+		for (const method of ["first", "run", "all", "raw"]) {
+			const original = statement[method].bind(statement);
+			statement[method] = (...args) => {
+				count++;
+				return original(...args);
+			};
+		}
+		const originalBind = statement.bind.bind(statement);
+		statement.bind = (...args) => wrap(originalBind(...args));
+		return statement;
+	};
+	const originalPrepare = db.prepare.bind(db);
+	db.prepare = (sql) => wrap(originalPrepare(sql));
+	return () => count;
+}
 
 // ---------------------------------------------------------------- parser ---
 
@@ -168,6 +190,24 @@ test("a UTF-8 BOM and a UTF-16 file both parse", () => {
 	assert.deepEqual(contacts, [{ email: "jose@example.com", displayName: "José" }]);
 });
 
+// The picker and the route share this classifier — precedence drift between
+// them is what let a MIME-only CSV skip the preview.
+test("the shared format classifier keeps the route's precedence", () => {
+	// An explicit format wins over every sniff.
+	assert.equal(resolveContactImportFormat("csv", "a.vcf", "text/vcard"), "csv");
+	assert.equal(resolveContactImportFormat("vcf", "a.csv", "text/csv"), "vcf");
+	assert.equal(resolveContactImportFormat("XML", "a.csv", "text/csv"), null);
+	// Then the extension beats the content type.
+	assert.equal(resolveContactImportFormat("", "a.csv", "text/vcard"), "csv");
+	assert.equal(resolveContactImportFormat("", "a.vcf", "text/csv"), "vcf");
+	assert.equal(resolveContactImportFormat("", "a.vcard", "text/csv"), "vcf");
+	// Then the content type, then the vCard-compatible default.
+	assert.equal(resolveContactImportFormat("", "list", "text/csv"), "csv");
+	assert.equal(resolveContactImportFormat("", "list", "application/vnd.ms-excel"), "csv");
+	assert.equal(resolveContactImportFormat("", "list", "application/octet-stream"), "vcf");
+	assert.equal(resolveContactImportFormat("", "", ""), "vcf");
+});
+
 // ------------------------------------------------------------------ route ---
 
 test("a .csv upload imports new rows, updates existing, and reports bad rows", async (t) => {
@@ -215,6 +255,34 @@ test("a CSV body selected as vcf is rejected, including a card hidden in a quote
 	assert.equal((await POST(post("mb-admin", csv("Maya,maya@example.test"), "contacts.vcf"))).status, 400);
 	assert.equal((await POST(post("mb-admin", csv("Maya,maya@example.test"), "list.txt", { format: "vcf" }))).status, 400);
 	assert.deepEqual(contactsOf(sqlite, "admin"), [{ email: "existing@example.com", display_name: "Old Name", source: "manual" }]);
+});
+
+test("a vCard with comment wrappers and a folded marker-like line still imports", async (t) => {
+	const sqlite = await setup(t, "admin");
+	const vcf = [
+		"#Exported from Example Contacts v2",
+		"BEGIN:VCARD",
+		"FN:Maya",
+		"NOTE:the text on the next folded line is a note,",
+		" BEGIN:VCARD",
+		"EMAIL:maya@example.test",
+		"END:VCARD",
+		"# generated 2026-11-23",
+		"",
+	].join("\r\n");
+	const response = await POST(post("mb-admin", vcf, "contacts.vcf"));
+	assert.equal(response.status, 200);
+	assert.deepEqual(await response.json(), { imported: 1, updated: 0, skipped: 0, failed: 0 });
+	assert.equal(contactsOf(sqlite, "admin").length, 2);
+});
+
+test("a quoted CSV cell holding card markers is not a format mismatch", async (t) => {
+	const sqlite = await setup(t, "admin");
+	const content = 'name,email,notes\r\nBob,bob@example.test,"about them:\nBEGIN:VCARD\nFN:Bob\nEMAIL:x@y.test\nEND:VCARD"\r\n';
+	const response = await POST(post("mb-admin", content, "contacts.csv"));
+	assert.equal(response.status, 200);
+	assert.deepEqual(await response.json(), { imported: 1, updated: 0, skipped: 0, failed: 0 });
+	assert.equal(contactsOf(sqlite, "admin").find((row) => row.email === "bob@example.test").display_name, "Bob");
 });
 
 test("an unknown format or conflict policy is a 400", async (t) => {
@@ -331,6 +399,46 @@ test("a preview over many rows classifies all of them with batched lookups", asy
 	assert.equal(body.counts.new, 150);
 	assert.equal(body.rows.length, 151);
 	assert.equal(contactsOf(sqlite, "admin").length, 1);
+});
+
+test("a delegated preview's query count stays under budget and ignores private matches", async (t) => {
+	// The owner book holds 120 upload addresses that never appear on mb-team's
+	// mail, plus 30 that do — the upload is 300 rows over all three groups.
+	const seenRows = Array.from({ length: 30 }, (_, i) => `('c-s${i}','admin','seen${i}@example.test','S','manual',0,1)`);
+	const hiddenRows = Array.from({ length: 120 }, (_, i) => `('c-h${i}','admin','hidden${i}@example.test','H','manual',0,1)`);
+	const messageRows = Array.from({ length: 30 }, (_, i) => `('m-s${i}','admin','mb-team','outbound','team@example.com','seen${i}@example.test','x','sent',1)`);
+	const extra = `
+		INSERT INTO contacts (id, user_id, email, display_name, source, blocked, created_at) VALUES ${[...seenRows, ...hiddenRows].join(",")};
+		INSERT INTO messages (id, user_id, mailbox_id, direction, from_addr, to_addr, subject, status, created_at) VALUES ${messageRows.join(",")};
+	`;
+	const upload = csv(
+		"name,email",
+		...Array.from({ length: 30 }, (_, i) => `S,seen${i}@example.test`),
+		...Array.from({ length: 120 }, (_, i) => `H,hidden${i}@example.test`),
+		...Array.from({ length: 150 }, (_, i) => `A,absent${i}@example.test`),
+	);
+
+	const sqlite = await setup(t, "delegate", extra);
+	const queries = countQueries(globalThis.csvImpEnv.DB);
+	const body = await (await POST(post("mb-team", upload, "c.csv", { preview: "1" }))).json();
+	const delegatedQueries = queries();
+	// D1 Free allows 50 queries per invocation; a per-row visibility probe was 106.
+	assert.ok(delegatedQueries < 50, `delegated preview ran ${delegatedQueries} queries`);
+	assert.equal(body.counts.existing, 30);
+	assert.equal(body.counts.new, 120 + 150);
+	assert.equal(contactsOf(sqlite, "admin").length, 151);
+
+	// Same upload and mailbox with the private half of the book removed: the
+	// query count must be identical — private membership cannot move the cost.
+	await setup(t, "delegate", `
+		INSERT INTO contacts (id, user_id, email, display_name, source, blocked, created_at) VALUES ${seenRows.join(",")};
+		INSERT INTO messages (id, user_id, mailbox_id, direction, from_addr, to_addr, subject, status, created_at) VALUES ${messageRows.join(",")};
+	`);
+	const queries2 = countQueries(globalThis.csvImpEnv.DB);
+	const body2 = await (await POST(post("mb-team", upload, "c.csv", { preview: "1" }))).json();
+	assert.equal(queries2(), delegatedQueries);
+	assert.equal(body2.counts.existing, 30);
+	assert.equal(body2.counts.new, 120 + 150);
 });
 
 test("a delegate imports CSV into the shared mailbox owner's address book", async (t) => {

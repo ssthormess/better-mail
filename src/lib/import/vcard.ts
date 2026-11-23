@@ -37,9 +37,12 @@ const CARD_BEGIN = /^begin:vcard$/i;
 const CARD_END = /^end:vcard$/i;
 
 /**
- * Whether the whole document is vCard cards: at least one BEGIN:VCARD block and
- * nothing but blank lines outside card blocks. The parser deliberately scans
- * for markers inside surrounding text, but an upload checked against this is
+ * Whether the whole document is vCard cards: at least one BEGIN:VCARD block,
+ * and outside card blocks nothing but blank lines and the `#` comment wrappers
+ * real exports carry. Inside a card a line opening with space or tab is a
+ * folded continuation — its text is part of the previous property, never a
+ * marker, even when it spells BEGIN:VCARD. The parser deliberately scans for
+ * markers inside surrounding text, but an upload checked against this is
  * fail-closed — loose prose carrying card markers (a CSV cell holding a card)
  * is not a vCard document.
  */
@@ -49,6 +52,7 @@ export function isVCardDocument(text: string): boolean {
 	for (const line of text.replace(/^\uFEFF/, "").split(/\r\n?|\n/)) {
 		const trimmed = line.trim();
 		if (trimmed === "") continue;
+		if (inCard && (line[0] === " " || line[0] === "\t")) continue;
 		if (CARD_BEGIN.test(trimmed)) {
 			if (inCard) return false;
 			inCard = true;
@@ -60,7 +64,7 @@ export function isVCardDocument(text: string): boolean {
 			inCard = false;
 			continue;
 		}
-		if (!inCard) return false;
+		if (!inCard && trimmed[0] !== "#") return false;
 	}
 	return cards > 0;
 }

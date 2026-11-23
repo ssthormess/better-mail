@@ -242,10 +242,34 @@ export function parseCsvContacts(text: string, maxRows = CSV_IMPORT_MAX_ROWS): C
 }
 
 /**
- * Whether the text carries a bare vCard marker line — a .vcf saved under a .csv
- * name, or a card embedded so its BEGIN/END land on their own lines. Either way
- * the file is not trusted as CSV, whatever its declared or sniffed format.
+ * Whether the text carries a standalone vCard marker line outside any quoted
+ * field — a .vcf saved under a .csv name, or a card dropped in unquoted. A
+ * marker inside a quoted cell is ordinary cell content (a notes field quoting
+ * an example card) and does not disqualify the file, so the scan tracks the
+ * same quote state the parser does: `"` opens a field only at a field's start
+ * and `""` is an escaped quote.
  */
 export function hasVCardMarkers(text: string): boolean {
-	return /^\s*(?:begin|end):vcard\s*$/im.test(text);
+	let quoted = false;
+	for (const line of text.split(/\r\n?|\n/)) {
+		if (!quoted && /^\s*(?:begin|end):vcard\s*$/i.test(line)) return true;
+		let fieldStart = true;
+		for (let i = 0; i < line.length; i++) {
+			const char = line[i];
+			if (quoted) {
+				if (char === '"') {
+					if (line[i + 1] === '"') i++;
+					else quoted = false;
+				}
+				continue;
+			}
+			if (char === '"' && fieldStart) {
+				quoted = true;
+				fieldStart = false;
+				continue;
+			}
+			fieldStart = char === ",";
+		}
+	}
+	return false;
 }
