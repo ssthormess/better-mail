@@ -30,7 +30,8 @@ export function parseRecipientAddress(address: string): ParsedRecipientAddress |
 	// The subaddress splits at the first "+". An empty tag (`user+@…`) does not
 	// split for routing: `hasSubaddress` is false and `fullLocalPart` keeps the
 	// literal `user+`, which claimants that honor literal-only empty tags (the
-	// mailing-list lookups) detect by `fullLocalPart.endsWith("+")`.
+	// mailing-list lookups) detect as `!hasSubaddress && endsWith("+")` — a tag
+	// of "+" alone, like `user++`, is non-empty and subaddresses normally.
 	const separator = fullLocalPart.indexOf("+");
 
 	return {

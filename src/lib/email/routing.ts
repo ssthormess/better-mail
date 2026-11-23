@@ -154,9 +154,10 @@ export async function resolveInboundAddress(
 	// below, and a disabled list — like a disabled mailbox — simply does not
 	// match. For a `user+tag` address this is the `user` base fallback behind
 	// the literal lookup above: `user+x` resolves to it only when no `user+x`
-	// list exists. An empty-tag `user+` skips this pass — lists keep it
-	// literal-only like the plus-addressing pass does.
-	if (!mailbox && !parsed.fullLocalPart.endsWith("+")) {
+	// list exists. Only a lone empty tag skips this pass — `user+` is
+	// literal-only for lists, but `user++` and `user+x+` carry real tags and
+	// fall back to `user` like any other subaddress.
+	if (!mailbox && (parsed.hasSubaddress || !parsed.fullLocalPart.endsWith("+"))) {
 		const list = await findEnabledMailingList(db, domain.id, parsed.localPart);
 		if (list) return { action: "list", list: toResolvedList(list, domain) };
 	}

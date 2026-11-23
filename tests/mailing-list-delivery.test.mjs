@@ -242,6 +242,39 @@ test("a literal empty-tag list claims its own address", async (t) => {
 	);
 });
 
+test("a tag that is itself a plus claims the literal list first", async (t) => {
+	t.mock.method(console, "info", () => {});
+	const { env, database, queued } = await setup(t);
+	insertList(database, { id: "team", localPart: "team", members: ["bob@one.test"] });
+	insertList(database, { id: "team-plusplus", localPart: "team++", members: ["ann@one.test"] });
+
+	// team++ has the non-empty tag '+': the literal team++ list wins over the
+	// team base, like any other tagged list.
+	await intake(env, "team++@one.test");
+	await processInboundMessage(env, queued[0]);
+	assert.deepEqual(mailByMailbox(database).map((row) => row.mailboxId), ["annbox"]);
+});
+
+test("tags ending in a plus still fall back to the base list", async (t) => {
+	t.mock.method(console, "info", () => {});
+	const { env, database, queued } = await setup(t);
+	insertList(database, { members: ["bob@one.test", "ann@one.test"] });
+
+	// team++ (tag '+') and team+x+ (tag 'x+') are real subaddresses: with no
+	// literal lists for them, the team base list claims both.
+	for (const to of ["team++@one.test", "team+x+@one.test"]) {
+		const decision = await resolveInboundAddress(getDb(env), to);
+		assert.equal(decision?.action, "list");
+		assert.equal(decision?.list?.listId, "team");
+	}
+	await intake(env, "team++@one.test");
+	await processInboundMessage(env, queued[0]);
+	assert.deepEqual(
+		new Set(mailByMailbox(database).map((row) => row.mailboxId)),
+		new Set(["bobbox", "annbox"]),
+	);
+});
+
 test("a member copy keeps the member's own envelope address, tag and all", async (t) => {
 	t.mock.method(console, "info", () => {});
 	const { env, database, queued } = await setup(t);

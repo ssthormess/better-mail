@@ -108,7 +108,9 @@ async function collectMemberDeliveries(
  * claims; `team+x` falls back to the `team` list only when no `team+x` list
  * exists. An empty-tag `team+@domain` is literal-only for lists — only a
  * stored `team+` claims it, never the `team` base — matching how the
- * plus-addressing pass treats empty tags. On this base the mailbox claims
+ * plus-addressing pass treats empty tags; a tag that itself ends in `+`
+ * (`team++`, `team+x+`) is non-empty and falls back to `team` normally. On
+ * this base the mailbox claims
  * still strip `+` to base, so `team+` mail lands in the `team` mailbox when
  * no `team+` claimant exists; the divergence disappears once #416 merges.
  *
