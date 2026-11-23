@@ -536,6 +536,30 @@ test("a saturated unverified sample reports unknown, not new", async (t) => {
 	assert.equal(contactsOf(sqlite, "admin").length, 2);
 });
 
+test("a saturated sample is unknown identically whether the contact is privately stored or not", async (t) => {
+	// Same mailbox evidence, two books. The stored row is private to the owner;
+	// if "unknown" only fired for stored candidates a delegate could probe book
+	// membership through an unresolved lookup. Both runs must be identical.
+	const messages = `
+		INSERT INTO messages (id, user_id, mailbox_id, direction, from_addr, to_addr, subject, status, created_at)
+		WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 16)
+		SELECT 'sat-' || n, 'admin', 'mb-team', 'inbound', 'x@y.z', '"a@b.c club" <z' || n || '@y.z', 'x', 'received', 1 FROM seq;
+		INSERT INTO messages (id, user_id, mailbox_id, direction, from_addr, to_addr, subject, status, created_at) VALUES
+			('zz-real','admin','mb-team','outbound','team@example.com','a@b.c','x','sent',1);
+	`;
+	await setup(t, "delegate", `
+		INSERT INTO contacts (id, user_id, email, display_name, source, blocked, created_at) VALUES
+			('c-sat','admin','a@b.c','AB','manual',0,1);
+		${messages}
+	`);
+	const storedBody = await (await POST(post("mb-team", csv("name,email", "AB,a@b.c"), "c.csv", { preview: "1" }))).json();
+	await setup(t, "delegate", messages);
+	const absentBody = await (await POST(post("mb-team", csv("name,email", "AB,a@b.c"), "c.csv", { preview: "1" }))).json();
+	assert.deepEqual(storedBody, absentBody);
+	assert.equal(absentBody.counts.unknown, 1);
+	assert.equal(absentBody.rows[0].status, "unknown");
+});
+
 test("folded whitespace around a real address also saturates to unknown", async (t) => {
 	// Same bound fill, but the real match is folded with a TAB after the list
 	// comma — a separator the JS parser accepts but the SQL token ranker does not

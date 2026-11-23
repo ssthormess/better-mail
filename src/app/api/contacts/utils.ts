@@ -204,8 +204,9 @@ export async function addressesSeenInMailbox(db: Db, mailboxId: string, emails: 
  * preview may call "existing". One stage: visibility and book membership are
  * computed by the same chunked scan, so a full 2000-candidate upload costs ~21
  * statements end to end, well under D1's per-invocation limit even with auth
- * and access reads counted. `unverified` holds stored contacts whose sample
- * saturated without a verified match — the preview must show them as unknown,
+ * and access reads counted. `unverified` holds every candidate whose sample
+ * saturated without a verified match — stored or not, so the status reveals
+ * nothing about book membership — the preview must show them as unknown,
  * not as provably new.
  */
 export async function existingContactsSeenInMailbox(db: Db, mailboxId: string, ownerUserId: string, emails: string[], viewerUserId: string): Promise<{ existing: Set<string>; unverified: Set<string> }> {
@@ -217,12 +218,10 @@ export async function existingContactsSeenInMailbox(db: Db, mailboxId: string, o
 		candidateSeen(await mailboxCandidateRows(db, mailboxId, viewerUserId, ownerUserId, unique.slice(offset, offset + VISIBILITY_CHUNK)), seen, stored, saturated);
 	}
 	const existing = new Set<string>();
-	const unverified = new Set<string>();
 	for (const email of stored) {
 		if (seen.has(email)) existing.add(email);
-		else if (saturated.has(email)) unverified.add(email);
 	}
-	return { existing, unverified };
+	return { existing, unverified: saturated };
 }
 
 export function toContactDetails(contact: Awaited<ReturnType<typeof getContactByEmail>>) {

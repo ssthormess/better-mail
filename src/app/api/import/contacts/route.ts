@@ -133,8 +133,10 @@ export async function POST(request: Request) {
 		// scan computes both, its statement count tracks candidates only, and an
 		// existing contact a delegate cannot see reads as new. When that scan
 		// fills a candidate's row bound without verifying it, the candidate is
-		// "unknown" — the lookup cannot honestly call it absent. Owners classify
-		// against their whole book directly.
+		// "unknown" — the lookup cannot honestly call it absent, and the status
+		// fires on the mailbox evidence alone so it never betrays whether the
+		// address sits in the owner's private book. Owners classify against
+		// their whole book directly.
 		let existing: Set<string>;
 		let unverified = new Set<string>();
 		if (access.isOwner) {
