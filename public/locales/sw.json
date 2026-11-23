@@ -417,6 +417,7 @@
 	"contacts.importDescription": "Kagua kile {file} kitakachoongeza kwenye kitabu chako cha anwani kabla ya chochote kuhifadhiwa.",
 	"contacts.importCounts": "{new} mpya, {existing} tayari kwenye anwani zako, {invalid} batili, {duplicates} zinazojirudia katika faili",
 	"contacts.importOverLimit": "Safu {skipped} zaidi ya kikomo cha kuingiza zitaachwa",
+	"contacts.importUnverified": "Safu {unknown} hazikuweza kuthibitishwa kwenye barua za kisanduku hiki",
 	"contacts.importPolicyLabel": "Anwani zilizopo tayari",
 	"contacts.importPolicyUpdate": "Sasisha majina yao kutoka kwa faili",
 	"contacts.importPolicySkip": "Ziache kama zilivyo",

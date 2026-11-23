@@ -417,6 +417,7 @@
 	"contacts.importDescription": "پیش از ذخیره هر چیزی ببینید {file} چه چیزی به دفترچه نشانی شما اضافه می‌کند.",
 	"contacts.importCounts": "{new} جدید، {existing} از قبل در مخاطبین شما، {invalid} نامعتبر، {duplicates} تکراری در فایل",
 	"contacts.importOverLimit": "{skipped} ردیف بیش از حد وارد کردن است و کنار گذاشته می‌شود",
+	"contacts.importUnverified": "{unknown} ردیف در نامه‌های این صندوق قابل تأیید نشد",
 	"contacts.importPolicyLabel": "مخاطبینی که از قبل وجود دارند",
 	"contacts.importPolicyUpdate": "نامشان از فایل به‌روزرسانی شود",
 	"contacts.importPolicySkip": "همان‌طور که هستند بمانند",

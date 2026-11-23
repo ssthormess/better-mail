@@ -39,7 +39,7 @@ export type ContactImportPreviewRow = {
 	row: number;
 	email: string | null;
 	name: string | null;
-	status: "new" | "existing" | "invalid" | "dup";
+	status: "new" | "existing" | "invalid" | "dup" | "unknown";
 };
 
 export type ContactImportPreview = {
@@ -49,6 +49,8 @@ export type ContactImportPreview = {
 		existing: number;
 		invalid: number;
 		duplicates: number;
+		/** Stored contacts the delegated visibility scan could not verify — shown honestly instead of claimed new. */
+		unknown: number;
 		/** Rows the parser dropped before classification (over-cap, unreadable cards). */
 		skipped: number;
 	};

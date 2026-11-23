@@ -417,6 +417,7 @@
 	"contacts.importDescription": "எதையும் சேமிப்பதற்கு முன் {file} உங்கள் முகவரி புத்தகத்தில் எதைச் சேர்க்கும் என்பதைப் பாருங்கள்.",
 	"contacts.importCounts": "{new} புதியவை, {existing} ஏற்கனவே உங்கள் தொடர்புகளில், {invalid} தவறானவை, {duplicates} கோப்பில் மீண்டும் வந்தவை",
 	"contacts.importOverLimit": "இறக்குமதி வரம்பை மீறிய {skipped} வரிசைகள் விடப்படும்",
+	"contacts.importUnverified": "{unknown} வரிசைகளை இந்த அஞ்சல் பெட்டியின் மடல்களில் சரிபார்க்க முடியவில்லை",
 	"contacts.importPolicyLabel": "ஏற்கனவே உள்ள தொடர்புகள்",
 	"contacts.importPolicyUpdate": "கோப்பிலிருந்து அவற்றின் பெயர்களைப் புதுப்பி",
 	"contacts.importPolicySkip": "அவற்றை உள்ளபடியே விடு",

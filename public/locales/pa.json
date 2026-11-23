@@ -417,6 +417,7 @@
 	"contacts.importDescription": "ਕੁਝ ਵੀ ਸੁਰੱਖਿਅਤ ਕਰਨ ਤੋਂ ਪਹਿਲਾਂ ਦੇਖੋ ਕਿ {file} ਤੁਹਾਡੀ ਐਡਰੈੱਸ ਬੁੱਕ ਵਿੱਚ ਕੀ ਜੋੜੇਗਾ।",
 	"contacts.importCounts": "{new} ਨਵੇਂ, {existing} ਪਹਿਲਾਂ ਹੀ ਤੁਹਾਡੇ ਸੰਪਰਕਾਂ ਵਿੱਚ, {invalid} ਅਵੈਧ, {duplicates} ਫਾਈਲ ਵਿੱਚ ਦੁਹਰਾਏ ਗਏ",
 	"contacts.importOverLimit": "{skipped} ਕਤਾਰਾਂ ਆਯਾਤ ਸੀਮਾ ਤੋਂ ਵੱਧ ਹਨ ਅਤੇ ਛੱਡੀਆਂ ਜਾਣਗੀਆਂ",
+	"contacts.importUnverified": "{unknown} ਕਤਾਰਾਂ ਇਸ ਮੇਲਬਾਕਸ ਦੀ ਮੇਲ ਵਿੱਚ ਤਸਦੀਕ ਨਹੀਂ ਹੋ ਸਕੀਆਂ",
 	"contacts.importPolicyLabel": "ਪਹਿਲਾਂ ਤੋਂ ਮੌਜੂਦ ਸੰਪਰਕ",
 	"contacts.importPolicyUpdate": "ਫਾਈਲ ਤੋਂ ਉਹਨਾਂ ਦੇ ਨਾਂ ਅੱਪਡੇਟ ਕਰੋ",
 	"contacts.importPolicySkip": "ਉਹਨਾਂ ਨੂੰ ਜਿਵੇਂ ਹਨ ਛੱਡੋ",

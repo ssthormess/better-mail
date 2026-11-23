@@ -124,23 +124,39 @@ export async function POST(request: Request) {
 	// IN() statements, not one SELECT per row, so a 2,000-row preview stays
 	// inside D1's per-invocation query budget.
 	if (preview) {
-		const counts = { new: 0, existing: 0, invalid: 0, duplicates: 0, skipped: parsed.previewSkipped };
+		const counts = { new: 0, existing: 0, invalid: 0, duplicates: 0, unknown: 0, skipped: parsed.previewSkipped };
 		const rows: { row: number; email: string | null; name: string | null; status: string }[] = [];
 		const candidates = parsed.rows.flatMap((row) => (row.status === "ok" && row.email ? [row.email] : []));
 		// Same visibility rule as GET /api/contacts and the export: a delegate
 		// only sees addresses on this mailbox's mail, so their "existing" set is
 		// book membership intersected with the mailbox-visible set — one chunked
 		// scan computes both, its statement count tracks candidates only, and an
-		// existing contact a delegate cannot see reads as new. Owners classify
+		// existing contact a delegate cannot see reads as new. When that scan
+		// fills a candidate's row bound without verifying it, the candidate is
+		// "unknown" — the lookup cannot honestly call it absent. Owners classify
 		// against their whole book directly.
-		const existing = access.isOwner
-			? await getExistingContactEmails(db, ownerId, candidates)
-			: await existingContactsSeenInMailbox(db, access.mailbox.id, ownerId, candidates, user.id);
+		let existing: Set<string>;
+		let unverified = new Set<string>();
+		if (access.isOwner) {
+			existing = await getExistingContactEmails(db, ownerId, candidates);
+		} else {
+			const scoped = await existingContactsSeenInMailbox(db, access.mailbox.id, ownerId, candidates, user.id);
+			existing = scoped.existing;
+			unverified = scoped.unverified;
+		}
 		for (const row of parsed.rows) {
-			const status = row.status === "ok" ? (existing.has(row.email ?? "") ? "existing" : "new") : row.status;
+			const status =
+				row.status === "ok"
+					? existing.has(row.email ?? "")
+						? "existing"
+						: unverified.has(row.email ?? "")
+							? "unknown"
+							: "new"
+					: row.status;
 			if (status === "new") counts.new++;
 			else if (status === "existing") counts.existing++;
 			else if (status === "dup") counts.duplicates++;
+			else if (status === "unknown") counts.unknown++;
 			else counts.invalid++;
 			rows.push({ row: row.row, email: row.email, name: row.displayName ?? null, status });
 		}

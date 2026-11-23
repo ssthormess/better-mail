@@ -352,7 +352,7 @@ test("a preview classifies every row and writes nothing", async (t) => {
 	assert.equal(response.status, 200);
 	const body = await response.json();
 	assert.equal(body.preview, true);
-	assert.deepEqual(body.counts, { new: 1, existing: 1, invalid: 1, duplicates: 1, skipped: 0 });
+	assert.deepEqual(body.counts, { new: 1, existing: 1, invalid: 1, duplicates: 1, skipped: 0, unknown: 0 });
 	assert.deepEqual(body.rows, [
 		{ row: 2, email: "maya@example.com", name: "Maya", status: "new" },
 		{ row: 3, email: "existing@example.com", name: "Old", status: "existing" },
@@ -368,7 +368,7 @@ test("a .vcf preview reports new and existing cards without writing", async (t) 
 	const vcf = "BEGIN:VCARD\r\nFN:Maya\r\nEMAIL:maya@example.com\r\nEND:VCARD\r\nBEGIN:VCARD\r\nEMAIL:existing@example.com\r\nEND:VCARD\r\n";
 	const response = await POST(post("mb-admin", vcf, "contacts.vcf", { preview: "1" }));
 	const body = await response.json();
-	assert.deepEqual(body.counts, { new: 1, existing: 1, invalid: 0, duplicates: 0, skipped: 0 });
+	assert.deepEqual(body.counts, { new: 1, existing: 1, invalid: 0, duplicates: 0, skipped: 0, unknown: 0 });
 	assert.deepEqual(body.rows, [
 		{ row: 1, email: "maya@example.com", name: "Maya", status: "new" },
 		{ row: 2, email: "existing@example.com", name: null, status: "existing" },
@@ -513,6 +513,45 @@ test("stored-book membership requires the returned address to match exactly", ()
 	assert.equal(isExactStoredContact("äda@example.test", "ada@example.test"), false);
 	assert.equal(isExactStoredContact("other@example.test", "ada@example.test"), false);
 	assert.equal(isExactStoredContact(null, "ada@example.test"), false);
+});
+
+test("a saturated unverified sample reports unknown, not new", async (t) => {
+	// 16 messages whose quoted display names merely contain the candidate token
+	// rank like real hits and fill the row bound; the real row at rank 17 never
+	// reaches the verifier. The lookup cannot prove absence — the row is unknown.
+	const sqlite = await setup(t, "delegate", `
+		INSERT INTO contacts (id, user_id, email, display_name, source, blocked, created_at) VALUES
+			('c-sat','admin','a@b.c','AB','manual',0,1);
+		INSERT INTO messages (id, user_id, mailbox_id, direction, from_addr, to_addr, subject, status, created_at)
+		WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 16)
+		SELECT 'sat-' || n, 'admin', 'mb-team', 'inbound', 'x@y.z', '"a@b.c club" <z' || n || '@y.z', 'x', 'received', 1 FROM seq;
+		INSERT INTO messages (id, user_id, mailbox_id, direction, from_addr, to_addr, subject, status, created_at) VALUES
+			('zz-real','admin','mb-team','outbound','team@example.com','a@b.c','x','sent',1);
+	`);
+	const body = await (await POST(post("mb-team", csv("name,email", "AB,a@b.c"), "c.csv", { preview: "1" }))).json();
+	assert.equal(body.counts.unknown, 1);
+	assert.equal(body.counts.existing, 0);
+	assert.equal(body.counts.new, 0);
+	assert.equal(body.rows[0].status, "unknown");
+	assert.equal(contactsOf(sqlite, "admin").length, 2);
+});
+
+test("folded whitespace around a real address also saturates to unknown", async (t) => {
+	// Same bound fill, but the real match is folded with a TAB after the list
+	// comma — a separator the JS parser accepts but the SQL token ranker does not
+	// normalize — so it still lands past the sampled rows.
+	const sqlite = await setup(t, "delegate", `
+		INSERT INTO contacts (id, user_id, email, display_name, source, blocked, created_at) VALUES
+			('c-fold','admin','folded@e.test','F','manual',0,1);
+		INSERT INTO messages (id, user_id, mailbox_id, direction, from_addr, to_addr, subject, status, created_at)
+		WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 16)
+		SELECT 'fold-' || n, 'admin', 'mb-team', 'inbound', 'x@y.z', '"folded@e.test list" <z' || n || '@y.z', 'x', 'received', 1 FROM seq;
+		INSERT INTO messages (id, user_id, mailbox_id, direction, from_addr, to_addr, subject, status, created_at) VALUES
+			('zz-fold','admin','mb-team','inbound','team@example.com','x@y.z,' || char(9) || 'folded@e.test','x','received',1);
+	`);
+	const body = await (await POST(post("mb-team", csv("name,email", "F,folded@e.test"), "c.csv", { preview: "1" }))).json();
+	assert.equal(body.counts.unknown, 1);
+	assert.equal(body.rows[0].status, "unknown");
 });
 
 test("a delegated preview of a maximum 2000-row upload stays well under the statement budget", async (t) => {

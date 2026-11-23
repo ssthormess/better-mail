@@ -417,6 +417,7 @@
 	"contacts.importDescription": "काहीही जतन करण्यापूर्वी {file} तुमच्या अॅड्रेस बुकमध्ये काय जोडेल ते पहा.",
 	"contacts.importCounts": "{new} नवीन, {existing} आधीच तुमच्या संपर्कांत, {invalid} अवैध, {duplicates} फाइलमध्ये दुहेरी",
 	"contacts.importOverLimit": "{skipped} ओळी आयात मर्यादेपेक्षा जास्त आहेत आणि वगळल्या जातील",
+	"contacts.importUnverified": "{unknown} ओळी या मेलबॉक्सच्या मेलमध्ये पडताळता आल्या नाहीत",
 	"contacts.importPolicyLabel": "आधीपासून अस्तित्वात असलेले संपर्क",
 	"contacts.importPolicyUpdate": "फाइलमधून त्यांची नावे अपडेट करा",
 	"contacts.importPolicySkip": "त्यांना जसे आहे तसे ठेवा",

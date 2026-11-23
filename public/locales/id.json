@@ -412,6 +412,7 @@
 	"contacts.importDescription": "Tinjau apa yang akan ditambahkan {file} ke buku alamat Anda sebelum ada yang disimpan.",
 	"contacts.importCounts": "{new} baru, {existing} sudah ada di kontak Anda, {invalid} tidak valid, {duplicates} ganda dalam file",
 	"contacts.importOverLimit": "{skipped} baris melebihi batas impor dan akan dilewati",
+	"contacts.importUnverified": "{unknown} baris tidak dapat diverifikasi di surat kotak ini",
 	"contacts.importPolicyLabel": "Kontak yang sudah ada",
 	"contacts.importPolicyUpdate": "Perbarui namanya dari file",
 	"contacts.importPolicySkip": "Biarkan apa adanya",

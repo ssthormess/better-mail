@@ -417,6 +417,7 @@
 	"contacts.importDescription": "کچھ بھی محفوظ ہونے سے پہلے دیکھیں کہ {file} آپ کی ایڈریس بک میں کیا شامل کرے گا۔",
 	"contacts.importCounts": "{new} نئے، {existing} پہلے سے آپ کے رابطوں میں، {invalid} غلط، {duplicates} فائل میں دہرائے گئے",
 	"contacts.importOverLimit": "{skipped} قطاریں درآمد کی حد سے زیادہ ہیں اور چھوڑ دی جائیں گی",
+	"contacts.importUnverified": "{unknown} قطاروں کی تصدیق اس میل باکس کے خطوط سے نہیں ہو سکی",
 	"contacts.importPolicyLabel": "پہلے سے موجود رابطے",
 	"contacts.importPolicyUpdate": "ان کے نام فائل سے اپڈیٹ کریں",
 	"contacts.importPolicySkip": "انہیں جیسے ہیں چھوڑ دیں",

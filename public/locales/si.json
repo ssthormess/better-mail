@@ -417,6 +417,7 @@
 	"contacts.importDescription": "කිසිවක් සුරැකීමට පෙර {file} ඔබේ ලිපින පොතට එක් කරන්නේ කුමක්දැයි බලන්න.",
 	"contacts.importCounts": "අලුත් {new}, දැනටමත් ඔබේ සම්බන්ධතා අතර {existing}, වලංගු නොවන {invalid}, ගොනුවේ නැවත නැවත එන {duplicates}",
 	"contacts.importOverLimit": "ආයාත සීමාව ඉක්මවන පේළි {skipped} ඉවත ලැබේ",
+	"contacts.importUnverified": "පේළි {unknown} මෙම තැපැල් පෙට්ටියේ ලිපි වලින් තහවුරු කළ නොහැක",
 	"contacts.importPolicyLabel": "දැනටමත් පවතින සම්බන්ධතා",
 	"contacts.importPolicyUpdate": "ගොනුවෙන් ඒවායේ නම් යාවත්කාලීන කරන්න",
 	"contacts.importPolicySkip": "ඒවා ඇති ආකාරයෙන්ම තබන්න",

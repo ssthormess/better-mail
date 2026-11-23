@@ -408,6 +408,7 @@
 	"contacts.importDescription": "Bir şey kaydedilmeden önce {file} dosyasının adres defterinize neler ekleyeceğini gözden geçirin.",
 	"contacts.importCounts": "{new} yeni, {existing} zaten kişilerinizde, {invalid} geçersiz, {duplicates} dosyada tekrarlanan",
 	"contacts.importOverLimit": "İçe aktarma sınırını aşan {skipped} satır dışarıda bırakılacak",
+	"contacts.importUnverified": "{unknown} satır bu posta kutusunun iletilerinde doğrulanamadı",
 	"contacts.importPolicyLabel": "Zaten var olan kişiler",
 	"contacts.importPolicyUpdate": "İsimlerini dosyadan güncelle",
 	"contacts.importPolicySkip": "Olduğu gibi bırak",

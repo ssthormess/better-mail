@@ -422,6 +422,7 @@
 	"contacts.importDescription": "Vérifiez ce que {file} ajoutera à votre carnet d'adresses avant toute sauvegarde.",
 	"contacts.importCounts": "{new} nouveaux, {existing} déjà dans vos contacts, {invalid} invalides, {duplicates} en double dans le fichier",
 	"contacts.importOverLimit": "{skipped} lignes dépassent la limite d'importation et seront ignorées",
+	"contacts.importUnverified": "{unknown} lignes n'ont pas pu être vérifiées dans les mails de cette boîte",
 	"contacts.importPolicyLabel": "Contacts déjà existants",
 	"contacts.importPolicyUpdate": "Mettre à jour leurs noms depuis le fichier",
 	"contacts.importPolicySkip": "Les laisser tels quels",

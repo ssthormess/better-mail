@@ -421,6 +421,7 @@
 	"contacts.importDescription": "Review what {file} adds to your address book before anything is saved.",
 	"contacts.importCounts": "{new} new, {existing} already in your contacts, {invalid} invalid, {duplicates} repeated in the file",
 	"contacts.importOverLimit": "{skipped} rows are over the import limit and will be left out",
+	"contacts.importUnverified": "{unknown} rows could not be verified against this mailbox's mail",
 	"contacts.importPolicyLabel": "Contacts that already exist",
 	"contacts.importPolicyUpdate": "Update their names from the file",
 	"contacts.importPolicySkip": "Leave them as they are",

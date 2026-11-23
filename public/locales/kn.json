@@ -417,6 +417,7 @@
 	"contacts.importDescription": "ಏನನ್ನೂ ಉಳಿಸುವ ಮೊದಲು {file} ನಿಮ್ಮ ವಿಳಾಸ ಪುಸ್ತಕಕ್ಕೆ ಏನು ಸೇರಿಸುತ್ತದೆಂದು ಪರಿಶೀಲಿಸಿ.",
 	"contacts.importCounts": "{new} ಹೊಸ, {existing} ಈಗಾಗಲೇ ನಿಮ್ಮ ಸಂಪರ್ಕಗಳಲ್ಲಿ, {invalid} ಅಮಾನ್ಯ, {duplicates} ಫೈಲ್‌ನಲ್ಲಿ ನಕಲಿ",
 	"contacts.importOverLimit": "{skipped} ಸಾಲುಗಳು ಆಮದು ಮಿತಿಯನ್ನು ಮೀರಿವೆ ಮತ್ತು ಬಿಟ್ಟುಹೋಗುತ್ತವೆ",
+	"contacts.importUnverified": "ಈ ಮೇಲ್‌ಬಾಕ್ಸ್‌ನ ಮೇಲ್‌ಗಳಲ್ಲಿ {unknown} ಸಾಲುಗಳನ್ನು ಪರಿಶೀಲಿಸಲಾಗಲಿಲ್ಲ",
 	"contacts.importPolicyLabel": "ಈಗಾಗಲೇ ಇರುವ ಸಂಪರ್ಕಗಳು",
 	"contacts.importPolicyUpdate": "ಫೈಲ್‌ನಿಂದ ಅವರ ಹೆಸರುಗಳನ್ನು ನವೀಕರಿಸಿ",
 	"contacts.importPolicySkip": "ಅವುಗಳನ್ನು ಹಾಗೆಯೇ ಬಿಡಿ",

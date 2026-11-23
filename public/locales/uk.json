@@ -427,6 +427,7 @@
 	"contacts.importDescription": "Перевірте, що {file} додасть до вашої адресної книги, перш ніж щось буде збережено.",
 	"contacts.importCounts": "Нових: {new}, уже в контактах: {existing}, недійсних: {invalid}, повторів у файлі: {duplicates}",
 	"contacts.importOverLimit": "{skipped} рядків понад ліміт імпорту буде пропущено",
+	"contacts.importUnverified": "{unknown} рядків не вдалося перевірити за листами цієї скриньки",
 	"contacts.importPolicyLabel": "Контакти, які вже існують",
 	"contacts.importPolicyUpdate": "Оновити їхні імена з файлу",
 	"contacts.importPolicySkip": "Залишити як є",

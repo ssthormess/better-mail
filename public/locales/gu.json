@@ -417,6 +417,7 @@
 	"contacts.importDescription": "કંઈપણ સાચવતા પહેલાં જુઓ કે {file} તમારી એડ્રેસ બુકમાં શું ઉમેરશે.",
 	"contacts.importCounts": "{new} નવા, {existing} પહેલેથી તમારા સંપર્કોમાં છે, {invalid} અમાન્ય, {duplicates} ફાઇલમાં પુનરાવર્તિત",
 	"contacts.importOverLimit": "{skipped} પંકતિઓ આયાત મર્યાદા ઉપર છે અને છોડવામાં આવશે",
+	"contacts.importUnverified": "{unknown} પંકતિઓ આ મેઇલબોક્સના મેઇલમાં ચકાસી શકાઈ નહીં",
 	"contacts.importPolicyLabel": "પહેલેથી અસ્તિત્વમાં રહેલા સંપર્કો",
 	"contacts.importPolicyUpdate": "ફાઇલમાંથી તેમના નામ અપડેટ કરો",
 	"contacts.importPolicySkip": "તેમને જેમ છે તેમ રાખો",

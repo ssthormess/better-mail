@@ -412,6 +412,7 @@
 	"contacts.importDescription": "保存する前に、{file} がアドレス帳に追加する内容を確認します。",
 	"contacts.importCounts": "新規 {new} 件、既存 {existing} 件、無効 {invalid} 件、ファイル内重複 {duplicates} 件",
 	"contacts.importOverLimit": "上限を超えた {skipped} 行は除外されます",
+	"contacts.importUnverified": "{unknown} 行はこのメールボックスのメールで確認できませんでした",
 	"contacts.importPolicyLabel": "すでに存在する連絡先",
 	"contacts.importPolicyUpdate": "ファイルの名前で更新する",
 	"contacts.importPolicySkip": "そのままにする",

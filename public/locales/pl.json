@@ -427,6 +427,7 @@
 	"contacts.importDescription": "Zobacz, co {file} doda do Twojej książki adresowej, zanim cokolwiek zostanie zapisane.",
 	"contacts.importCounts": "{new} nowych, {existing} już w Twoich kontaktach, {invalid} nieprawidłowych, {duplicates} powtórzonych w pliku",
 	"contacts.importOverLimit": "{skipped} wierszy przekracza limit importu i zostanie pominiętych",
+	"contacts.importUnverified": "{unknown} wierszy nie udało się zweryfikować w poczcie tej skrzynki",
 	"contacts.importPolicyLabel": "Kontakty, które już istnieją",
 	"contacts.importPolicyUpdate": "Zaktualizuj ich nazwy z pliku",
 	"contacts.importPolicySkip": "Zostaw je bez zmian",

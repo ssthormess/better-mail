@@ -108,7 +108,7 @@ function CsvImportConfirm({
 		);
 	}
 
-	const writable = preview.counts.new + preview.counts.existing;
+	const writable = preview.counts.new + preview.counts.existing + preview.counts.unknown;
 	return (
 		<>
 			<p className="text-sm text-neutral-700">
@@ -119,10 +119,13 @@ function CsvImportConfirm({
 					duplicates: preview.counts.duplicates,
 				})}
 			</p>
+			{preview.counts.unknown > 0 && (
+				<p className="text-sm text-neutral-500">{t("contacts.importUnverified", { unknown: preview.counts.unknown })}</p>
+			)}
 			{preview.counts.skipped > 0 && (
 				<p className="text-sm text-neutral-500">{t("contacts.importOverLimit", { skipped: preview.counts.skipped })}</p>
 			)}
-			{preview.counts.existing > 0 && (
+			{preview.counts.existing + preview.counts.unknown > 0 && (
 				<div role="radiogroup" aria-label={t("contacts.importPolicyLabel")} className="space-y-2">
 					{(["update", "skip"] as const).map((policy) => (
 						<label key={policy} className="flex cursor-pointer items-center gap-3 rounded-xl bg-neutral-50 p-4">

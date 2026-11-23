@@ -417,6 +417,7 @@
 	"contacts.importDescription": "Controleer wat {file} aan je adresboek toevoegt voordat er iets wordt opgeslagen.",
 	"contacts.importCounts": "{new} nieuw, {existing} al in je contacten, {invalid} ongeldig, {duplicates} dubbel in het bestand",
 	"contacts.importOverLimit": "{skipped} rijen boven de importlimiet worden weggelaten",
+	"contacts.importUnverified": "{unknown} rijen konden niet worden geverifieerd in de mail van dit postvak",
 	"contacts.importPolicyLabel": "Contacten die al bestaan",
 	"contacts.importPolicyUpdate": "Hun namen bijwerken uit het bestand",
 	"contacts.importPolicySkip": "Ze laten zoals ze zijn",

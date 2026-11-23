@@ -412,6 +412,7 @@
 	"contacts.importDescription": "在保存之前，查看 {file} 将向您的通讯录添加哪些内容。",
 	"contacts.importCounts": "{new} 个新联系人，{existing} 个已在联系人中，{invalid} 个无效，{duplicates} 个文件中重复",
 	"contacts.importOverLimit": "超出导入上限的 {skipped} 行将被忽略",
+	"contacts.importUnverified": "有 {unknown} 行无法在此邮箱的邮件中得到确认",
 	"contacts.importPolicyLabel": "已存在的联系人",
 	"contacts.importPolicyUpdate": "用文件中的姓名更新",
 	"contacts.importPolicySkip": "保持原样",

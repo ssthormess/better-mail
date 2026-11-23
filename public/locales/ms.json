@@ -416,6 +416,7 @@
 	"contacts.importDescription": "Semak apa yang {file} akan tambahkan pada buku alamat anda sebelum apa-apa disimpan.",
 	"contacts.importCounts": "{new} baharu, {existing} sudah dalam kenalan anda, {invalid} tidak sah, {duplicates} berulang dalam fail",
 	"contacts.importOverLimit": "{skipped} baris melebihi had import dan akan diketepikan",
+	"contacts.importUnverified": "{unknown} baris tidak dapat disahkan dalam mel peti ini",
 	"contacts.importPolicyLabel": "Kenalan yang sudah wujud",
 	"contacts.importPolicyUpdate": "Kemas kini namanya dari fail",
 	"contacts.importPolicySkip": "Biarkan seperti sediakala",

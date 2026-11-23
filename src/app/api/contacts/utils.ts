@@ -162,11 +162,25 @@ async function mailboxCandidateRows(db: Db, mailboxId: string, viewerUserId: str
 	}));
 }
 
-/** Rows where `email` appears as a real address in that same row's from/to/cc — the exact verdict, not the prefilter's. */
-function candidateSeen(rows: CandidateRow[], seen: Set<string>, contacts?: Set<string>) {
+/**
+ * Exact per-candidate verdicts from one chunk's sampled rows. `seen` gets the
+ * verified addresses; `saturated` (when passed) gets candidates whose sample
+ * hit the per-candidate row bound WITHOUT a verified match — more rows may
+ * exist beyond the bound, so the lookup cannot honestly call them absent. The
+ * local addressListIncludes parse remains the exact verdict; substring hits
+ * and LIKE false positives cannot pass as real visibility.
+ */
+function candidateSeen(rows: CandidateRow[], seen: Set<string>, contacts?: Set<string>, saturated?: Set<string>) {
+	const rowCount = new Map<string, number>();
+	for (const row of rows) rowCount.set(row.email, (rowCount.get(row.email) ?? 0) + 1);
 	for (const row of rows) {
 		if (row.isContact) contacts?.add(row.email);
 		if ([row.fromAddr, row.toAddr, row.ccAddr].some((value) => addressListIncludes(value, row.email))) seen.add(row.email);
+	}
+	if (saturated) {
+		for (const [email, count] of rowCount) {
+			if (count >= VISIBILITY_ROWS_PER_CANDIDATE && !seen.has(email)) saturated.add(email);
+		}
 	}
 }
 
@@ -190,19 +204,25 @@ export async function addressesSeenInMailbox(db: Db, mailboxId: string, emails: 
  * preview may call "existing". One stage: visibility and book membership are
  * computed by the same chunked scan, so a full 2000-candidate upload costs ~21
  * statements end to end, well under D1's per-invocation limit even with auth
- * and access reads counted.
+ * and access reads counted. `unverified` holds stored contacts whose sample
+ * saturated without a verified match — the preview must show them as unknown,
+ * not as provably new.
  */
-export async function existingContactsSeenInMailbox(db: Db, mailboxId: string, ownerUserId: string, emails: string[], viewerUserId: string): Promise<Set<string>> {
+export async function existingContactsSeenInMailbox(db: Db, mailboxId: string, ownerUserId: string, emails: string[], viewerUserId: string): Promise<{ existing: Set<string>; unverified: Set<string> }> {
 	const seen = new Set<string>();
 	const stored = new Set<string>();
+	const saturated = new Set<string>();
 	const unique = [...new Set(emails)];
 	for (let offset = 0; offset < unique.length; offset += VISIBILITY_CHUNK) {
-		candidateSeen(await mailboxCandidateRows(db, mailboxId, viewerUserId, ownerUserId, unique.slice(offset, offset + VISIBILITY_CHUNK)), seen, stored);
+		candidateSeen(await mailboxCandidateRows(db, mailboxId, viewerUserId, ownerUserId, unique.slice(offset, offset + VISIBILITY_CHUNK)), seen, stored, saturated);
 	}
-	stored.forEach((email) => {
-		if (!seen.has(email)) stored.delete(email);
-	});
-	return stored;
+	const existing = new Set<string>();
+	const unverified = new Set<string>();
+	for (const email of stored) {
+		if (seen.has(email)) existing.add(email);
+		else if (saturated.has(email)) unverified.add(email);
+	}
+	return { existing, unverified };
 }
 
 export function toContactDetails(contact: Awaited<ReturnType<typeof getContactByEmail>>) {

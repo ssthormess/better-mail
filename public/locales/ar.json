@@ -437,6 +437,7 @@
 	"contacts.importDescription": "راجع ما سيضيفه {file} إلى دفتر عناوينك قبل حفظ أي شيء.",
 	"contacts.importCounts": "{new} جديدة، {existing} موجودة في جهات اتصالك، {invalid} غير صالحة، {duplicates} مكررة في الملف",
 	"contacts.importOverLimit": "{skipped} صفًا فوق حد الاستيراد وستُترك",
+	"contacts.importUnverified": "{unknown} صفوف تعذّر التحقق منها في بريد هذا الصندوق",
 	"contacts.importPolicyLabel": "جهات اتصال موجودة مسبقًا",
 	"contacts.importPolicyUpdate": "حدّث أسماءها من الملف",
 	"contacts.importPolicySkip": "اتركها كما هي",

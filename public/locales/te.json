@@ -417,6 +417,7 @@
 	"contacts.importDescription": "ఏదైనా సేవ్ చేయడానికి ముందు {file} మీ చిరునామా పుస్తకానికి ఏమి జోడిస్తుందో చూడండి.",
 	"contacts.importCounts": "{new} కొత్తవి, {existing} ఇప్పటికే మీ పరిచయాల్లో, {invalid} చెల్లనివి, {duplicates} ఫైల్‌లో పునరావృతమైనవి",
 	"contacts.importOverLimit": "{skipped} వరుసలు దిగుమతి పరిమితిని దాటి ఉన్నాయి మరియు వదిలివేయబడతాయి",
+	"contacts.importUnverified": "{unknown} వరుసలను ఈ మెయిల్‌బాక్స్ మెయిళ్లలో ధృవీకరించలేకపోయాం",
 	"contacts.importPolicyLabel": "ఇప్పటికే ఉన్న పరిచయాలు",
 	"contacts.importPolicyUpdate": "ఫైల్ నుండి వాటి పేర్లను నవీకించండి",
 	"contacts.importPolicySkip": "వాటిని ఉన్నట్లే వదిలేయండి",

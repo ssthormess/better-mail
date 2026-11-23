@@ -417,6 +417,7 @@
 	"contacts.importDescription": "Prüfen Sie, was {file} Ihrem Adressbuch hinzufügt, bevor etwas gespeichert wird.",
 	"contacts.importCounts": "{new} neu, {existing} bereits in Ihren Kontakten, {invalid} ungültig, {duplicates} doppelt in der Datei",
 	"contacts.importOverLimit": "{skipped} Zeilen über dem Importlimit werden ausgelassen",
+	"contacts.importUnverified": "{unknown} Zeilen konnten anhand der Mails dieses Postfachs nicht verifiziert werden",
 	"contacts.importPolicyLabel": "Bereits vorhandene Kontakte",
 	"contacts.importPolicyUpdate": "Namen aus der Datei aktualisieren",
 	"contacts.importPolicySkip": "Unverändert lassen",

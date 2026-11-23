@@ -417,6 +417,7 @@
 	"contacts.importDescription": "എന്തെങ്കിലും സേവ് ചെയ്യുന്നതിന് മുൻപ് {file} നിങ്ങളുടെ വിലാസ പുസ്തകത്തിലേക്ക് എന്ത് ചേർക്കുമെന്ന് പരിശോധിക്കുക.",
 	"contacts.importCounts": "{new} പുതിയവ, {existing} നിലവിൽ നിങ്ങളുടെ കോൺടാക്റ്റുകളിൽ, {invalid} അസാധുവായവ, {duplicates} ഫയലിൽ ആവർത്തിച്ചവ",
 	"contacts.importOverLimit": "{skipped} വരികൾ ഇമ്പോർട്ട് പരിധിക്ക് മുകളിലാണ്, അവ വിട്ടുകളയും",
+	"contacts.importUnverified": "{unknown} വരികൾ ഈ മെയിൽബോക്സിലെ മെയിലുകളിൽ പരിശോധിക്കാൻ കഴിഞ്ഞില്ല",
 	"contacts.importPolicyLabel": "നിലവിലുള്ള കോൺടാക്റ്റുകൾ",
 	"contacts.importPolicyUpdate": "ഫയലിൽ നിന്ന് അവയുടെ പേരുകൾ അപ്ഡേറ്റ് ചെയ്യുക",
 	"contacts.importPolicySkip": "അവയെ അതുപോലെ നിൽക്കാൻ അനുവദിക്കുക",

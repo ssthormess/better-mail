@@ -422,6 +422,7 @@
 	"contacts.importDescription": "Revisa lo que {file} añadirá a tu libreta de direcciones antes de guardar nada.",
 	"contacts.importCounts": "{new} nuevos, {existing} ya en tus contactos, {invalid} no válidos, {duplicates} repetidos en el archivo",
 	"contacts.importOverLimit": "{skipped} filas superan el límite de importación y se omitirán",
+	"contacts.importUnverified": "{unknown} filas no se pudieron verificar en el correo de este buzón",
 	"contacts.importPolicyLabel": "Contactos que ya existen",
 	"contacts.importPolicyUpdate": "Actualizar sus nombres desde el archivo",
 	"contacts.importPolicySkip": "Dejarlos como están",

@@ -417,6 +417,7 @@
 	"contacts.importDescription": "কিছু সংরক্ষণের আগে দেখে নিন {file} আপনার ঠিকানা বইয়ে কী যোগ করবে।",
 	"contacts.importCounts": "{new}টি নতুন, {existing}টি ইতিমধ্যে আপনার পরিচিতিতে আছে, {invalid}টি অবৈধ, {duplicates}টি ফাইলে পুনরাবৃত",
 	"contacts.importOverLimit": "{skipped}টি সারি আমদানির সীমা পেরিয়ে গেছে এবং বাদ পড়বে",
+	"contacts.importUnverified": "{unknown}টি সারি এই মেইলবক্সের মেইলে যাচাই করা যায়নি",
 	"contacts.importPolicyLabel": "যে পরিচিতিগুলো ইতিমধ্যে আছে",
 	"contacts.importPolicyUpdate": "ফাইল থেকে তাদের নাম আপডেট করুন",
 	"contacts.importPolicySkip": "তাদের যেমন আছে তেমনই রাখুন",

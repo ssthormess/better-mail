@@ -417,6 +417,7 @@
 	"contacts.importDescription": "Duba abin da {file} zai ƙara ga littafin adiresoshinka kafin a adana komai.",
 	"contacts.importCounts": "{new} sabo, {existing} sun riga suna cikin abokan hulɗarka, {invalid} mara inganci, {duplicates} maimaita a fayil",
 	"contacts.importOverLimit": "Layuka {skipped} sun wuce iyakar shigo da kuma za a bar su",
+	"contacts.importUnverified": "Ba a tabbatar da layuka {unknown} a wasiƙun wannan akwatin ba",
 	"contacts.importPolicyLabel": "Abokan hulɗa da suka riga suna akwai",
 	"contacts.importPolicyUpdate": "Sabunta sunayensu daga fayil ɗin",
 	"contacts.importPolicySkip": "Bar su kamar yadda suke",

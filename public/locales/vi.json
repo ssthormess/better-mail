@@ -412,6 +412,7 @@
 	"contacts.importDescription": "Xem trước những gì {file} sẽ thêm vào sổ địa chỉ của bạn trước khi lưu.",
 	"contacts.importCounts": "{new} mới, {existing} đã có trong liên hệ, {invalid} không hợp lệ, {duplicates} trùng trong tệp",
 	"contacts.importOverLimit": "{skipped} hàng vượt giới hạn nhập sẽ bị bỏ qua",
+	"contacts.importUnverified": "{unknown} hàng không xác minh được trong thư của hộp thư này",
 	"contacts.importPolicyLabel": "Liên hệ đã tồn tại",
 	"contacts.importPolicyUpdate": "Cập nhật tên từ tệp",
 	"contacts.importPolicySkip": "Giữ nguyên",

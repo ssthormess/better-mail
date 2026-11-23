@@ -422,6 +422,7 @@
 	"contacts.importDescription": "Controlla cosa aggiungerà {file} alla tua rubrica prima di salvare.",
 	"contacts.importCounts": "{new} nuovi, {existing} già nei tuoi contatti, {invalid} non validi, {duplicates} ripetuti nel file",
 	"contacts.importOverLimit": "{skipped} righe oltre il limite di importazione verranno tralasciate",
+	"contacts.importUnverified": "{unknown} righe non verificabili nelle email di questa casella",
 	"contacts.importPolicyLabel": "Contatti già esistenti",
 	"contacts.importPolicyUpdate": "Aggiorna i loro nomi dal file",
 	"contacts.importPolicySkip": "Lasciali come sono",

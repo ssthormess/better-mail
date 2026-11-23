@@ -416,6 +416,7 @@
 	"contacts.importDescription": "저장하기 전에 {file}이(가) 주소록에 추가할 내용을 확인하세요.",
 	"contacts.importCounts": "새 항목 {new}개, 이미 연락처에 있음 {existing}개, 유효하지 않음 {invalid}개, 파일 내 중복 {duplicates}개",
 	"contacts.importOverLimit": "가져오기 한도를 넘는 {skipped}개 행은 제외됩니다",
+	"contacts.importUnverified": "{unknown}개 행을 이 메일함의 메일에서 확인할 수 없습니다",
 	"contacts.importPolicyLabel": "이미 존재하는 연락처",
 	"contacts.importPolicyUpdate": "파일의 이름으로 업데이트",
 	"contacts.importPolicySkip": "그대로 두기",
