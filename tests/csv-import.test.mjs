@@ -21,8 +21,9 @@ const { app, newDatabase } = await loadApp("csv-import", `
 	export { parseCsvContacts, CSV_IMPORT_MAX_ROWS } from "./src/lib/import/csv.ts";
 	export { decodeTextBytes } from "./src/lib/import/text.ts";
 	export { resolveContactImportFormat } from "./src/lib/import/format.ts";
+	export { isExactStoredContact } from "./src/app/api/contacts/utils.ts";
 `, { mocks });
-const { POST, parseCsvContacts, CSV_IMPORT_MAX_ROWS, decodeTextBytes, resolveContactImportFormat } = app;
+const { POST, parseCsvContacts, CSV_IMPORT_MAX_ROWS, decodeTextBytes, resolveContactImportFormat, isExactStoredContact } = app;
 
 const seed = `${sharedMailboxSeed("full_access")}
 	INSERT INTO contacts (id, user_id, email, display_name, source, blocked, created_at) VALUES
@@ -479,6 +480,39 @@ test("a frequent correspondent cannot crowd out a rare one in the same chunk", a
 	const body = await (await POST(post("mb-team", upload, "c.csv", { preview: "1" }))).json();
 	assert.equal(body.counts.existing, 2);
 	assert.equal(body.counts.new, 0);
+});
+
+test("substring-heavy mail to a longer address cannot crowd out the real one", async (t) => {
+	// 20 messages to xa@b.cc (each contains 'a@b.c' as a substring) plus one real
+	// a@b.c message sorting last: a per-candidate substring bound of 16 drops the
+	// real row unless exact-token hits rank ahead of substring hits.
+	const sqlite = await setup(t, "delegate", `
+		INSERT INTO contacts (id, user_id, email, display_name, source, blocked, created_at) VALUES
+			('c-ab','admin','a@b.c','AB','manual',0,1);
+		INSERT INTO messages (id, user_id, mailbox_id, direction, from_addr, to_addr, subject, status, created_at)
+		WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 20)
+		SELECT 'ab-' || n, 'admin', 'mb-team', 'inbound', 'xa@b.cc', 'team@example.com', 'x', 'received', 1 FROM seq;
+		INSERT INTO messages (id, user_id, mailbox_id, direction, from_addr, to_addr, subject, status, created_at) VALUES
+			('zz-real','admin','mb-team','outbound','team@example.com','a@b.c','x','sent',1);
+	`);
+	const upload = csv("name,email", "AB,a@b.c");
+	const body = await (await POST(post("mb-team", upload, "c.csv", { preview: "1" }))).json();
+	assert.equal(body.counts.existing, 1);
+	assert.equal(body.counts.new, 0);
+	assert.equal(contactsOf(sqlite, "admin").length, 2);
+});
+
+// The MySQL-collation variant of this (accent-insensitive '=' marking a
+// different stored address as the contact) cannot be reproduced on the SQLite
+// test fixture — its TEXT '=' is byte-exact — so the join now returns the stored
+// email itself and the verdict compares codepoints in JS; the fixture below
+// covers the compare directly.
+test("stored-book membership requires the returned address to match exactly", () => {
+	assert.equal(isExactStoredContact("maya@example.test", "maya@example.test"), true);
+	assert.equal(isExactStoredContact("Maya@Example.test", "maya@example.test"), true);
+	assert.equal(isExactStoredContact("äda@example.test", "ada@example.test"), false);
+	assert.equal(isExactStoredContact("other@example.test", "ada@example.test"), false);
+	assert.equal(isExactStoredContact(null, "ada@example.test"), false);
 });
 
 test("a delegated preview of a maximum 2000-row upload stays well under the statement budget", async (t) => {

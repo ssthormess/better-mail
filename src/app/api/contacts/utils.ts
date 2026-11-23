@@ -87,14 +87,29 @@ interface CandidateRow {
 }
 
 /**
+ * Whether the stored contact row the join found IS the candidate's address.
+ * MySQL's default utf8mb4 collation is accent-insensitive, so `contacts.email =
+ * candidate` can match a different stored address — the join returns the stored
+ * value and this compare (codepoints, case-folded like the address parser) is
+ * the verdict.
+ */
+export function isExactStoredContact(storedEmail: string | null, email: string): boolean {
+	return storedEmail !== null && storedEmail.toLowerCase() === email.toLowerCase();
+}
+
+/**
  * Mailbox-corpus scan shared by the visibility checks below. Each statement
  * carries up to VISIBILITY_CHUNK candidates as a UNION-derived table, joins
  * mailbox messages on a case-folded substring hit inside the concatenated
  * from/to/cc corpus, and keeps only the first few matching rows PER CANDIDATE
  * via ROW_NUMBER — a flat LIMIT would let one frequent correspondent crowd
- * another's hits out and misreport a stored contact as new. When `ownerUserId`
- * is given, the same pass also flags candidates that are stored contacts of
- * that user, so preview gets visibility and book membership in one stage.
+ * another's hits out and misreport a stored contact as new. The window ranks
+ * rows where the candidate is a complete address token (the corpus with every
+ * address delimiter normalized to a comma contains `,email,`) above plain
+ * substring hits, so 16 messages to `xa@b.cc` cannot exhaust `a@b.c`'s bound
+ * before its real row. When `ownerUserId` is given, the same pass also returns
+ * the stored contact address per candidate, so preview gets visibility and book
+ * membership in one stage.
  *
  * The SQL prefilter is deliberately loose: lower() folds ASCII case, so a
  * non-ASCII candidate whose case differs from the stored header can
@@ -110,17 +125,29 @@ async function mailboxCandidateRows(db: Db, mailboxId: string, viewerUserId: str
 		schemaDialect() === "postgres"
 			? sql`strpos(lower(${corpus}), lower(v.email)) > 0`
 			: sql`instr(lower(${corpus}), lower(v.email)) > 0`;
+	// Every delimiter a parsed address can border on becomes a comma, so
+	// `,email,` in the normalized corpus means a complete address token — a
+	// superset of what addressListIncludes will accept, cheap enough to rank by.
+	const tokenCorpus = concatText(
+		",",
+		sql`replace(replace(replace(replace(replace(replace(replace(lower(${corpus}), ' ', ','), '<', ','), '>', ','), ';', ','), '"', ','), '(', ','), ')', ',')`,
+		",",
+	);
+	const exactishHit =
+		schemaDialect() === "postgres"
+			? sql`strpos(${tokenCorpus}, ${concatText(",", sql`lower(v.email)`, ",")}) > 0`
+			: sql`instr(${tokenCorpus}, ${concatText(",", sql`lower(v.email)`, ",")}) > 0`;
 	const candidates = sql.join(
 		chunk.map((email) => sql`select ${email} as email`),
 		sql` union all `,
 	);
 	const contactJoin = ownerUserId === null ? sql`` : sql`left join ${contacts} on ${contacts.userId} = ${ownerUserId} and ${contacts.email} = v.email`;
-	const contactFlag = ownerUserId === null ? sql`0` : sql`case when ${contacts.email} is null then 0 else 1 end`;
+	const storedEmail = ownerUserId === null ? sql`null` : sql`${contacts.email}`;
 	const rows = await db.all(sql`
-		select email, is_contact, from_addr, to_addr, cc_addr from (
-			select v.email as email, ${contactFlag} as is_contact,
+		select email, stored_email, from_addr, to_addr, cc_addr from (
+			select v.email as email, ${storedEmail} as stored_email,
 				${messages.fromAddr} as from_addr, ${messages.toAddr} as to_addr, ${messages.ccAddr} as cc_addr,
-				row_number() over (partition by v.email order by ${messages.id}) as rn
+				row_number() over (partition by v.email order by case when ${exactishHit} then 0 else 1 end, ${messages.id}) as rn
 			from (${candidates}) v
 			join ${messages} on ${messages.mailboxId} = ${mailboxId} and ${draftsVisibleTo(viewerUserId)} and ${hit}
 			${contactJoin}
@@ -128,7 +155,7 @@ async function mailboxCandidateRows(db: Db, mailboxId: string, viewerUserId: str
 	`);
 	return (rows as Array<Record<string, unknown>>).map((row) => ({
 		email: row.email as string,
-		isContact: row.is_contact === 1 || row.is_contact === true,
+		isContact: isExactStoredContact(row.stored_email as string | null, row.email as string),
 		fromAddr: row.from_addr as string,
 		toAddr: row.to_addr as string,
 		ccAddr: row.cc_addr as string | null,
