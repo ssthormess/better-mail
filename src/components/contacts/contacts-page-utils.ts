@@ -1,5 +1,9 @@
+import toast from "react-hot-toast";
 import { authFetch } from "@/lib/auth/client";
+import type { Translator } from "@/lib/i18n/utils";
 import type {
+	ContactImportConflict,
+	ContactImportPreview,
 	ContactImportResult,
 	ContactListItem,
 	ContactMutationResponse,
@@ -67,10 +71,16 @@ export async function exportContacts(mailboxId: string, format: "vcf" | "csv"): 
 	URL.revokeObjectURL(url);
 }
 
-export async function importContacts(mailboxId: string, file: File): Promise<ContactImportResult> {
+export async function importContacts(
+	mailboxId: string,
+	file: File,
+	options: { format?: "vcf" | "csv"; conflict?: ContactImportConflict } = {},
+): Promise<ContactImportResult> {
 	const body = new FormData();
 	body.set("mailboxId", mailboxId);
 	body.set("file", file);
+	if (options.format) body.set("format", options.format);
+	if (options.conflict) body.set("conflict", options.conflict);
 	const response = await authFetch("/api/import/contacts", { method: "POST", body });
 	const data = (await response.json()) as Partial<ContactImportResult> & { error?: string };
 	if (!response.ok) throw new Error(data.error ?? "Unable to import contacts");
@@ -80,6 +90,39 @@ export async function importContacts(mailboxId: string, file: File): Promise<Con
 		skipped: data.skipped ?? 0,
 		failed: data.failed ?? 0,
 	};
+}
+
+/** Classifies the upload's rows against the address book without writing — the file is posted again on confirm. */
+export async function previewContactImport(mailboxId: string, file: File): Promise<ContactImportPreview> {
+	const body = new FormData();
+	body.set("mailboxId", mailboxId);
+	body.set("file", file);
+	body.set("format", "csv");
+	body.set("preview", "1");
+	const response = await authFetch("/api/import/contacts", { method: "POST", body });
+	const data = (await response.json()) as ContactImportPreview & { error?: string };
+	if (!response.ok || !data.preview) throw new Error(data.error ?? "Unable to import contacts");
+	return data;
+}
+
+/** Toast the import counts; returns whether anything was written so callers can refresh the list. */
+export function reportImportResult(t: Translator, result: ContactImportResult): boolean {
+	const totals = {
+		imported: result.imported,
+		updated: result.updated,
+		skipped: result.skipped,
+		failed: result.failed,
+	};
+	if (result.imported + result.updated === 0) {
+		// The file parsed but nothing was written: show the counts when there
+		// were rows to try, or that it simply held no contacts at all.
+		toast.error(result.skipped + result.failed > 0 ? t("contacts.importSummarySkipped", totals) : t("contacts.importEmpty"));
+		return false;
+	}
+	toast.success(
+		result.skipped + result.failed > 0 ? t("contacts.importSummarySkipped", totals) : t("contacts.importSummary", totals),
+	);
+	return true;
 }
 
 export async function deleteContact(mailboxId: string, address: string): Promise<void> {

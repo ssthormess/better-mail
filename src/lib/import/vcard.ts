@@ -1,6 +1,9 @@
 import { normalizeEmailAddress } from "@/lib/email/address";
 import { parseAddress } from "@/lib/utils";
 
+// The shared import decoder; kept under its original name for the vCard upload path.
+export { decodeTextBytes as decodeVcfBytes } from "@/lib/import/text";
+
 // A hand-rolled reader, on purpose: the maintained options each miss something this
 // import needs. `vcf`@2.1.x (the popular parser) never decodes ENCODING=QUOTED-PRINTABLE
 // or CHARSET and does not join vCard 2.1 "=" soft-wrap continuations, `vcard4` only
@@ -28,21 +31,6 @@ export interface VCardImportParseResult {
 	 * the import cap.
 	 */
 	skipped: number;
-}
-
-/**
- * Decode an uploaded .vcf to text. vCard files are usually UTF-8, but old desktop
- * tools also wrote UTF-16 — sniff its BOM first. A UTF-8 BOM is consumed by the decoder.
- */
-export function decodeVcfBytes(buffer: ArrayBuffer): string {
-	const bytes = new Uint8Array(buffer);
-	if (bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0xfe) {
-		return new TextDecoder("utf-16le").decode(bytes.subarray(2));
-	}
-	if (bytes.length >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) {
-		return new TextDecoder("utf-16be").decode(bytes.subarray(2));
-	}
-	return new TextDecoder().decode(bytes);
 }
 
 const CARD_BEGIN = /^begin:vcard$/i;

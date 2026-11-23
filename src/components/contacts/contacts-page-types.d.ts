@@ -31,6 +31,38 @@ export type ContactImportResult = {
 	failed: number;
 };
 
+/** What an import does when a row's address is already a contact. */
+export type ContactImportConflict = "update" | "skip";
+
+export type ContactImportPreviewRow = {
+	/** Spreadsheet row number for CSV, card index for vCard. */
+	row: number;
+	email: string | null;
+	name: string | null;
+	status: "new" | "existing" | "invalid" | "dup";
+};
+
+export type ContactImportPreview = {
+	preview: true;
+	counts: {
+		new: number;
+		existing: number;
+		invalid: number;
+		duplicates: number;
+		/** Rows the parser dropped before classification (over-cap, unreadable cards). */
+		skipped: number;
+	};
+	rows: ContactImportPreviewRow[];
+};
+
+export type ContactImportDialogProps = {
+	mailboxId: string;
+	/** The picked .csv file; null closes the dialog. */
+	file: File | null;
+	onOpenChange: (open: boolean) => void;
+	onImported: () => void;
+};
+
 export type ContactEditDialogProps = {
 	mailboxId: string;
 	/** Set for renaming an existing contact; unset creates a new one. */

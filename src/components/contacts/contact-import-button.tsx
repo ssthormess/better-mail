@@ -5,44 +5,30 @@ import toast from "react-hot-toast";
 import { Upload } from "@/components/icons";
 import { useLanguage } from "@/components/language-provider";
 import { Button } from "@/components/ui/button";
-import { importContacts } from "./contacts-page-utils";
+import { ContactImportDialog } from "./contact-import-dialog";
+import { importContacts, reportImportResult } from "./contacts-page-utils";
 
 /**
- * "Import" button plus its hidden file picker: the chosen .vcf is posted to the
- * import route and the reported counts land in a toast. `onImported` runs when at
- * least one contact was written so the list can refresh.
+ * "Import" button plus its hidden file picker. A .vcf posts straight to the
+ * import route and the counts land in a toast; a .csv opens the two-step dialog
+ * (preview and a conflict policy) before anything is written. `onImported` runs
+ * when at least one contact was written so the list can refresh.
  */
 export function ContactImportButton({ mailboxId, onImported }: { mailboxId: string; onImported: () => void }) {
 	const { t } = useLanguage();
 	const inputRef = useRef<HTMLInputElement>(null);
 	const [importing, setImporting] = useState(false);
+	const [csvFile, setCsvFile] = useState<File | null>(null);
 
 	async function onPick(file: File) {
+		if (/\.csv$/i.test(file.name)) {
+			setCsvFile(file);
+			return;
+		}
 		setImporting(true);
 		try {
 			const result = await importContacts(mailboxId, file);
-			const totals = {
-				imported: result.imported,
-				updated: result.updated,
-				skipped: result.skipped,
-				failed: result.failed,
-			};
-			if (result.imported + result.updated === 0) {
-				// The file parsed but nothing was written: show the counts when there
-				// were cards to try, or that it simply held no contacts at all.
-				toast.error(
-					result.skipped + result.failed > 0
-						? t("contacts.importSummarySkipped", totals)
-						: t("contacts.importEmpty"),
-				);
-				return;
-			}
-			toast.success(
-				result.skipped + result.failed > 0
-					? t("contacts.importSummarySkipped", totals)
-					: t("contacts.importSummary", totals),
-			);
-			onImported();
+			if (reportImportResult(t, result)) onImported();
 		} catch (error) {
 			toast.error(error instanceof Error ? error.message : t("contacts.importFailed"));
 		} finally {
@@ -55,7 +41,7 @@ export function ContactImportButton({ mailboxId, onImported }: { mailboxId: stri
 			<input
 				ref={inputRef}
 				type="file"
-				accept=".vcf,text/vcard,text/x-vcard"
+				accept=".vcf,.csv,text/vcard,text/x-vcard,text/csv"
 				className="hidden"
 				onChange={(event) => {
 					const file = event.target.files?.[0];
@@ -68,6 +54,14 @@ export function ContactImportButton({ mailboxId, onImported }: { mailboxId: stri
 				<Upload className="h-4 w-4" />
 				{t("contacts.import")}
 			</Button>
+			<ContactImportDialog
+				mailboxId={mailboxId}
+				file={csvFile}
+				onOpenChange={(open) => {
+					if (!open) setCsvFile(null);
+				}}
+				onImported={onImported}
+			/>
 		</>
 	);
 }
