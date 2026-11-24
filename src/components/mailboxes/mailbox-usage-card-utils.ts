@@ -11,6 +11,11 @@ export function mailboxUsageQueryKey(mailboxId: string) {
 // "full_access", and an admin who can manage the owner's account arrives with
 // null from the access fallback. read_only / send_as / send_on_behalf mounts
 // can only 404, so the query must never fire for them.
+// One under-rendered edge: an eligible admin who also holds an explicit
+// delegate grant below full_access keeps that lower permission in the page
+// payload, so the card stays hidden even though GET /api/mailboxes/[id]/usage
+// would serve them. Hiding is the safe direction — a query that might 404
+// never fires.
 export function canViewMailboxUsage(
 	permission: "read_only" | "send_as" | "send_on_behalf" | "full_access" | null | undefined,
 ): boolean {
