@@ -51,3 +51,28 @@ export async function checkMailboxQuota(env: CloudflareEnv, db: AppDatabase, mai
 		throw new MailboxStorageQuotaError(usage.totalBytes, outgoingBytes, limit);
 	}
 }
+
+/** Bounce reason shared by every inbound surface: the Worker's setReject, the SMTP listener's 550 and the relay route's reject response all show it to the sender, and the post-queue drop logs it. */
+export const INBOUND_QUOTA_REJECT_REASON = "Message rejected: the recipient mailbox is over its storage limit.";
+
+/**
+ * True when storing `incomingBytes` more would put the mailbox over
+ * MAILBOX_STORAGE_LIMIT_BYTES. Same boundary as `checkMailboxQuota`: landing
+ * exactly on the limit is allowed, and an unset or unreadable limit is unlimited.
+ *
+ * `incomingBytes` is raw MIME size at every call site (`rawSize` before the queue,
+ * the stored object's size after it), while `getMailboxUsage` counts parsed bodies
+ * and attachments only — the raw blob is its documented gap. The estimate is
+ * therefore conservative by the size of the MIME envelope.
+ *
+ * No owner notice is emitted on a reject or drop: the realtime union only carries
+ * new-message and agent-draft payloads, a type the client does not render, and
+ * wiring one would fire an unthrottled push per dropped message. The SMTP bounce
+ * is the sender's notice where a bounce exists; the owner sees the usage card.
+ */
+export async function mailboxInboundQuotaExceeded(env: CloudflareEnv, db: AppDatabase, mailboxId: string, incomingBytes: number): Promise<boolean> {
+	const limit = getMailboxStorageLimit(env);
+	if (limit === null) return false;
+	const usage = await getMailboxUsage(db, mailboxId);
+	return usage.totalBytes + incomingBytes > limit;
+}

@@ -1,5 +1,7 @@
+import { getDb } from "@/db";
 import { forwardedMarker, getAccountForwardingDestination, isForwardedMarkerValid, MAILFLARE_FORWARDED_HEADER } from "@/lib/email/account-forwarding";
 import { resolveIncomingMail } from "@/lib/email/incoming";
+import { INBOUND_QUOTA_REJECT_REASON, mailboxInboundQuotaExceeded } from "@/lib/email/mailbox-quota";
 import { inboundStorageKey } from "@/lib/email/inbound-id";
 import type { InboundQueueMessage } from "@/lib/email/inbound";
 import type { IntakeActions, IntakeInput, IntakeResult } from "@/lib/email/intake-types";
@@ -30,6 +32,15 @@ export async function intakeIncomingMail(env: CloudflareEnv, input: IntakeInput,
 		const forwarded = await actions.forward?.(decision.forwardTo, marker);
 		if (forwarded) forwardedTo = decision.forwardTo;
 		if (forwarded && !decision.keepCopy) return { action: "forward", forwardedTo };
+	}
+
+	// Same gate as the Worker email handler: everything below stores a copy, which a
+	// mailbox over its storage cap cannot take. The SMTP listener turns the reject into
+	// a 550, the relay route answers with action "reject" so it can setReject, and
+	// provider intake simply drops — it already answered the provider's webhook.
+	if (decision?.mailbox && await mailboxInboundQuotaExceeded(env, getDb(env), decision.mailbox.mailboxId, input.raw.byteLength)) {
+		await actions.reject?.(INBOUND_QUOTA_REJECT_REASON);
+		return { action: "reject", reason: INBOUND_QUOTA_REJECT_REASON };
 	}
 
 	if (!alreadyForwarded) {

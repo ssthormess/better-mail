@@ -15,6 +15,7 @@ import { listMessageAttachments, storeMessageAttachments } from "@/lib/email/att
 import { registerInboundInvite } from "@/lib/calendar/invite-store";
 import { inboundAttachmentLimitReason } from "@/lib/email/inbound-attachments";
 import { inboundMessageId } from "@/lib/email/inbound-id";
+import { INBOUND_QUOTA_REJECT_REASON, mailboxInboundQuotaExceeded } from "@/lib/email/mailbox-quota";
 import { extractUnsubscribeLinkFromBody, extractUnsubscribeUrlFromRaw, getUnsubscribeUrlFromRawR2Key } from "@/lib/email/unsubscribe";
 import { resolveThreadId } from "@/lib/email/threading";
 import { normalizeMessageId } from "@/lib/email/thread-lookup";
@@ -87,6 +88,15 @@ export async function processInboundMessage(
 	const raw = await env.BUCKET.get(payload.rawR2Key);
 	if (!raw) {
 		console.error(`Missing R2 object: ${payload.rawR2Key}`);
+		return;
+	}
+
+	// The pre-queue gate is best-effort: usage can grow between accept and delivery, and
+	// intake paths that cannot bounce still land here. Dropping deletes the orphaned raw
+	// object; the sender is not told — their provider already got a 2xx.
+	if (await mailboxInboundQuotaExceeded(env, db, decision.mailbox.mailboxId, raw.size)) {
+		console.warn(`Inbound dropped for ${payload.to}: ${INBOUND_QUOTA_REJECT_REASON}`);
+		await dropRaw();
 		return;
 	}
 

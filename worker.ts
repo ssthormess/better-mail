@@ -1,4 +1,5 @@
 import { runAutoUpdate } from "@/lib/update/auto-update";
+import { getDb } from "./src/db/index";
 import { withDatabase } from "./src/db/with-database";
 import { withStorage } from "./src/lib/storage";
 import vinextHandler from "vinext/server/fetch-handler";
@@ -25,6 +26,7 @@ import { resolveIncomingMail, forwardMessage } from "./src/lib/email/incoming";
 import { getUserFromSession } from "./src/lib/auth/session";
 import { getSessionTokenFromRequest } from "./src/lib/realtime/utils";
 import { inboundAttachmentLimitReasonFromRaw } from "./src/lib/email/inbound-attachments";
+import { INBOUND_QUOTA_REJECT_REASON, mailboxInboundQuotaExceeded } from "./src/lib/email/mailbox-quota";
 import { hasValidSessionMutationOrigin } from "./src/lib/auth/origin";
 import {
 	getAccountForwardingDestination,
@@ -105,6 +107,14 @@ export default {
 				// A forward rule drops the message unless it was explicitly asked to keep a copy.
 				// If the forward itself failed we still store it, so mail is never silently lost.
 				if (forwarded && !decision.keepCopy) return;
+			}
+
+			// Everything below stores a copy, which a mailbox over its storage cap cannot take.
+			// A pure forward stores nothing and stays unchecked; the kept copy of a forward that
+			// asked for one counts. Usage can grow before the queue runs, so the check repeats there.
+			if (decision?.mailbox && await mailboxInboundQuotaExceeded(env, getDb(env), decision.mailbox.mailboxId, message.rawSize)) {
+				message.setReject(INBOUND_QUOTA_REJECT_REASON);
+				return;
 			}
 
 			if (!alreadyForwarded) {
