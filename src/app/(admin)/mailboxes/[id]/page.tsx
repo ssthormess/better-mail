@@ -34,6 +34,7 @@ import {
   updateMailboxAlias,
   updateMailboxSettings,
 } from "./utils";
+import MailboxUsageCard from "@/components/mailboxes/mailbox-usage-card";
 import { getMailboxesBase } from "../utils";
 import MailboxAvatarForm from "./MailboxAvatarForm";
 
@@ -469,6 +470,7 @@ export default function MailboxSettingsPage() {
           </CardContent>
         </Card>
       )}
+      <MailboxUsageCard mailboxId={mailboxId} permission={mailbox.data?.permission} />
       <Card className="rounded-3xl border-0 bg-white p-6">
         <CardHeader className="py-0">
           <CardTitle className="text-red-700">{t("mailbox.dangerZone")}</CardTitle>
