@@ -598,6 +598,66 @@ test("a master deleted mid-import is never written back", async (t) => {
 	assert.deepEqual(spy.filter((kind) => kind !== "insert"), ["update"]); // the one committed update; nothing after
 });
 
+test("a master deleted underfoot is reported vanished, never applied", async (t) => {
+	// The update resolves with zero rows because a concurrent delete won — counting it updated
+	// would claim a write landed on a row that no longer exists.
+	const sqlite = await sequentialDriver(t, seed, {
+		beforeWrite: (db) => db.exec("DELETE FROM calendar_events WHERE user_id='user-2'"),
+	});
+	const first = await app.route.POST(req(ics(vevent(["UID:gone", "DTSTART:20261102T090000Z", "SUMMARY:Before"]))));
+	assert.equal(first.status, 200);
+	const res = await app.route.POST(req(ics(vevent(["UID:gone", "DTSTART:20261102T090000Z", "SUMMARY:Revised"]))));
+	assert.equal(res.status, 200);
+	const body = await res.json();
+	assert.equal(body.updated, 0);
+	assert.equal(body.vanished, 1);
+	assert.ok(body.errors.some((line) => line.includes("vanished mid-import")));
+	assert.equal(eventsOf(sqlite, "user-2").length, 0);
+});
+
+test("a master deleted underfoot on an atomic driver is also reported vanished", async (t) => {
+	const { env, sqlite } = await newDatabase(t, seed);
+	globalThis.calImportUser = secondUser;
+	globalThis.calImportKey = null;
+	let armed = false;
+	globalThis.calImportEnv = { DB: new Proxy(env.DB, {
+		get: (target, prop) => {
+			const value = Reflect.get(target, prop);
+			if (prop !== "batch" || typeof value !== "function") return typeof value === "function" ? value.bind(target) : value;
+			return async (...args) => {
+				if (armed) { armed = false; sqlite.exec("DELETE FROM calendar_events WHERE user_id='user-2'"); }
+				return value.apply(target, args);
+			};
+		},
+	}) };
+	const first = await app.route.POST(req(ics(vevent(["UID:gone-atomic", "DTSTART:20261102T090000Z", "SUMMARY:Before"]))));
+	assert.equal(first.status, 200);
+	armed = true; // the competitor strikes inside the revised import's batch window
+	const res = await app.route.POST(req(ics(vevent(["UID:gone-atomic", "DTSTART:20261102T090000Z", "SUMMARY:Revised"]))));
+	assert.equal(res.status, 200);
+	const body = await res.json();
+	assert.equal(body.updated, 0);
+	assert.equal(body.vanished, 1);
+	assert.equal(eventsOf(sqlite, "user-2").length, 0);
+});
+
+test("a vanished event before a failure stays out of the applied count", async (t) => {
+	const sqlite = await sequentialDriver(t, seed, {
+		beforeWrite: (db) => db.exec("DELETE FROM calendar_events WHERE user_id='user-2'"),
+	});
+	const first = await app.route.POST(req(ics(vevent(["UID:gone-fail", "DTSTART:20261102T090000Z", "SUMMARY:Before"]))));
+	assert.equal(first.status, 200);
+	sqlite.exec("CREATE TRIGGER fail_bad BEFORE INSERT ON calendar_events WHEN NEW.title='Bad' BEGIN SELECT RAISE(ABORT, 'forced'); END;");
+	const res = await app.route.POST(req(ics([...vevent(["UID:gone-fail", "DTSTART:20261102T090000Z", "SUMMARY:Revised"]), ...vevent(["UID:bad", "DTSTART:20261103T090000Z", "SUMMARY:Bad"])])));
+	assert.equal(res.status, 500);
+	const body = await res.json();
+	assert.equal(body.updated, 0);
+	assert.equal(body.vanished, 1);
+	assert.equal(body.unattempted, 0);
+	assert.ok(!body.detail.includes("1 event(s) before it stay applied"));
+	assert.ok(body.detail.includes("vanished mid-import"));
+});
+
 test("a first-write failure that may have committed admits it", async (t) => {
 	// The master insert commits remotely, then the HTTP response is lost: completed===0 only proves
 	// the response failed, so the report must admit the event may exist — never claim it wasn't applied.

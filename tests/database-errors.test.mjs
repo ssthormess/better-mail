@@ -63,6 +63,14 @@ test("driver error codes win over the message", () => {
 	assert.equal(isMissingTableError(coded({ code: "42703" })), false);
 	assert.equal(isMissingColumnError(coded({ code: "42P01" })), false);
 	assert.equal(isMissingColumnError(coded({ code: "23505" })), false);
+	assert.equal(isUniqueConstraintError(coded({ code: "23505" })), true);
+	assert.equal(isUniqueConstraintError(coded({ errno: 1062 })), true);
+	assert.equal(isUniqueConstraintError(coded({ code: "ER_DUP_ENTRY" })), true);
+	assert.equal(isUniqueConstraintError(coded({ code: "SQLITE_CONSTRAINT_UNIQUE" })), true);
+	assert.equal(isUniqueConstraintError(coded({ code: "SQLITE_CONSTRAINT_PRIMARYKEY" })), true);
+	assert.equal(isUniqueConstraintError(coded({ code: "SQLITE_CONSTRAINT_FOREIGNKEY" })), false);
+	assert.equal(isUniqueConstraintError(coded({ code: "SQLITE_CONSTRAINT" })), false);
+	assert.equal(isUniqueConstraintError(coded({ code: "23503" })), false);
 });
 
 test("message lists with sent mail keep working before migration 0068", async (t) => {

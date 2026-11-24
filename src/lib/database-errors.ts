@@ -32,5 +32,12 @@ export function isMissingColumnError(error: unknown): boolean {
 }
 
 export function isUniqueConstraintError(error: unknown): boolean {
-	return errorChainMatches(error, /UNIQUE constraint failed|duplicate key value violates unique constraint|duplicate entry/i);
+	return errorChainMatches(
+		error,
+		/UNIQUE constraint failed|duplicate key value violates unique constraint|duplicate entry/i,
+		// PostgreSQL's unique_violation, MySQL's ER_DUP_ENTRY errno and code, and better-sqlite3's
+		// specific constraint codes — the generic SQLITE_CONSTRAINT covers NOT NULL and FK too, so
+		// only the uniqueness-flavored codes belong here (other dialects fall back to the message).
+		["23505", 1062, "ER_DUP_ENTRY", "SQLITE_CONSTRAINT_UNIQUE", "SQLITE_CONSTRAINT_PRIMARYKEY"],
+	);
 }
