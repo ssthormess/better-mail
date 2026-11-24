@@ -77,58 +77,60 @@ export async function POST(request: Request) {
 		list.push(override);
 		overridesByEvent.set(override.eventId, list);
 	}
-	// Each event's master row plus all of its override rows commit in one batch — an event is the
-	// atomic unit, so a database failure leaves complete events before it and zero rows for the
-	// event that failed, never a master split from its detached occurrences. Whole-file atomicity
-	// is deliberately not used: one bad event should not roll back an entire honest file, and a
-	// batch per event keeps transactions small. A failure reports exactly what was applied.
-	// On D1 the batch is a real transaction; on an external driver the executor says honestly
-	// whether its transaction wrapper gives one — Neon-class HTTP drivers cannot, so a failed
-	// batch there may have committed a prefix and the route compensates instead.
+	// Each event's master row plus all of its override rows are written as one unit — an event is
+	// the failure unit, so a database failure leaves complete events before it and reports the
+	// event that failed, never a split master from its detached occurrences left silently.
+	// Whole-file atomicity is deliberately not used: one bad event should not roll back an entire
+	// honest file, and a batch per event keeps transactions small. A failure reports exactly what
+	// was applied. On D1 the batch is a real transaction; on an external driver the executor says
+	// honestly whether its transaction wrapper gives one — Neon-class HTTP drivers cannot, so a
+	// failed event there leaves a committed prefix that the response admits instead of undoing.
 	const executor = isExternalDatabase(env.DB) ? env.DB.sqlExecutor : null;
 	const atomic = executor ? (executor.atomicBatch ? await executor.atomicBatch() : executor.transaction !== undefined) : true;
 	const changed = new Set<string>();
 	let imported = 0;
 	let unchanged = 0;
 	let overridesWritten = 0;
-	let failed: { index: number; event: ImportEventRow; error: unknown; reverted: boolean; outcome: RevertOutcome } | null = null;
+	let failed: { index: number; event: ImportEventRow; error: unknown; reverted: boolean; outcome: FailureOutcome } | null = null;
 	for (const [index, event] of prepared.events.entries()) {
 		const existing = existingById.get(event.id);
-		const writes: { run: BatchItem<"sqlite">; undo: CommittedWrite }[] = [];
+		const statements: BatchItem<"sqlite">[] = [];
 		let eventOverrides = 0;
 		if (!existing) {
-			writes.push({ run: db.insert(calendarEvents).values(event), undo: { kind: "master-insert", id: event.id, row: event } });
+			statements.push(db.insert(calendarEvents).values(event));
 		} else if (masterDiffers(existing, event)) {
-			writes.push({ run: db.update(calendarEvents).set({ ...masterFields(event), updatedAt: new Date() }).where(eq(calendarEvents.id, event.id)), undo: { kind: "master-update", id: event.id, prior: existing, written: event } });
+			statements.push(db.update(calendarEvents).set({ ...masterFields(event), updatedAt: new Date() }).where(eq(calendarEvents.id, event.id)));
 		}
 		for (const override of overridesByEvent.get(event.id) ?? []) {
 			const prior = existingPairs.get(`${override.eventId}:${override.occurrenceMs}`);
 			if (!prior) {
-				writes.push({ run: db.insert(calendarEventOverrides).values(override), undo: { kind: "override-insert", id: override.id, row: override } });
+				statements.push(db.insert(calendarEventOverrides).values(override));
 			} else if (overrideDiffers(prior, override)) {
-				writes.push({ run: db.update(calendarEventOverrides).set({ startsAt: override.startsAt, endsAt: override.endsAt, title: override.title, description: override.description, location: override.location, updatedAt: new Date() }).where(eq(calendarEventOverrides.id, prior.id)), undo: { kind: "override-update", id: prior.id, prior, written: override } });
+				statements.push(db.update(calendarEventOverrides).set({ startsAt: override.startsAt, endsAt: override.endsAt, title: override.title, description: override.description, location: override.location, updatedAt: new Date() }).where(eq(calendarEventOverrides.id, prior.id)));
 			} else continue;
 			eventOverrides += 1;
 		}
-		if (!writes.length) {
+		if (!statements.length) {
 			if (existing) unchanged += 1;
 			continue;
 		}
-		const committed: CommittedWrite[] = [];
+		let completed = 0;
 		try {
 			if (atomic) {
-				await db.batch(writes.map((write) => write.run) as [BatchItem<"sqlite">, ...BatchItem<"sqlite">[]]);
+				await db.batch(statements as [BatchItem<"sqlite">, ...BatchItem<"sqlite">[]]);
 			} else {
-				// This driver only runs statements sequentially: record exactly which writes
-				// committed, so a failure undoes this request's writes and nothing else's.
-				for (const write of writes) {
-					await write.run;
-					committed.push(write.undo);
+				// This driver only runs statements sequentially. A failure leaves this request's own
+				// committed prefix — undo on a non-transactional store cannot tell our rows from a
+				// concurrent writer's, so nothing is deleted or restored; the response reports the
+				// residue honestly and a re-import converges the event through the upsert path.
+				for (const statement of statements) {
+					await statement;
+					completed += 1;
 				}
 			}
 		} catch (error) {
-			const outcome = atomic ? ("clean" as const) : await revertCommitted(db, committed, !existing);
-			failed = { index, event, error, reverted: outcome === "clean", outcome };
+			const outcome: FailureOutcome = atomic ? "clean" : !existing && completed === 0 ? "conflict" : "partial";
+			failed = { index, event, error, reverted: atomic, outcome };
 			break;
 		}
 		if (existing) changed.add(event.id);
@@ -146,10 +148,9 @@ export async function POST(request: Request) {
 		const applied = imported + changed.size + unchanged;
 		const unattempted = prepared.events.length - applied - 1;
 		const residue =
-			atomic ? "its writes were rolled back"
-			: outcome === "clean" ? "no partial writes of it remain"
+			outcome === "clean" ? "its writes were rolled back"
 			: outcome === "conflict" ? "it was not applied; a conflicting event may already exist"
-			: "it may be left in an inconsistent state";
+			: "it may be partially applied — re-importing the file converges it";
 		return NextResponse.json(
 			{
 				error: "IMPORT_PARTIAL_FAILURE",
@@ -197,56 +198,9 @@ function overrideDiffers(existing: typeof calendarEventOverrides.$inferSelect, o
 }
 
 /**
- * Exactly what this request committed on a sequential driver, in commit order. Reverting walks it
- * in reverse and only ever touches rows the write provably produced — a deterministic id collides
- * with a concurrent import's row of the same event, so blind deletes by id are not allowed.
+ * How a failed event ended: "clean" is a real rollback (transactional drivers only), "conflict" is
+ * a first-write failure on a new event where the row that blocked it belongs to someone else, and
+ * "partial" is a mid-event failure on a sequential driver whose committed prefix honestly stays —
+ * undo there could destroy a concurrent writer's work, so residue is reported, never claimed away.
  */
-type CommittedWrite =
-	| { kind: "master-insert"; id: string; row: ImportEventRow }
-	| { kind: "master-update"; id: string; prior: typeof calendarEvents.$inferSelect; written: ImportEventRow }
-	| { kind: "override-insert"; id: string; row: ImportOverrideRow }
-	| { kind: "override-update"; id: string; prior: typeof calendarEventOverrides.$inferSelect; written: ImportOverrideRow };
-
-type RevertOutcome = "clean" | "conflict" | "partial";
-
-/**
- * Undo what this request committed before the failure. Every step re-reads the row first and
- * compares its stored fields to the values this request wrote: an insert is only deleted and an
- * update only restored when the row still carries this request's content — a concurrent request
- * may have deleted or rewritten it, and neither foreign rows nor resurrected ones are ours to
- * touch. Field values are the guard because updatedAt is stored at whole-second precision, which
- * cannot tell this request's write from a competitor's. "conflict" means the very first write
- * failed — nothing of this request exists, so nothing runs; the row that blocked it belongs to
- * someone else. "partial" means some write could not be provably reverted, so the response must
- * not claim a clean revert.
- */
-async function revertCommitted(db: ReturnType<typeof getDb>, committed: CommittedWrite[], wasNew: boolean): Promise<RevertOutcome> {
-	if (!committed.length) return wasNew ? "conflict" : "clean";
-	let complete = true;
-	for (const write of [...committed].reverse()) {
-		try {
-			if (write.kind === "master-insert") {
-				const [row] = await db.select().from(calendarEvents).where(eq(calendarEvents.id, write.id));
-				if (!row) continue;
-				if (masterDiffers(row, write.row)) { complete = false; continue; }
-				await db.delete(calendarEvents).where(eq(calendarEvents.id, write.id));
-			} else if (write.kind === "master-update") {
-				const [row] = await db.select().from(calendarEvents).where(eq(calendarEvents.id, write.id));
-				if (!row || masterDiffers(row, write.written)) { complete = false; continue; }
-				await db.update(calendarEvents).set({ ...masterFields(write.prior), updatedAt: write.prior.updatedAt }).where(eq(calendarEvents.id, write.id));
-			} else if (write.kind === "override-insert") {
-				const [row] = await db.select().from(calendarEventOverrides).where(eq(calendarEventOverrides.id, write.id));
-				if (!row) continue;
-				if (overrideDiffers(row, write.row)) { complete = false; continue; }
-				await db.delete(calendarEventOverrides).where(eq(calendarEventOverrides.id, write.id));
-			} else {
-				const [row] = await db.select().from(calendarEventOverrides).where(eq(calendarEventOverrides.id, write.id));
-				if (!row || overrideDiffers(row, write.written)) { complete = false; continue; }
-				await db.update(calendarEventOverrides).set({ startsAt: write.prior.startsAt, endsAt: write.prior.endsAt, title: write.prior.title, description: write.prior.description, location: write.prior.location, updatedAt: write.prior.updatedAt }).where(eq(calendarEventOverrides.id, write.id));
-			}
-		} catch {
-			complete = false;
-		}
-	}
-	return complete ? "clean" : "partial";
-}
+type FailureOutcome = "clean" | "conflict" | "partial";

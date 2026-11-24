@@ -431,7 +431,8 @@ test("a write failure rolls back its whole event and reports what was applied", 
 // env.DB fakes a Neon-class external driver: the drizzle handle is real, but the executor
 // honestly reports no transaction, so the route writes sequentially — the shape lazyExecutor
 // produces for HTTP protocols. hooks.beforeWrite/afterWrite run around each committed write
-// statement, letting a test act as a concurrent request between this one's statements.
+// statement, letting a test act as a concurrent request between this one's statements; hooks.spy,
+// when an array, records every mutating statement kind the route issues.
 async function sequentialDriver(t, seedSql, hooks = {}) {
 	const { sqlite, db } = await newDatabase(t, seedSql);
 	globalThis.calImportUser = secondUser;
@@ -461,9 +462,11 @@ async function sequentialDriver(t, seedSql, hooks = {}) {
 	globalThis.calImportEnv = {
 		DB: {
 			createDrizzle: () => new Proxy(db, {
-				get: (target, prop) => ((hooks.beforeWrite || hooks.afterWrite) && (prop === "insert" || prop === "update")
-					? (...args) => wrapChain(Reflect.get(target, prop).apply(target, args))
-					: Reflect.get(target, prop)),
+				get: (target, prop) => {
+					if (hooks.spy && (prop === "insert" || prop === "update" || prop === "delete")) hooks.spy.push(prop);
+					if ((hooks.beforeWrite || hooks.afterWrite) && (prop === "insert" || prop === "update")) return (...args) => wrapChain(Reflect.get(target, prop).apply(target, args));
+					return Reflect.get(target, prop);
+				},
 			}),
 			sqlExecutor: { dialect: "postgres", query: async () => { throw new Error("unreachable"); }, atomicBatch: async () => false },
 		},
@@ -471,8 +474,9 @@ async function sequentialDriver(t, seedSql, hooks = {}) {
 	return sqlite;
 }
 
-test("on a driver without transactions a failed event is cleaned up and reported", async (t) => {
-	const sqlite = await sequentialDriver(t, seed);
+test("on a driver without transactions a failed event reports its residue honestly", async (t) => {
+	const spy = [];
+	const sqlite = await sequentialDriver(t, seed, { spy });
 	const logged = [];
 	const originalError = console.error;
 	console.error = (...args) => logged.push(args);
@@ -489,22 +493,27 @@ test("on a driver without transactions a failed event is cleaned up and reported
 	assert.equal(body.error, "IMPORT_PARTIAL_FAILURE");
 	assert.equal(body.imported, 1);
 	assert.equal(body.failed, 1);
-	assert.equal(body.reverted, true);
+	assert.notEqual(body.reverted, true);
 	assert.equal(body.unattempted, 1);
-	assert.ok(body.detail.includes("no partial writes"));
-	// Sequential execution committed the failed event's master before the override aborted;
-	// compensation removed it, so storage looks exactly like the transactional case.
-	assert.deepEqual(eventsOf(sqlite, "user-2").map((event) => event.title), ["First"]);
+	assert.ok(body.detail.includes("partially applied"));
+	// Sequential execution committed the failed event's master before the override aborted; the
+	// prefix is this request's own residue — admitted, never claimed away — and re-import converges.
+	assert.deepEqual(eventsOf(sqlite, "user-2").map((event) => event.title), ["First", "Series"]);
 	assert.equal(sqlite.prepare("SELECT COUNT(*) AS n FROM calendar_event_overrides o JOIN calendar_events e ON o.event_id = e.id WHERE e.user_id = 'user-2'").get().n, 0);
+	// No undo writes at all: on a store without transactions deleting or restoring could destroy
+	// a concurrent request's rows, so only the failed event's own writes exist.
+	assert.ok(!spy.includes("delete"));
 	// The raw driver error is a server-side diagnostic, not client detail.
 	assert.ok(!body.detail.includes("forced override failure"));
 	assert.ok(!body.detail.includes("insert into"));
 	assert.ok(logged.some((args) => String(args[0]).includes("calendar import failed") && String(args[1]).includes("Failed query")));
 });
 
-test("when cleanup also fails the response admits partial rows may remain", async (t) => {
-	const sqlite = await sequentialDriver(t, seed);
+test("a failed event issues no undo writes, even ones a trigger would block", async (t) => {
+	const spy = [];
+	const sqlite = await sequentialDriver(t, seed, { spy });
 	sqlite.exec(`CREATE TRIGGER fail_override BEFORE INSERT ON calendar_event_overrides WHEN NEW.occurrence_ms = ${Date.parse("2026-11-09T09:00:00Z")} BEGIN SELECT RAISE(ABORT, 'forced override failure'); END;`);
+	// Any delete the failure path attempted would abort here — none is attempted at all.
 	sqlite.exec("CREATE TRIGGER block_cleanup BEFORE DELETE ON calendar_events WHEN OLD.user_id = 'user-2' BEGIN SELECT RAISE(ABORT, 'delete blocked'); END;");
 	const res = await app.route.POST(req(ics([
 		...vevent(["UID:first", "DTSTART:20261101T090000Z", "SUMMARY:First"]),
@@ -515,11 +524,10 @@ test("when cleanup also fails the response admits partial rows may remain", asyn
 	const body = await res.json();
 	assert.equal(body.error, "IMPORT_PARTIAL_FAILURE");
 	assert.equal(body.failed, 1);
-	assert.equal(body.reverted, false);
-	assert.ok(body.detail.includes("inconsistent"));
-	// The failed event's master committed before the abort and the blocked cleanup left it: the
-	// report counts it as failed, not applied, and never claims the store is clean.
+	assert.notEqual(body.reverted, true);
 	assert.deepEqual(eventsOf(sqlite, "user-2").map((event) => event.title), ["First", "Series"]);
+	// Three mutating statements total — two masters plus the aborted override — and no undo writes.
+	assert.deepEqual(spy, ["insert", "insert", "insert"]);
 });
 
 test("losing a same-event insert race leaves the concurrent winner's row alone", async (t) => {
@@ -527,7 +535,9 @@ test("losing a same-event insert race leaves the concurrent winner's row alone",
 	// request's preflight and its first write, so the insert fails on the duplicate primary key.
 	const winnerId = `evt_i_${createHash("sha256").update("user-2uid:race").digest("hex")}`;
 	let won = false;
+	const spy = [];
 	const sqlite = await sequentialDriver(t, seed, {
+		spy,
 		beforeWrite: async (sqlite) => {
 			if (won) return;
 			won = true;
@@ -540,20 +550,24 @@ test("losing a same-event insert race leaves the concurrent winner's row alone",
 	assert.equal(body.error, "IMPORT_PARTIAL_FAILURE");
 	assert.equal(body.imported, 0);
 	assert.equal(body.failed, 1);
-	// Nothing this request wrote existed, so there was nothing to revert — and the response does
-	// not claim a revert over a row that belongs to the winner.
+	// Nothing this request wrote existed, so the response reports the conflict — and since no undo
+	// ever runs, the winner's row is provably untouched.
 	assert.notEqual(body.reverted, true);
+	assert.ok(body.detail.includes("conflicting event"));
+	assert.deepEqual(spy, ["insert"]);
 	const rows = eventsOf(sqlite, "user-2");
 	assert.equal(rows.length, 1);
 	assert.equal(rows[0].id, winnerId);
 	assert.equal(rows[0].title, "Race winner");
 });
 
-test("a master deleted mid-import is not resurrected by the revert", async (t) => {
+test("a master deleted mid-import is never written back", async (t) => {
 	// The master update commits, a concurrent request deletes the event, then the override
-	// insert fails: the revert must see the row is gone instead of writing it back.
+	// insert fails: with no undo the deleted row simply stays deleted.
 	let race = false;
+	const spy = [];
 	const sqlite = await sequentialDriver(t, seed, {
+		spy,
 		afterWrite: async (sqlite) => {
 			if (!race) return;
 			race = false;
@@ -574,15 +588,16 @@ test("a master deleted mid-import is not resurrected by the revert", async (t) =
 	assert.equal(body.failed, 1);
 	assert.notEqual(body.reverted, true);
 	assert.equal(eventsOf(sqlite, "user-2").length, 0);
+	assert.deepEqual(spy.filter((kind) => kind !== "insert"), ["update"]); // the one committed update; nothing after
 });
 
-test("an uncontended failed re-import restores the pre-write snapshot", async (t) => {
+test("an uncontended failed re-import admits its own committed residue", async (t) => {
 	const sqlite = await sequentialDriver(t, seed);
 	const first = await app.route.POST(req(ics(vevent(["UID:snap", "DTSTART:20261102T090000Z", "DTEND:20261102T100000Z", "SUMMARY:Before", "RRULE:FREQ=WEEKLY"]))));
 	assert.equal(first.status, 200);
 	sqlite.exec(`CREATE TRIGGER fail_override BEFORE INSERT ON calendar_event_overrides WHEN NEW.occurrence_ms = ${Date.parse("2026-11-09T09:00:00Z")} BEGIN SELECT RAISE(ABORT, 'forced override failure'); END;`);
-	// The revision's master update commits at whole-second storage precision, then the override
-	// insert aborts: the revert must still recognise the row as this request's own write.
+	// The revision's master update commits, then the override insert aborts: the stored revision
+	// is this request's own work — the response says so and re-import converges through upsert.
 	const res = await app.route.POST(req(ics([
 		...vevent(["UID:snap", "DTSTART:20261102T090000Z", "DTEND:20261102T100000Z", "SUMMARY:After", "RRULE:FREQ=WEEKLY"]),
 		...vevent(["UID:snap", "RECURRENCE-ID:20261109T090000Z", "DTSTART:20261109T110000Z", "DTEND:20261109T120000Z", "SUMMARY:Moved"]),
@@ -591,15 +606,25 @@ test("an uncontended failed re-import restores the pre-write snapshot", async (t
 	const body = await res.json();
 	assert.equal(body.error, "IMPORT_PARTIAL_FAILURE");
 	assert.equal(body.failed, 1);
-	assert.equal(body.reverted, true);
+	assert.notEqual(body.reverted, true);
+	assert.ok(body.detail.includes("converges"));
 	const [row] = eventsOf(sqlite, "user-2");
-	assert.equal(row.title, "Before");
-	assert.equal(sqlite.prepare("SELECT COUNT(*) AS n FROM calendar_event_overrides o JOIN calendar_events e ON o.event_id = e.id WHERE e.user_id = 'user-2'").get().n, 0);
+	assert.equal(row.title, "After");
+	// The transient failure gone, re-importing the same file converges the residue: the master
+	// matches and the missing override lands.
+	sqlite.exec("DROP TRIGGER fail_override");
+	const retry = await app.route.POST(req(ics([
+		...vevent(["UID:snap", "DTSTART:20261102T090000Z", "DTEND:20261102T100000Z", "SUMMARY:After", "RRULE:FREQ=WEEKLY"]),
+		...vevent(["UID:snap", "RECURRENCE-ID:20261109T090000Z", "DTSTART:20261109T110000Z", "DTEND:20261109T120000Z", "SUMMARY:Moved"]),
+	])));
+	assert.equal(retry.status, 200);
+	assert.equal((await retry.json()).overrides, 1);
+	assert.equal(sqlite.prepare("SELECT COUNT(*) AS n FROM calendar_event_overrides o JOIN calendar_events e ON o.event_id = e.id WHERE e.user_id = 'user-2'").get().n, 1);
 });
 
 test("a master rewritten mid-import stays the competitor's and reports partial", async (t) => {
 	// Our master update commits, a concurrent request rewrites the event with different content,
-	// then the override insert fails: the revert must not clobber the competitor's revision.
+	// then the override insert fails: with no undo the competitor's revision is never clobbered.
 	let race = false;
 	const sqlite = await sequentialDriver(t, seed, {
 		afterWrite: async (sqlite) => {
@@ -622,6 +647,37 @@ test("a master rewritten mid-import stays the competitor's and reports partial",
 	assert.notEqual(body.reverted, true);
 	const [row] = eventsOf(sqlite, "user-2");
 	assert.equal(row.title, "Competitor edit");
+});
+
+test("a competitor's identical-content commit is never restored over", async (t) => {
+	// Our update commits, a concurrent request writes the SAME content with a newer updated_at
+	// (indistinguishable ownership), then the override insert fails: undo would clobber the
+	// competitor's commit with our old snapshot, which is exactly why none runs.
+	let race = false;
+	const sqlite = await sequentialDriver(t, seed, {
+		afterWrite: async (sqlite) => {
+			if (!race) return;
+			race = false;
+			sqlite.exec("UPDATE calendar_events SET title = 'After', updated_at = updated_at + 1 WHERE user_id = 'user-2'");
+		},
+	});
+	const first = await app.route.POST(req(ics(vevent(["UID:ident", "DTSTART:20261102T090000Z", "DTEND:20261102T100000Z", "SUMMARY:Before", "RRULE:FREQ=WEEKLY"]))));
+	assert.equal(first.status, 200);
+	const priorStamp = sqlite.prepare("SELECT updated_at FROM calendar_events WHERE user_id = 'user-2'").get().updated_at;
+	sqlite.exec(`CREATE TRIGGER fail_override BEFORE INSERT ON calendar_event_overrides WHEN NEW.occurrence_ms = ${Date.parse("2026-11-09T09:00:00Z")} BEGIN SELECT RAISE(ABORT, 'forced override failure'); END;`);
+	race = true;
+	const res = await app.route.POST(req(ics([
+		...vevent(["UID:ident", "DTSTART:20261102T090000Z", "DTEND:20261102T100000Z", "SUMMARY:After", "RRULE:FREQ=WEEKLY"]),
+		...vevent(["UID:ident", "RECURRENCE-ID:20261109T090000Z", "DTSTART:20261109T110000Z", "DTEND:20261109T120000Z", "SUMMARY:Moved"]),
+	])));
+	assert.equal(res.status, 500);
+	const body = await res.json();
+	assert.equal(body.failed, 1);
+	assert.notEqual(body.reverted, true);
+	const row = sqlite.prepare("SELECT title, updated_at FROM calendar_events WHERE user_id = 'user-2'").get();
+	assert.equal(row.title, "After");
+	// The competitor's bumped timestamp survives: a restore would have written the older value back.
+	assert.ok(row.updated_at > priorStamp);
 });
 
 test("the export feed for a fixed fixture still hashes to its pinned digest", async () => {
