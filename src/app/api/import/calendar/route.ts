@@ -139,8 +139,9 @@ export async function POST(request: Request) {
 				// committed prefix — undo on a non-transactional store cannot tell our rows from a
 				// concurrent writer's, so nothing is deleted or restored; the response reports the
 				// residue honestly and a re-import converges the event through the upsert path.
+				results = [];
 				for (const [i, statement] of statements.entries()) {
-					const result = await statement;
+					const result = results[i] = await statement;
 					if (mustHit[i] && rowsAffected(result) === 0) { vanishedAt = i; break; }
 					completed += 1;
 				}
@@ -163,14 +164,12 @@ export async function POST(request: Request) {
 			// event itself or only a stored override decides which residue the report describes.
 			const masterStatements = statements.length - eventOverrides;
 			if (vanishedAt < masterStatements) vanishedMasters += 1;
-			if (atomic) {
-				// A resolved batch committed every statement — even the override writes after the
-				// vanished index — but each only counts where its own result proves rows changed.
-				for (let i = masterStatements; i < statements.length; i++) {
-					if (!mustHit[i] || rowsAffected(results?.[i]) !== 0) overridesWritten += 1;
-				}
-			} else {
-				overridesWritten += Math.max(0, completed - masterStatements);
+			// Every ran statement is in results (atomic resolves them all; sequential stops at the
+			// vanished index). An override write is credited solely where its own outcome proves a
+			// row changed: an INSERT proves on resolution, an UPDATE only on a positive affected-row
+			// count — a proven zero vanished and a null/unknown count proves nothing.
+			for (let i = masterStatements; i < (results?.length ?? 0); i++) {
+				if (!mustHit[i] || (rowsAffected(results[i]) ?? 0) > 0) overridesWritten += 1;
 			}
 			continue;
 		}

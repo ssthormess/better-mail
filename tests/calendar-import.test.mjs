@@ -695,6 +695,55 @@ test("a vanished override update credits only overrides proven written", async (
 	assert.equal(overridesOf(sqlite, eventsOf(sqlite, "user-2")[0].id).length, 0);
 });
 
+test("an unknown-shape update result is never counted as written", async (t) => {
+	// Same hole on the atomic path: the batch maps the second override's result to {} — an unknown
+	// shape. null is not a proof of rows changed, so neither override write can be credited.
+	const { env, sqlite } = await newDatabase(t, seed);
+	globalThis.calImportUser = secondUser;
+	globalThis.calImportKey = null;
+	let armed = false;
+	globalThis.calImportEnv = { DB: new Proxy(env.DB, {
+		get: (target, prop) => {
+			const value = Reflect.get(target, prop);
+			if (prop !== "batch" || typeof value !== "function") return typeof value === "function" ? value.bind(target) : value;
+			return async (...args) => {
+				if (!armed) return value.apply(target, args);
+				armed = false;
+				sqlite.exec("DELETE FROM calendar_event_overrides WHERE event_id IN (SELECT id FROM calendar_events WHERE user_id='user-2')");
+				return (await value.apply(target, args)).map((result, i) => (i === 1 ? {} : result));
+			};
+		},
+	}) };
+	const master = ["UID:unknown-shape", "DTSTART:20261102T090000Z", "DTEND:20261102T100000Z", "SUMMARY:Series", "RRULE:FREQ=WEEKLY"];
+	const over = (day, hour) => ["UID:unknown-shape", `RECURRENCE-ID:202611${day}T090000Z`, `DTSTART:202611${day}T${hour}0000Z`, `DTEND:202611${day}T${hour}3000Z`, `SUMMARY:Moved${day}`];
+	const first = await app.route.POST(req(ics([...vevent(master), ...vevent(over("09", "11")), ...vevent(over("16", "11"))])));
+	assert.equal(first.status, 200);
+	armed = true;
+	const res = await app.route.POST(req(ics([...vevent(master), ...vevent(over("09", "12")), ...vevent(over("16", "12"))])));
+	assert.equal(res.status, 200);
+	const body = await res.json();
+	assert.equal(body.vanished, 1);
+	assert.equal(body.overrides, 0);
+	assert.equal(overridesOf(sqlite, eventsOf(sqlite, "user-2")[0].id).length, 0);
+});
+
+test("an unknown-shape sequential resolve before a later vanish is not credited", async (t) => {
+	let armed = false;
+	const hooks = { beforeWrite: (db) => { if (armed) db.exec("DELETE FROM calendar_event_overrides WHERE event_id IN (SELECT id FROM calendar_events WHERE user_id='user-2')"); } };
+	await sequentialDriver(t, seed, hooks);
+	const master = ["UID:seq-unknown", "DTSTART:20261102T090000Z", "DTEND:20261102T100000Z", "SUMMARY:Series", "RRULE:FREQ=WEEKLY"];
+	const over = (day, hour) => ["UID:seq-unknown", `RECURRENCE-ID:202611${day}T090000Z`, `DTSTART:202611${day}T${hour}0000Z`, `DTEND:202611${day}T${hour}3000Z`, `SUMMARY:Moved${day}`];
+	const first = await app.route.POST(req(ics([...vevent(master), ...vevent(over("09", "11")), ...vevent(over("16", "11"))])));
+	assert.equal(first.status, 200);
+	armed = true;
+	hooks.fakeResult = {}; // first override update resolves a count-less shape — unverifiable, not written
+	const res = await app.route.POST(req(ics([...vevent(master), ...vevent(over("09", "12")), ...vevent(over("16", "12"))])));
+	assert.equal(res.status, 200);
+	const body = await res.json();
+	assert.equal(body.vanished, 1);
+	assert.equal(body.overrides, 0);
+});
+
 test("a vanished event before a failure stays out of the applied count", async (t) => {
 	const sqlite = await sequentialDriver(t, seed, {
 		beforeWrite: (db) => db.exec("DELETE FROM calendar_events WHERE user_id='user-2'"),
