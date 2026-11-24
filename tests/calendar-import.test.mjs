@@ -433,12 +433,14 @@ test("a write failure rolls back its whole event and reports what was applied", 
 // produces for HTTP protocols. hooks.beforeWrite/afterWrite run around each committed write
 // statement, letting a test act as a concurrent request between this one's statements; hooks.spy,
 // when an array, records every mutating statement kind the route issues; hooks.failWith rejects
-// the NEXT awaited write with the given error after it committed — a lost HTTP response.
+// the NEXT awaited write with the given error after it committed — a lost HTTP response;
+// hooks.fakeResult resolves the NEXT awaited write with the given value instead of its real
+// result — the dialect's driver-specific result shape.
 async function sequentialDriver(t, seedSql, hooks = {}) {
 	const { sqlite, db } = await newDatabase(t, seedSql);
 	globalThis.calImportUser = secondUser;
 	globalThis.calImportKey = null;
-	const racy = hooks.beforeWrite || hooks.afterWrite || hooks.failWith !== undefined;
+	const racy = hooks.beforeWrite || hooks.afterWrite || hooks.failWith !== undefined || hooks.fakeResult !== undefined;
 	// Wrap every builder in the chain (insert().values(), update().set().where()) so the statement
 	// the route awaits runs the hooks around its execution — a concurrent request between writes.
 	const wrapChain = (obj) => new Proxy(obj, {
@@ -454,6 +456,11 @@ async function sequentialDriver(t, seedSql, hooks = {}) {
 						const failure = hooks.failWith;
 						hooks.failWith = undefined;
 						throw failure;
+					}
+					if (hooks.fakeResult !== undefined) {
+						const fake = hooks.fakeResult;
+						hooks.fakeResult = undefined;
+						return fake;
 					}
 					return value;
 				})().then(resolve, reject);
@@ -639,6 +646,53 @@ test("a master deleted underfoot on an atomic driver is also reported vanished",
 	assert.equal(body.updated, 0);
 	assert.equal(body.vanished, 1);
 	assert.equal(eventsOf(sqlite, "user-2").length, 0);
+});
+
+test("a mysql-proxy root-array zero-row update is still reported vanished", async (t) => {
+	// drizzle mysql-proxy resolves UPDATEs as [{ insertId, affectedRows }] — a root array, not an
+	// object. The affected-row check has to read that shape or the count silently says "unknown".
+	const hooks = { beforeWrite: (db) => db.exec("DELETE FROM calendar_events WHERE user_id='user-2'") };
+	const sqlite = await sequentialDriver(t, seed, hooks);
+	const first = await app.route.POST(req(ics(vevent(["UID:mysql-shape", "DTSTART:20261102T090000Z", "SUMMARY:Before"]))));
+	assert.equal(first.status, 200);
+	hooks.fakeResult = [{ insertId: 0, affectedRows: 0 }];
+	const res = await app.route.POST(req(ics(vevent(["UID:mysql-shape", "DTSTART:20261102T090000Z", "SUMMARY:Revised"]))));
+	assert.equal(res.status, 200);
+	const body = await res.json();
+	assert.equal(body.updated, 0);
+	assert.equal(body.vanished, 1);
+	assert.equal(eventsOf(sqlite, "user-2").length, 0);
+});
+
+test("a vanished override update credits only overrides proven written", async (t) => {
+	// The override row is deleted inside the batch window: its UPDATE resolves zero rows, so the
+	// event reports vanished and overrides:0 — crediting the intended write would claim a phantom.
+	const { env, sqlite } = await newDatabase(t, seed);
+	globalThis.calImportUser = secondUser;
+	globalThis.calImportKey = null;
+	let armed = false;
+	globalThis.calImportEnv = { DB: new Proxy(env.DB, {
+		get: (target, prop) => {
+			const value = Reflect.get(target, prop);
+			if (prop !== "batch" || typeof value !== "function") return typeof value === "function" ? value.bind(target) : value;
+			return async (...args) => {
+				if (armed) { armed = false; sqlite.exec("DELETE FROM calendar_event_overrides WHERE event_id IN (SELECT id FROM calendar_events WHERE user_id='user-2')"); }
+				return value.apply(target, args);
+			};
+		},
+	}) };
+	const master = ["UID:series", "DTSTART:20261102T090000Z", "DTEND:20261102T100000Z", "SUMMARY:Series", "RRULE:FREQ=WEEKLY"];
+	const override = (start) => ["UID:series", "RECURRENCE-ID:20261109T090000Z", `DTSTART:${start}`, "DTEND:20261109T120000Z", "SUMMARY:Moved"];
+	const first = await app.route.POST(req(ics([...vevent(master), ...vevent(override("20261109T110000Z"))])));
+	assert.equal(first.status, 200);
+	assert.equal(overridesOf(sqlite, eventsOf(sqlite, "user-2")[0].id).length, 1);
+	armed = true;
+	const res = await app.route.POST(req(ics([...vevent(master), ...vevent(override("20261109T130000Z"))])));
+	assert.equal(res.status, 200);
+	const body = await res.json();
+	assert.equal(body.vanished, 1);
+	assert.equal(body.overrides, 0);
+	assert.equal(overridesOf(sqlite, eventsOf(sqlite, "user-2")[0].id).length, 0);
 });
 
 test("a vanished event before a failure stays out of the applied count", async (t) => {

@@ -92,6 +92,7 @@ export async function POST(request: Request) {
 	let imported = 0;
 	let unchanged = 0;
 	let vanished = 0;
+	let vanishedMasters = 0;
 	let overridesWritten = 0;
 	let failed: { index: number; event: ImportEventRow; error: unknown; reverted: boolean; outcome: FailureOutcome } | null = null;
 	for (const [index, event] of prepared.events.entries()) {
@@ -124,12 +125,13 @@ export async function POST(request: Request) {
 			continue;
 		}
 		let completed = 0;
-		let vanishedUnderfoot = false;
+		let vanishedAt = -1;
+		let results: unknown[] | null = null;
 		try {
 			if (atomic) {
-				const results = await db.batch(statements as [BatchItem<"sqlite">, ...BatchItem<"sqlite">[]]);
+				results = await db.batch(statements as [BatchItem<"sqlite">, ...BatchItem<"sqlite">[]]);
 				for (const [i, result] of results.entries()) {
-					if (mustHit[i] && rowsAffected(result) === 0) { vanishedUnderfoot = true; break; }
+					if (mustHit[i] && rowsAffected(result) === 0) { vanishedAt = i; break; }
 					completed += 1;
 				}
 			} else {
@@ -139,7 +141,7 @@ export async function POST(request: Request) {
 				// residue honestly and a re-import converges the event through the upsert path.
 				for (const [i, statement] of statements.entries()) {
 					const result = await statement;
-					if (mustHit[i] && rowsAffected(result) === 0) { vanishedUnderfoot = true; break; }
+					if (mustHit[i] && rowsAffected(result) === 0) { vanishedAt = i; break; }
 					completed += 1;
 				}
 			}
@@ -152,15 +154,24 @@ export async function POST(request: Request) {
 			failed = { index, event, error, reverted: atomic, outcome };
 			break;
 		}
-		if (vanishedUnderfoot) {
+		if (vanishedAt >= 0) {
 			// A row the preflight read proved was there is gone — deleted between the read and the
-			// write. The event is never counted applied: its committed prefix is residue the
+			// write. The event is never counted applied: its proven-committed writes are residue the
 			// "vanished" bucket admits, and a re-import converges the rest through the upsert path.
 			vanished += 1;
-			// On the atomic path a resolved batch committed every statement — even those after the
-			// vanished index — so all of this event's override writes landed. Sequentially, only
-			// the override statements resolved before the break did.
-			overridesWritten += atomic ? eventOverrides : Math.max(0, completed - (statements.length - eventOverrides));
+			// Master statements come first in each event's list; whether the vanished row was the
+			// event itself or only a stored override decides which residue the report describes.
+			const masterStatements = statements.length - eventOverrides;
+			if (vanishedAt < masterStatements) vanishedMasters += 1;
+			if (atomic) {
+				// A resolved batch committed every statement — even the override writes after the
+				// vanished index — but each only counts where its own result proves rows changed.
+				for (let i = masterStatements; i < statements.length; i++) {
+					if (!mustHit[i] || rowsAffected(results?.[i]) !== 0) overridesWritten += 1;
+				}
+			} else {
+				overridesWritten += Math.max(0, completed - masterStatements);
+			}
 			continue;
 		}
 		if (existing) changed.add(event.id);
@@ -169,7 +180,8 @@ export async function POST(request: Request) {
 	}
 	const errors = [...prepared.errors];
 	if (unchanged) errors.push(`${unchanged} unchanged event(s) already imported; skipped`);
-	if (vanished) errors.push(`${vanished} event(s) vanished mid-import — deleted by a concurrent change; re-importing re-adds them`);
+	if (vanishedMasters) errors.push(`${vanishedMasters} event(s) vanished mid-import — deleted by a concurrent change; re-importing re-adds them`);
+	if (vanished - vanishedMasters) errors.push(`${vanished - vanishedMasters} event(s) lost a stored override mid-import — deleted by a concurrent change; re-importing converges them`);
 	if (failed) {
 		const { index, event, error, reverted, outcome } = failed;
 		const label = `event #${index + 1}${event.title === "(untitled)" ? "" : ` "${event.title.slice(0, 60)}"`}`;
@@ -231,15 +243,16 @@ function overrideDiffers(existing: typeof calendarEventOverrides.$inferSelect, o
 
 /**
  * A resolved write statement's affected-row count across the layer's result shapes: D1/drizzle-d1
- * and the compat `run` report `meta.changes`; the pg and mysql proxies attach `affectedRows` (the
- * mysql proxy also nests it under `rows[0]`). Drivers that expose no count — the external sqlite
- * proxy resolves `{ rows: [] }` — return null, and only a proven zero is treated as "vanished".
+ * and the compat `run` report `meta.changes`; the pg proxy attaches `affectedRows` to its root
+ * rows array; the mysql proxy resolves a root array `[{ insertId, affectedRows }]` (and nests the
+ * same object under `rows[0]` in its callback payload). Drivers that expose no count — the
+ * external sqlite proxy resolves `{ rows: [] }` — return null: only a proven zero is "vanished".
  */
 function rowsAffected(result: unknown): number | null {
 	const shaped = result as { meta?: { changes?: unknown }; affectedRows?: unknown; rows?: { affectedRows?: unknown }[] } | null;
 	if (typeof shaped?.meta?.changes === "number") return shaped.meta.changes;
 	if (typeof shaped?.affectedRows === "number") return shaped.affectedRows;
-	const first = shaped?.rows?.[0];
+	const first = (Array.isArray(result) ? result[0] : shaped?.rows?.[0]) as { affectedRows?: unknown } | undefined;
 	return first && typeof first.affectedRows === "number" ? first.affectedRows : null;
 }
 
