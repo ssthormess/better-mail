@@ -576,6 +576,54 @@ test("a master deleted mid-import is not resurrected by the revert", async (t) =
 	assert.equal(eventsOf(sqlite, "user-2").length, 0);
 });
 
+test("an uncontended failed re-import restores the pre-write snapshot", async (t) => {
+	const sqlite = await sequentialDriver(t, seed);
+	const first = await app.route.POST(req(ics(vevent(["UID:snap", "DTSTART:20261102T090000Z", "DTEND:20261102T100000Z", "SUMMARY:Before", "RRULE:FREQ=WEEKLY"]))));
+	assert.equal(first.status, 200);
+	sqlite.exec(`CREATE TRIGGER fail_override BEFORE INSERT ON calendar_event_overrides WHEN NEW.occurrence_ms = ${Date.parse("2026-11-09T09:00:00Z")} BEGIN SELECT RAISE(ABORT, 'forced override failure'); END;`);
+	// The revision's master update commits at whole-second storage precision, then the override
+	// insert aborts: the revert must still recognise the row as this request's own write.
+	const res = await app.route.POST(req(ics([
+		...vevent(["UID:snap", "DTSTART:20261102T090000Z", "DTEND:20261102T100000Z", "SUMMARY:After", "RRULE:FREQ=WEEKLY"]),
+		...vevent(["UID:snap", "RECURRENCE-ID:20261109T090000Z", "DTSTART:20261109T110000Z", "DTEND:20261109T120000Z", "SUMMARY:Moved"]),
+	])));
+	assert.equal(res.status, 500);
+	const body = await res.json();
+	assert.equal(body.error, "IMPORT_PARTIAL_FAILURE");
+	assert.equal(body.failed, 1);
+	assert.equal(body.reverted, true);
+	const [row] = eventsOf(sqlite, "user-2");
+	assert.equal(row.title, "Before");
+	assert.equal(sqlite.prepare("SELECT COUNT(*) AS n FROM calendar_event_overrides o JOIN calendar_events e ON o.event_id = e.id WHERE e.user_id = 'user-2'").get().n, 0);
+});
+
+test("a master rewritten mid-import stays the competitor's and reports partial", async (t) => {
+	// Our master update commits, a concurrent request rewrites the event with different content,
+	// then the override insert fails: the revert must not clobber the competitor's revision.
+	let race = false;
+	const sqlite = await sequentialDriver(t, seed, {
+		afterWrite: async (sqlite) => {
+			if (!race) return;
+			race = false;
+			sqlite.exec("UPDATE calendar_events SET title = 'Competitor edit' WHERE user_id = 'user-2'");
+		},
+	});
+	const first = await app.route.POST(req(ics(vevent(["UID:clash", "DTSTART:20261102T090000Z", "DTEND:20261102T100000Z", "SUMMARY:Series", "RRULE:FREQ=WEEKLY"]))));
+	assert.equal(first.status, 200);
+	sqlite.exec(`CREATE TRIGGER fail_override BEFORE INSERT ON calendar_event_overrides WHEN NEW.occurrence_ms = ${Date.parse("2026-11-09T09:00:00Z")} BEGIN SELECT RAISE(ABORT, 'forced override failure'); END;`);
+	race = true;
+	const res = await app.route.POST(req(ics([
+		...vevent(["UID:clash", "DTSTART:20261102T090000Z", "DTEND:20261102T100000Z", "SUMMARY:Series revised", "RRULE:FREQ=WEEKLY"]),
+		...vevent(["UID:clash", "RECURRENCE-ID:20261109T090000Z", "DTSTART:20261109T110000Z", "DTEND:20261109T120000Z", "SUMMARY:Moved"]),
+	])));
+	assert.equal(res.status, 500);
+	const body = await res.json();
+	assert.equal(body.failed, 1);
+	assert.notEqual(body.reverted, true);
+	const [row] = eventsOf(sqlite, "user-2");
+	assert.equal(row.title, "Competitor edit");
+});
+
 test("the export feed for a fixed fixture still hashes to its pinned digest", async () => {
 	// Pins F21's download byte-for-byte on this branch: a fixed clock, one TZID series with an
 	// exclusion, an RSVP'd guest, a detached exception and an extra occurrence.

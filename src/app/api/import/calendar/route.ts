@@ -99,16 +99,14 @@ export async function POST(request: Request) {
 		if (!existing) {
 			writes.push({ run: db.insert(calendarEvents).values(event), undo: { kind: "master-insert", id: event.id, row: event } });
 		} else if (masterDiffers(existing, event)) {
-			const writtenUpdatedAt = new Date();
-			writes.push({ run: db.update(calendarEvents).set({ ...masterFields(event), updatedAt: writtenUpdatedAt }).where(eq(calendarEvents.id, event.id)), undo: { kind: "master-update", id: event.id, prior: existing, writtenUpdatedAt } });
+			writes.push({ run: db.update(calendarEvents).set({ ...masterFields(event), updatedAt: new Date() }).where(eq(calendarEvents.id, event.id)), undo: { kind: "master-update", id: event.id, prior: existing, written: event } });
 		}
 		for (const override of overridesByEvent.get(event.id) ?? []) {
 			const prior = existingPairs.get(`${override.eventId}:${override.occurrenceMs}`);
 			if (!prior) {
 				writes.push({ run: db.insert(calendarEventOverrides).values(override), undo: { kind: "override-insert", id: override.id, row: override } });
 			} else if (overrideDiffers(prior, override)) {
-				const writtenUpdatedAt = new Date();
-				writes.push({ run: db.update(calendarEventOverrides).set({ startsAt: override.startsAt, endsAt: override.endsAt, title: override.title, description: override.description, location: override.location, updatedAt: writtenUpdatedAt }).where(eq(calendarEventOverrides.id, prior.id)), undo: { kind: "override-update", id: prior.id, prior, writtenUpdatedAt } });
+				writes.push({ run: db.update(calendarEventOverrides).set({ startsAt: override.startsAt, endsAt: override.endsAt, title: override.title, description: override.description, location: override.location, updatedAt: new Date() }).where(eq(calendarEventOverrides.id, prior.id)), undo: { kind: "override-update", id: prior.id, prior, written: override } });
 			} else continue;
 			eventOverrides += 1;
 		}
@@ -205,20 +203,22 @@ function overrideDiffers(existing: typeof calendarEventOverrides.$inferSelect, o
  */
 type CommittedWrite =
 	| { kind: "master-insert"; id: string; row: ImportEventRow }
-	| { kind: "master-update"; id: string; prior: typeof calendarEvents.$inferSelect; writtenUpdatedAt: Date }
+	| { kind: "master-update"; id: string; prior: typeof calendarEvents.$inferSelect; written: ImportEventRow }
 	| { kind: "override-insert"; id: string; row: ImportOverrideRow }
-	| { kind: "override-update"; id: string; prior: typeof calendarEventOverrides.$inferSelect; writtenUpdatedAt: Date };
+	| { kind: "override-update"; id: string; prior: typeof calendarEventOverrides.$inferSelect; written: ImportOverrideRow };
 
 type RevertOutcome = "clean" | "conflict" | "partial";
 
 /**
- * Undo what this request committed before the failure. Every step re-reads the row first: an
- * insert is only deleted when the stored row still matches what was written, an update is only
- * restored when the row still carries the timestamp this request wrote (a concurrent request may
- * have deleted or rewritten it, and neither foreign rows nor resurrected ones are ours to touch).
- * "conflict" means the very first write failed — nothing of this request exists, so nothing runs;
- * the row that blocked it belongs to someone else. "partial" means some write could not be
- * provably reverted, so the response must not claim a clean revert.
+ * Undo what this request committed before the failure. Every step re-reads the row first and
+ * compares its stored fields to the values this request wrote: an insert is only deleted and an
+ * update only restored when the row still carries this request's content — a concurrent request
+ * may have deleted or rewritten it, and neither foreign rows nor resurrected ones are ours to
+ * touch. Field values are the guard because updatedAt is stored at whole-second precision, which
+ * cannot tell this request's write from a competitor's. "conflict" means the very first write
+ * failed — nothing of this request exists, so nothing runs; the row that blocked it belongs to
+ * someone else. "partial" means some write could not be provably reverted, so the response must
+ * not claim a clean revert.
  */
 async function revertCommitted(db: ReturnType<typeof getDb>, committed: CommittedWrite[], wasNew: boolean): Promise<RevertOutcome> {
 	if (!committed.length) return wasNew ? "conflict" : "clean";
@@ -231,8 +231,8 @@ async function revertCommitted(db: ReturnType<typeof getDb>, committed: Committe
 				if (masterDiffers(row, write.row)) { complete = false; continue; }
 				await db.delete(calendarEvents).where(eq(calendarEvents.id, write.id));
 			} else if (write.kind === "master-update") {
-				const [row] = await db.select({ updatedAt: calendarEvents.updatedAt }).from(calendarEvents).where(eq(calendarEvents.id, write.id));
-				if (!row || instant(row.updatedAt) !== instant(write.writtenUpdatedAt)) { complete = false; continue; }
+				const [row] = await db.select().from(calendarEvents).where(eq(calendarEvents.id, write.id));
+				if (!row || masterDiffers(row, write.written)) { complete = false; continue; }
 				await db.update(calendarEvents).set({ ...masterFields(write.prior), updatedAt: write.prior.updatedAt }).where(eq(calendarEvents.id, write.id));
 			} else if (write.kind === "override-insert") {
 				const [row] = await db.select().from(calendarEventOverrides).where(eq(calendarEventOverrides.id, write.id));
@@ -240,8 +240,8 @@ async function revertCommitted(db: ReturnType<typeof getDb>, committed: Committe
 				if (overrideDiffers(row, write.row)) { complete = false; continue; }
 				await db.delete(calendarEventOverrides).where(eq(calendarEventOverrides.id, write.id));
 			} else {
-				const [row] = await db.select({ updatedAt: calendarEventOverrides.updatedAt }).from(calendarEventOverrides).where(eq(calendarEventOverrides.id, write.id));
-				if (!row || instant(row.updatedAt) !== instant(write.writtenUpdatedAt)) { complete = false; continue; }
+				const [row] = await db.select().from(calendarEventOverrides).where(eq(calendarEventOverrides.id, write.id));
+				if (!row || overrideDiffers(row, write.written)) { complete = false; continue; }
 				await db.update(calendarEventOverrides).set({ startsAt: write.prior.startsAt, endsAt: write.prior.endsAt, title: write.prior.title, description: write.prior.description, location: write.prior.location, updatedAt: write.prior.updatedAt }).where(eq(calendarEventOverrides.id, write.id));
 			}
 		} catch {
