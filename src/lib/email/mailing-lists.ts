@@ -445,11 +445,12 @@ function ensureHeld(state: ExpansionState, list: ResolvedList): HeldRecord {
  * is deterministic — and the depth it carries is the shallowest traversal
  * so far: a cached result serves any query at equal or greater depth, a
  * shallower query re-traverses the recorded edges so the frontier a deep
- * reach capped still expands. The stored result answers re-entrant
- * queries mid-traversal (its entries and edges were complete at scan
- * time), so the DFS stack only ever cuts a genuinely uncomputed visit.
- * A held edge scans its child restricted whatever the parent ran; any
- * other edge inherits the parent's restriction.
+ * reach capped still expands. The stored result also answers re-entrant
+ * queries mid-traversal — its entries and edges were complete at scan
+ * time — but the DFS stack flags every re-entry a cycle, so the edge
+ * keeps the served content while the consuming branch records the
+ * truncation. A held edge scans its child restricted whatever the parent
+ * ran; any other edge inherits the parent's restriction.
  */
 async function expandList(
 	db: AppDatabase,
@@ -470,8 +471,13 @@ async function expandList(
 		result = slots.restricted = projectRestricted(slots.full);
 		derived = true;
 	}
+	// The cycle guard runs ahead of the cache: a re-entry on an in-flight
+	// compute is truncated by definition, so the edge flags the cycle even
+	// when a stored result can still serve its content. A query naming a
+	// list with nothing stored — or nothing the queried restriction can
+	// use — returns the flag alone.
+	if (state.computing.has(listId)) return { result: result ?? null, blocked: "cycle" };
 	if (result && !derived && result.depth <= depth) return { result, blocked: null };
-	if (state.computing.has(listId)) return { result: null, blocked: "cycle" };
 	if (depth >= MAX_LIST_EXPANSION_DEPTH) return { result: null, blocked: "depth" };
 
 	state.computing.add(listId);

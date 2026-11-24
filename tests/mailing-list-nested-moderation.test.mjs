@@ -687,3 +687,21 @@ test("the root stays incomplete and is never served as a cached complete", async
 	const healthy = await expandMailingListDeliveries(db, resolvedList("plain"), "stranger@ext.test");
 	assert.equal(healthy.complete, true);
 });
+
+test("a plain cycle re-entry flags blocked cycle even when the result can serve", async (t) => {
+	const { database } = await setup(t);
+	// A->B->A with no moderation: a is both in-flight and already stored,
+	// so b's back-edge hits the cache inside a live compute. The in-flight
+	// result may still serve its content, but the edge must carry
+	// blocked:"cycle" — without the flag nothing poisons and the root
+	// reports a truncated branch as fully verified.
+	insertList(database, { id: "a", localPart: "a", members: ["b@one.test"] });
+	insertList(database, { id: "b", localPart: "b", members: ["a@one.test"] });
+	const db = getDb({ DB: database });
+
+	const expansion = await expandMailingListDeliveries(db, resolvedList("a"), "stranger@ext.test");
+	assert.equal(expansion.complete, false);
+	// blocked:"cycle" on the unheld back-edge reports the member row as
+	// already-expanded — the observable evidence the cycle was flagged.
+	assert.deepEqual(expansion.skipped, [{ email: "a@one.test", reason: "already-expanded" }]);
+});
