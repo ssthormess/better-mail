@@ -9,12 +9,11 @@ import { normalizeTimeZone } from "@/lib/time/utils";
 import { chunkIds } from "./chunks";
 import { prepareCalendarImport, type ImportIdScheme, type ImportEventRow, type ImportOverrideRow, type PreparedCalendarImport } from "./ics-import";
 import { fetchCalendarFeed, FeedFetchError, type FeedFetchOptions } from "./subscription-feed";
+// The interval bounds live in a dependency-free module so the management UI can import them
+// without pulling the database stack into the browser bundle.
+import { DEFAULT_REFRESH_INTERVAL_SEC, MAX_REFRESH_INTERVAL_SEC, MIN_REFRESH_INTERVAL_SEC } from "./subscription-constants";
 
-/** The cron ticks every five minutes, so a shorter interval could never be honored. */
-export const MIN_REFRESH_INTERVAL_SEC = 300;
-/** A month between pulls is long enough for even the quietest feed. */
-export const MAX_REFRESH_INTERVAL_SEC = 30 * 24 * 3600;
-export const DEFAULT_REFRESH_INTERVAL_SEC = 3600;
+export { DEFAULT_REFRESH_INTERVAL_SEC, MAX_REFRESH_INTERVAL_SEC, MIN_REFRESH_INTERVAL_SEC };
 
 /** Subscriptions read per query; the run pages through all of them by id. */
 const SUBSCRIPTION_PAGE = 200;

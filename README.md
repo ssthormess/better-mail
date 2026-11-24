@@ -125,6 +125,7 @@ A schema change needs a migration for each database type. See [Databases](docs/d
 - [Databases](docs/databases.md)
 - [Sending and receiving providers](docs/providers.md)
 - [API and integrations](docs/api.md)
+- [Calendar feed subscriptions](docs/calendar-subscriptions.md)
 - [Email assistant and MCP](docs/email-assistant-and-mcp.md)
 - [Adding a language](docs/localization.md)
 - [Troubleshooting](docs/troubleshooting.md)

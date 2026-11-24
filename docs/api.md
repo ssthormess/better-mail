@@ -63,6 +63,12 @@ When you add attendees and choose a sending mailbox, Mailflare emails each atten
 | `POST /api/calendar/events` | Create an event (`{ title, startsAt, endsAt, description?, location?, attendees?, color?, repeat?, repeatDays?, timeZone?, mailboxId?, from? }`). If the event is saved but some invitations fail to send, the response is still successful and includes `inviteErrors`, the list of attendee addresses that were not emailed |
 | `PATCH /api/calendar/events/[eventId]` | Update an event or series. For a repeating event, pass an occurrence ID or `effectiveFrom` to change it from that occurrence onward. Like `POST`, the response carries `inviteErrors` when some updated invitations could not be sent |
 | `DELETE /api/calendar/events/[eventId]` | Delete an event, or a series from an occurrence onward |
+| `GET /api/calendar/subscriptions` | List the user's feed subscriptions (`id`, `feedUrl`, `title`, `refreshIntervalSec`, `lastRefreshAt`, `lastRefreshStatus`, `lastError`, `eventCount`, `etag`, `lastModified`) |
+| `POST /api/calendar/subscriptions` | Subscribe to an external calendar feed (`{ url, title?, refreshIntervalSec? }`). `webcal://` URLs are stored as `https`. The first fetch and import happen synchronously; the response is `{ subscription, added, skipped, errors }`. Errors: `400` invalid URL/title/interval or `INVALID_ICS`, `409` already subscribed, `413` `FEED_LIMIT_EXCEEDED`, `502`/`504` `FEED_FETCH_FAILED` |
+| `PATCH /api/calendar/subscriptions/[subscriptionId]` | Update a feed's `title` and/or `refreshIntervalSec` (300 s to 30 days) |
+| `DELETE /api/calendar/subscriptions/[subscriptionId]` | Unsubscribe; deletes the feed's events |
+
+Feed events are read-only inline events refreshed by the five-minute cron; see [Calendar feed subscriptions](calendar-subscriptions.md).
 
 These routes accept the dashboard session or an API key (`Authorization: Bearer <key>`) with the **Read calendar** (`calendar:read`) or **Manage calendar** (`calendar:write`) scope, which you choose when creating the key in **Settings → API keys**. A key can only send invitations if it also has the `send` scope for the chosen mailbox. MCP and the assistant use separate calendar tools, described in [Email assistant and MCP](email-assistant-and-mcp.md).
 
