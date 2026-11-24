@@ -1,11 +1,11 @@
 import { NextResponse } from "next/server";
-import { inArray } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { getDb } from "@/db";
 import { calendarEventOverrides, calendarEvents } from "@/db/schema";
 import { getEnv } from "@/lib/cloudflare";
 import { authorizeCalendarRequest } from "@/lib/calendar/api-auth";
 import { chunkIds } from "@/lib/calendar/chunks";
-import { IcsLimitError, IcsParseError, MAX_IMPORT_BYTES, prepareCalendarImport, type PreparedCalendarImport } from "@/lib/calendar/ics-import";
+import { IcsLimitError, IcsParseError, MAX_IMPORT_BYTES, prepareCalendarImport, type ImportEventRow, type ImportOverrideRow, type PreparedCalendarImport } from "@/lib/calendar/ics-import";
 import { RequestBodyTooLargeError } from "@/lib/http/errors";
 import { readFormDataBody, readRawBody } from "@/lib/http/request";
 import { getRequestTimeZone } from "@/lib/time/utils";
@@ -15,8 +15,8 @@ import { getRequestTimeZone } from "@/lib/time/utils";
  * KBs, and the cap (MAX_IMPORT_BYTES / MAX_IMPORT_EVENTS) bounds the work well under a request.
  * Accepts a raw text/calendar (or octet-stream) body, or multipart/form-data with the file in any
  * field. Floating times resolve in the request zone (?timeZone=, X-Time-Zone, then the user's
- * stored zone), the same chain event creation uses. Import ids are content hashes, so re-uploading
- * an unchanged file is a no-op rather than a second copy of everything.
+ * stored zone), the same chain event creation uses. Import ids are stable identity hashes, so a
+ * revised file upserts the events it first created instead of duplicating or going stale.
  */
 async function readIcsBody(request: Request): Promise<string> {
 	if ((request.headers.get("content-type") ?? "").startsWith("multipart/form-data")) {
@@ -50,32 +50,79 @@ export async function POST(request: Request) {
 		throw parseError;
 	}
 	const db = getDb(env);
-	// Event ids are deterministic content hashes scoped to the user, so an id that already exists
-	// is an unchanged re-import and is skipped. A changed file collides on nothing and inserts new.
-	const existingEvents = new Set<string>();
+	// Event ids are stable identity hashes scoped to the user. An id that already exists is the same
+	// event the file describes again: the file is the newer snapshot, so its fields update in place
+	// and the response counts the row as updated rather than silently skipping it.
+	const existingById = new Map<string, typeof calendarEvents.$inferSelect>();
 	for (const chunk of chunkIds(prepared.events.map((event) => event.id))) {
-		for (const row of await db.select({ id: calendarEvents.id }).from(calendarEvents).where(inArray(calendarEvents.id, chunk))) existingEvents.add(row.id);
+		for (const row of await db.select().from(calendarEvents).where(and(inArray(calendarEvents.id, chunk), eq(calendarEvents.userId, user.id)))) existingById.set(row.id, row);
 	}
-	const toInsert = prepared.events.filter((event) => !existingEvents.has(event.id));
 	const writableIds = new Set(prepared.events.map((event) => event.id));
-	for (const event of toInsert) await db.insert(calendarEvents).values(event);
-	// Overrides dedupe on the table's natural key (eventId, occurrenceMs): an occurrence that already
-	// has an override — from an earlier import or a UI edit — is left alone, while new extras and
-	// exceptions on an already-imported series still land.
-	const existingPairs = new Set<string>();
-	for (const chunk of chunkIds([...writableIds])) {
-		for (const row of await db.select({ eventId: calendarEventOverrides.eventId, occurrenceMs: calendarEventOverrides.occurrenceMs }).from(calendarEventOverrides).where(inArray(calendarEventOverrides.eventId, chunk))) {
-			existingPairs.add(`${row.eventId}:${row.occurrenceMs}`);
+	const changed = new Set<string>();
+	let imported = 0;
+	for (const event of prepared.events) {
+		const existing = existingById.get(event.id);
+		if (!existing) {
+			await db.insert(calendarEvents).values(event);
+			imported += 1;
+			continue;
+		}
+		if (masterDiffers(existing, event)) {
+			await db.update(calendarEvents).set({ ...masterFields(event), updatedAt: new Date() }).where(eq(calendarEvents.id, event.id));
+			changed.add(event.id);
+		}
+	}
+	// Overrides upsert on the table's natural key (eventId, occurrenceMs): an occurrence the file
+	// still describes is inserted when missing or updated when its content moved, while overrides
+	// the file no longer mentions — a UI edit, or one a different file added — are left alone.
+	// An import adds and updates; it never deletes user data.
+	const existingPairs = new Map<string, typeof calendarEventOverrides.$inferSelect>();
+	for (const chunk of chunkIds([...writableIds].filter((id) => existingById.has(id)))) {
+		for (const row of await db.select().from(calendarEventOverrides).where(inArray(calendarEventOverrides.eventId, chunk))) {
+			existingPairs.set(`${row.eventId}:${row.occurrenceMs}`, row);
 		}
 	}
 	let overridesWritten = 0;
 	for (const override of prepared.overrides) {
-		if (!writableIds.has(override.eventId) || existingPairs.has(`${override.eventId}:${override.occurrenceMs}`)) continue;
-		await db.insert(calendarEventOverrides).values(override);
+		if (!writableIds.has(override.eventId)) continue;
+		const existing = existingPairs.get(`${override.eventId}:${override.occurrenceMs}`);
+		if (!existing) {
+			await db.insert(calendarEventOverrides).values(override);
+		} else if (overrideDiffers(existing, override)) {
+			await db.update(calendarEventOverrides).set({ startsAt: override.startsAt, endsAt: override.endsAt, title: override.title, description: override.description, location: override.location, updatedAt: new Date() }).where(eq(calendarEventOverrides.id, existing.id));
+		} else continue;
 		overridesWritten += 1;
+		if (existingById.has(override.eventId)) changed.add(override.eventId);
 	}
-	const duplicates = prepared.events.length - toInsert.length;
+	const unchanged = [...existingById.keys()].filter((id) => !changed.has(id)).length;
 	const errors = [...prepared.errors];
-	if (duplicates) errors.push(`${duplicates} unchanged event(s) already imported; skipped`);
-	return NextResponse.json({ imported: toInsert.length, overrides: overridesWritten, skipped: prepared.skipped + duplicates, errors });
+	if (unchanged) errors.push(`${unchanged} unchanged event(s) already imported; skipped`);
+	return NextResponse.json({ imported, updated: changed.size, overrides: overridesWritten, skipped: prepared.skipped + unchanged, errors });
+}
+
+/** The event columns an import owns — identity (id/userId), mailbox linkage and invite state are never touched. */
+const MASTER_COLUMNS = ["title", "description", "location", "attendees", "color", "repeat", "repeatDays", "repeatAnchorDay", "repeatUntil", "repeatInterval", "repeatWeekday", "repeatWeek", "excludedOccurrences", "timeZone", "startsAt", "endsAt", "reminderMinutes"] as const;
+
+function masterFields(event: ImportEventRow): Partial<typeof calendarEvents.$inferInsert> {
+	return Object.fromEntries(MASTER_COLUMNS.map((column) => [column, event[column]])) as Partial<typeof calendarEvents.$inferInsert>;
+}
+
+const instant = (value: unknown): number | null => (value instanceof Date ? value.getTime() : null);
+
+function masterDiffers(existing: typeof calendarEvents.$inferSelect, event: ImportEventRow): boolean {
+	return MASTER_COLUMNS.some((column) => {
+		const a = existing[column];
+		const b = event[column];
+		return a instanceof Date || b instanceof Date ? instant(a) !== instant(b) : a !== b;
+	});
+}
+
+const OVERRIDE_COLUMNS = ["startsAt", "endsAt", "title", "description", "location"] as const;
+
+function overrideDiffers(existing: typeof calendarEventOverrides.$inferSelect, override: ImportOverrideRow): boolean {
+	return OVERRIDE_COLUMNS.some((column) => {
+		const a = existing[column];
+		const b = override[column];
+		return a instanceof Date || b instanceof Date ? instant(a) !== instant(b) : a !== b;
+	});
 }

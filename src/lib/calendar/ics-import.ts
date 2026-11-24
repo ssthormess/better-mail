@@ -13,11 +13,14 @@ import { dateFromZonedFields, isValidTimeZone, normalizeTimeZone, zonedDateField
  * defaults, and no invitations are sent.
  *
  * Deliberate mapping decisions (documented for the caller and surfaced in `errors`):
- * - Dedup: there is no uid column, so ids are deterministic content hashes — `evt_i_<sha256>` of
- *   userId, the file UID and every stored field. Re-importing an unchanged file is a no-op
- *   (reported as skipped), while any changed field produces new events: an edited export does not
- *   update a previous import, it coexists with it. Override ids hash only (userId, eventId,
- *   occurrenceMs) because (eventId, occurrenceMs) is the table's natural key.
+ * - Dedup: there is no uid column, so identity comes from the file UID — `evt_i_<sha256>` of
+ *   (userId, "uid", UID), and a detached occurrence imported without its master keys on
+ *   (userId, UID, RECURRENCE-ID instant). A revised file lands on the same row and the route
+ *   upserts: master fields update from the file, overrides insert or update per
+ *   (eventId, occurrenceMs), and local-only overrides are left alone. Events with no UID fall
+ *   back to a content hash of every stored field: an identical re-import is still skipped, while
+ *   a changed one coexists as a second event — with no stable identity there is nothing to update.
+ *   Override ids hash only (userId, eventId, occurrenceMs), the table's natural key.
  * - TZID resolution prefers Intl (the expander's own tz source). An Intl-unknown TZID resolves
  *   through the file's VTIMEZONE for the stored instants, but no IANA name exists to store, so the
  *   series recurs in UTC — noted per event. A TZID neither knows resolves as floating.
@@ -548,7 +551,8 @@ export async function prepareCalendarImport(text: string, options: { userId: str
 	try {
 		parsed = ICAL.parse(text.replace(/^\uFEFF/, ""));
 	} catch (error) {
-		throw new IcsParseError(error instanceof Error ? error.message : "not an iCalendar file");
+		// Parser diagnostics carry a useful message; an internal TypeError on non-calendar bytes does not.
+		throw new IcsParseError(error instanceof Error && !(error instanceof TypeError) ? error.message : "not an iCalendar file");
 	}
 	// Concatenated VCALENDAR documents parse to a list of jCals; one document is a single jCal.
 	const documents = (Array.isArray(parsed) && Array.isArray(parsed[0]) ? parsed : [parsed]) as unknown[];
@@ -590,11 +594,15 @@ export async function prepareCalendarImport(text: string, options: { userId: str
 		try {
 			if (!group.masters.length) {
 				// Orphaned detached occurrences (Google exports them when a series shrank): each one is
-				// still a real event, imported standalone with its RECURRENCE-ID ignored.
+				// still a real event, imported standalone with its RECURRENCE-ID ignored for content
+				// but used for identity — it is what tells this orphan from the series' other orphans.
 				for (const orphan of group.detached) {
 					const built = buildGroup(orphan, [], [], ctx, label, note, false);
 					if (built) {
-						const row = await finishEvent(built, group.uid, options.userId);
+						const ridProperty = orphan.getFirstProperty("recurrence-id");
+						const rid = ridProperty?.getFirstValue();
+						const ridMs = rid instanceof ICAL.Time ? resolveTime(rid, tzidOf(ridProperty), ctx, label).at.getTime() : null;
+						const row = await finishEvent(built, group.uid !== null && ridMs !== null ? `${group.uid}#${ridMs}` : null, options.userId);
 						events.push(row.event);
 						overrides.push(...row.overrides);
 						note(`${label}: a detached occurrence without its series was imported as a single event`);
@@ -621,12 +629,17 @@ export async function prepareCalendarImport(text: string, options: { userId: str
 	return { events, overrides, skipped, errors };
 }
 
-async function finishEvent(built: BuiltEvent, uid: string | null, userId: string): Promise<{ event: ImportEventRow; overrides: ImportOverrideRow[] }> {
+/**
+ * The deterministic event id. `seed` is the stable identity the file provides — the UID, or
+ * UID#RECURRENCE-ID for an orphaned detached occurrence — so re-importing a revision finds the same
+ * row and updates it. Without a seed (no UID at all) the id hashes every stored field instead: an
+ * unchanged re-import is skipped, and a changed file produces a second event because nothing ties
+ * it to the first.
+ */
+async function finishEvent(built: BuiltEvent, seed: string | null, userId: string): Promise<{ event: ImportEventRow; overrides: ImportOverrideRow[] }> {
 	const { row, overrides } = built;
-	// The deterministic id covers everything stored, so an identical re-import collides and is
-	// skipped while any real change produces a distinct event.
-	const material = JSON.stringify([uid ?? "", row.title, row.description, row.location, row.attendees, row.color, row.repeat, row.repeatDays, row.repeatAnchorDay, row.repeatUntil?.getTime() ?? null, row.repeatInterval, row.repeatWeekday, row.repeatWeek, row.excludedOccurrences, row.timeZone, row.startsAt.getTime(), row.endsAt.getTime(), row.reminderMinutes]);
-	const id = `evt_i_${await sha256Hex(`${userId}${material}`)}`;
+	const material = JSON.stringify([row.title, row.description, row.location, row.attendees, row.color, row.repeat, row.repeatDays, row.repeatAnchorDay, row.repeatUntil?.getTime() ?? null, row.repeatInterval, row.repeatWeekday, row.repeatWeek, row.excludedOccurrences, row.timeZone, row.startsAt.getTime(), row.endsAt.getTime(), row.reminderMinutes]);
+	const id = `evt_i_${await sha256Hex(seed === null ? `${userId}fields:${material}` : `${userId}uid:${seed}`)}`;
 	const overrideRows = [...overrides.values()].sort((a, b) => a.occurrenceMs - b.occurrenceMs);
 	const overrideIds = await Promise.all(overrideRows.map((override) => sha256Hex(`${userId}${id}${override.occurrenceMs}`)));
 	return {

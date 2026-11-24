@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 import { loadApp } from "./helpers/real-db.mjs";
 
@@ -14,6 +15,7 @@ const { app, newDatabase } = await loadApp("cal-import", `
 	export * as exportRoute from "./src/app/api/export/calendar/route.ts";
 	export { normalizeCalendarColor } from "./src/lib/calendar/colors.ts";
 	export { MAX_IMPORT_EVENTS } from "./src/lib/calendar/ics-import.ts";
+	export { buildCalendarFeed } from "./src/lib/calendar/feed.ts";
 `, { mocks });
 
 const sec = (iso) => Math.floor(Date.parse(iso) / 1000);
@@ -145,6 +147,7 @@ test("re-importing an unchanged file is a no-op, not a second copy", async (t) =
 	assert.equal((await (await app.route.POST(req(body))).json()).imported, 1);
 	const again = await (await app.route.POST(req(body))).json();
 	assert.equal(again.imported, 0);
+	assert.equal(again.updated, 0);
 	assert.equal(again.skipped, 1);
 	assert.equal(eventsOf(sqlite, "user-2").length, 1);
 	// The same file for another user is its own event: ids are scoped per user.
@@ -304,4 +307,117 @@ test("an export round-trips through import field-for-field", async (t) => {
 			}
 		}
 	}
+});
+
+test("a revised file upserts the same event instead of duplicating or going stale", async (t) => {
+	const sqlite = await setup(t, { user: secondUser });
+	const file = (moved, title = "Master") => ics([
+		...vevent(["UID:series", "DTSTART:20261102T090000Z", "DTEND:20261102T100000Z", `SUMMARY:${title}`, "RRULE:FREQ=WEEKLY"]),
+		...vevent(["UID:series", "RECURRENCE-ID:20261109T090000Z", `DTSTART:${moved}T090000Z`, `DTEND:${moved}T100000Z`, "SUMMARY:Moved"]),
+	]);
+	assert.equal((await (await app.route.POST(req(file("20261109")))).json()).imported, 1);
+	// An identical re-import writes nothing and says so.
+	const same = await (await app.route.POST(req(file("20261109")))).json();
+	assert.deepEqual([same.imported, same.updated, same.skipped], [0, 0, 1]);
+	// A moved detached occurrence updates the stored override in place on the same event.
+	const moved = await (await app.route.POST(req(file("20261110")))).json();
+	assert.deepEqual([moved.imported, moved.updated], [0, 1]);
+	const [event] = eventsOf(sqlite, "user-2");
+	assert.equal(event.title, "Master");
+	const [override] = overridesOf(sqlite, event.id);
+	assert.equal(override.occurrence_ms, Date.parse("2026-11-09T09:00:00Z"));
+	assert.equal(override.starts_at, sec("2026-11-10T09:00:00Z"));
+	// A changed master field lands on the same row — the file is the newer snapshot, not a new series.
+	const renamed = await (await app.route.POST(req(file("20261110", "Renamed")))).json();
+	assert.deepEqual([renamed.imported, renamed.updated], [0, 1]);
+	assert.equal(eventsOf(sqlite, "user-2").length, 1);
+	assert.equal(eventsOf(sqlite, "user-2")[0].title, "Renamed");
+	// An override the file no longer describes is user data: left alone, never deleted.
+	const dropped = await (await app.route.POST(req(ics(vevent(["UID:series", "DTSTART:20261102T090000Z", "DTEND:20261102T100000Z", "SUMMARY:Renamed", "RRULE:FREQ=WEEKLY"]))))).json();
+	assert.equal(dropped.updated, 0);
+	assert.equal(overridesOf(sqlite, event.id).length, 1);
+});
+
+test("zone resolution prefers Intl, then the file's VTIMEZONE, then the floating zone", async (t) => {
+	const sqlite = await setup(t, { user: secondUser });
+	const lying = L(
+		"BEGIN:VCALENDAR", "VERSION:2.0",
+		// A VTIMEZONE that contradicts Intl: same TZID, a bogus +03:00 offset. Intl wins.
+		"BEGIN:VTIMEZONE", "TZID:America/New_York", "BEGIN:STANDARD", "DTSTART:19670101T000000", "TZOFFSETFROM:+0300", "TZOFFSETTO:+0300", "END:STANDARD", "END:VTIMEZONE",
+		...vevent(["UID:lie", "DTSTART;TZID=America/New_York:20261104T090000", "SUMMARY:trusted zone"]),
+		// A TZID nothing resolves — not Intl, not the file — falls back to the floating zone.
+		...vevent(["UID:nowhere", "DTSTART;TZID=Mars/Olympus:20261104T090000", "SUMMARY:lost zone"]),
+		"END:VCALENDAR");
+	const res = await app.route.POST(req(lying));
+	assert.equal(res.status, 200);
+	const body = await res.json();
+	const rows = Object.fromEntries(eventsOf(sqlite, "user-2").map((row) => [row.title, row]));
+	// 09:00 EST per Intl is 14:00Z; the lying VTIMEZONE would have made it 06:00Z.
+	assert.equal(rows["trusted zone"].starts_at, sec("2026-11-04T14:00:00Z"));
+	assert.equal(rows["trusted zone"].time_zone, "America/New_York");
+	// The unknown zone reads in the user's zone (UTC here) and keeps it for recurrence.
+	assert.equal(rows["lost zone"].starts_at, sec("2026-11-04T09:00:00Z"));
+	assert.equal(rows["lost zone"].time_zone, "UTC");
+	assert.ok(body.errors.some((e) => e.includes('unknown TZID "Mars/Olympus"')));
+});
+
+test("COUNT and UNTIL bound a series at their earliest honest instant", async (t) => {
+	const sqlite = await setup(t, { user: secondUser });
+	const body = await (await app.route.POST(req(ics([
+		// COUNT=1 produces exactly DTSTART, so the bound lands one second after it.
+		...vevent(["UID:c1", "DTSTART:20261102T090000Z", "SUMMARY:count one", "RRULE:FREQ=DAILY;COUNT=1"]),
+		// An EXDATE removes a counted occurrence without extending the series: COUNT is of rule
+		// instances, so the bound stays the third day even though the second is excluded.
+		...vevent(["UID:c-ex", "DTSTART:20261102T090000Z", "SUMMARY:count exdate", "RRULE:FREQ=DAILY;COUNT=3", "EXDATE:20261103T090000Z"]),
+		// An UNTIL earlier than the COUNT bound wins.
+		...vevent(["UID:c-u", "DTSTART:20261102T090000Z", "SUMMARY:count until", "RRULE:FREQ=DAILY;COUNT=10;UNTIL=20261104T090000Z"]),
+		// A local UNTIL resolves in the event zone across a DST edge: 09:00 on March 8 is EDT
+		// (13:00Z) after the 2am spring-forward, not the EST reading of 14:00Z.
+		...vevent(["UID:c-dst", "DTSTART;TZID=America/New_York:20260301T090000", "SUMMARY:dst until", "RRULE:FREQ=DAILY;UNTIL=20260308T090000"]),
+		// The same edge in UTC form: the last occurrence's instant sits on the EDT side of the jump.
+		...vevent(["UID:c-dstu", "DTSTART;TZID=America/New_York:20260301T090000", "SUMMARY:dst until utc", "RRULE:FREQ=DAILY;UNTIL=20260308T130000Z"]),
+	])))).json();
+	assert.equal(body.imported, 5);
+	const rows = Object.fromEntries(eventsOf(sqlite, "user-2").map((row) => [row.title, row]));
+	assert.equal(rows["count one"].repeat_until, sec("2026-11-02T09:00:01Z"));
+	assert.equal(rows["count exdate"].repeat_until, sec("2026-11-04T09:00:01Z"));
+	assert.deepEqual(JSON.parse(rows["count exdate"].excluded_occurrences), [Date.parse("2026-11-03T09:00:00Z")]);
+	assert.equal(rows["count until"].repeat_until, sec("2026-11-04T09:00:01Z"));
+	assert.equal(rows["dst until"].repeat_until, sec("2026-03-08T13:00:01Z"));
+	assert.equal(rows["dst until utc"].repeat_until, sec("2026-03-08T13:00:01Z"));
+});
+
+test("an octet-stream body imports and damaged bytes fail cleanly", async (t) => {
+	const sqlite = await setup(t, { user: secondUser });
+	const octet = new Request("http://localhost/api/import/calendar", { method: "POST", headers: { "content-type": "application/octet-stream" }, body: ics(vevent(["UID:bin", "DTSTART:20261103T170000Z", "SUMMARY:octet"])) });
+	assert.equal((await app.route.POST(octet)).status, 200);
+	assert.equal(eventsOf(sqlite, "user-2")[0].title, "octet");
+	for (const damaged of [
+		"\x00\x01\x02PNG\x89PNGgarbage\x00\xff", // binary, not iCalendar at all
+		"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:x\r\nDTSTART:20261103T170000Z\r\nSUMMA", // truncated mid-line
+		"BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:x\r\nDTSTART:20261103T170", // truncated, unclosed components
+	]) {
+		const res = await app.route.POST(req(damaged));
+		assert.equal(res.status, 400, JSON.stringify(damaged.slice(0, 30)));
+		assert.equal((await res.json()).error, "INVALID_ICS");
+	}
+});
+
+test("the export feed for a fixed fixture still hashes to its pinned digest", async () => {
+	// Pins F21's download byte-for-byte on this branch: a fixed clock, one TZID series with an
+	// exclusion, an RSVP'd guest, a detached exception and an extra occurrence.
+	const events = [{
+		id: "evt-fixture", title: "Fixture sync", description: "desc", location: "Room",
+		startsAt: new Date("2026-11-02T17:00:00Z"), endsAt: new Date("2026-11-02T17:30:00Z"),
+		repeat: "weekly", repeatDays: "[]", repeatAnchorDay: null, repeatUntil: null, repeatInterval: 1,
+		repeatWeekday: null, repeatWeek: null, excludedOccurrences: "[1763600400000]", timeZone: "America/New_York",
+		attendees: '["guest@example.com"]', attendeeResponses: '{"guest@example.com":"accepted"}', reminderMinutes: 15,
+		updatedAt: new Date("2026-11-01T00:00:00Z"), responseStatus: null,
+	}];
+	const overrides = new Map([["evt-fixture", [
+		{ occurrenceMs: 1762995600000, startsAt: new Date("2026-11-12T22:00:00Z"), endsAt: new Date("2026-11-12T22:30:00Z"), title: "Moved", description: null, location: null },
+		{ occurrenceMs: 1764190800000, startsAt: new Date("2026-11-26T19:00:00Z"), endsAt: new Date("2026-11-26T19:30:00Z"), title: null, description: null, location: null },
+	]]]);
+	const feed = app.buildCalendarFeed(events, { name: "Mailflare", now: new Date("2026-11-05T12:00:00Z"), download: true }, overrides);
+	assert.equal(createHash("sha256").update(feed).digest("hex"), "1c1476acebcb173b34bcf7d74e3341543c5866c27587e842610e54066bf4ba87");
 });
