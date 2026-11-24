@@ -1,0 +1,307 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { loadApp } from "./helpers/real-db.mjs";
+
+// POST /api/import/calendar writes user events from an .ics upload; it is the inverse of the
+// GET /api/export/calendar download, so the same fixture round-trips field-for-field.
+const mocks = {
+	"@/lib/cloudflare": `export function getEnv(){return globalThis.calImportEnv}`,
+	"@/lib/auth/cookies": `export async function getCurrentUser(){return globalThis.calImportUser}`,
+	"@/lib/api/key-auth": `export async function authenticateApiRequest(){return globalThis.calImportKey} export async function authenticateApiKeyValue(){return null} export function hasScope(scopes,required){return scopes.includes(required)||scopes.includes("*")}`,
+};
+const { app, newDatabase } = await loadApp("cal-import", `
+	export * as route from "./src/app/api/import/calendar/route.ts";
+	export * as exportRoute from "./src/app/api/export/calendar/route.ts";
+	export { normalizeCalendarColor } from "./src/lib/calendar/colors.ts";
+	export { MAX_IMPORT_EVENTS } from "./src/lib/calendar/ics-import.ts";
+`, { mocks });
+
+const sec = (iso) => Math.floor(Date.parse(iso) / 1000);
+const monday = sec("2026-11-02T17:00:00Z"); // 09:00 in America/Los_Angeles
+
+const seed = `
+	INSERT INTO users (id, email, password_hash, name, role, created_at) VALUES
+		('user-1', 'u@example.com', 'hash', 'User', 'user', 1),
+		('user-2', 'v@example.com', 'hash', 'Empty', 'user', 1);
+	INSERT INTO calendar_events (id, user_id, title, description, location, attendees, repeat, repeat_days, repeat_anchor_day, repeat_until, repeat_interval, repeat_weekday, repeat_week, excluded_occurrences, time_zone, reminder_minutes, starts_at, ends_at, created_at, updated_at) VALUES
+		('evt-one', 'user-1', 'One, off; "quoted"', 'Line one\nLine two, é', 'Room, 2', '["Guest@Example.com ","other@example.com","not-an-email"]', 'none', '[]', NULL, NULL, 1, NULL, NULL, '[]', NULL, 15, ${sec("2026-11-03T17:00:00Z")}, ${sec("2026-11-03T18:00:00Z")}, 1, 1),
+		('evt-daily', 'user-1', 'Every other day', '', '', '[]', 'daily', '[]', NULL, ${sec("2026-11-10T17:00:00Z")}, 2, NULL, NULL, '[]', NULL, NULL, ${monday}, ${monday + 1800}, 1, 1),
+		('evt-weekly', 'user-1', 'Weekly sync', 'Weekly notes', '', '[]', 'weekly', '[]', NULL, NULL, 1, NULL, NULL, '[${Date.parse("2026-11-09T17:00:00Z")}]', 'America/Los_Angeles', NULL, ${monday}, ${monday + 1800}, 1, 1),
+		('evt-weekdays', 'user-1', 'Mon Wed Fri', '', '', '[]', 'weekdays', '[1,3,5]', NULL, NULL, 1, NULL, NULL, '[]', NULL, NULL, ${monday}, ${monday + 1800}, 1, 1),
+		('evt-monthly', 'user-1', 'Monthly', '', '', '[]', 'monthly', '[]', 15, NULL, 1, NULL, NULL, '[]', NULL, NULL, ${monday}, ${monday + 1800}, 1, 1),
+		('evt-monthly31', 'user-1', 'End of month', '', '', '[]', 'monthly', '[]', 31, NULL, 1, NULL, NULL, '[]', NULL, NULL, ${monday}, ${monday + 1800}, 1, 1),
+		('evt-nth', 'user-1', 'Second Tuesday', '', '', '[]', 'monthly', '[]', NULL, NULL, 1, 2, 2, '[]', NULL, NULL, ${monday}, ${monday + 1800}, 1, 1),
+		('evt-fifth', 'user-1', 'Fifth Monday', '', '', '[]', 'monthly', '[]', NULL, NULL, 1, 1, 5, '[]', NULL, NULL, ${sec("2026-03-30T17:00:00Z")}, ${sec("2026-03-30T17:30:00Z")}, 1, 1),
+		('evt-leap', 'user-1', 'Leap day', '', '', '[]', 'yearly', '[]', NULL, NULL, 1, NULL, NULL, '[]', NULL, NULL, ${sec("2024-02-29T17:00:00Z")}, ${sec("2024-02-29T17:30:00Z")}, 1, 1),
+		('evt-yearly', 'user-1', 'Yearly', '', '', '[]', 'yearly', '[]', NULL, NULL, 1, NULL, NULL, '[]', NULL, NULL, ${monday}, ${monday + 1800}, 1, 1),
+		('evt-count', 'user-1', 'Count ten', '', '', '[]', 'daily', '[]', NULL, NULL, 1, NULL, NULL, '[]', NULL, NULL, ${monday}, ${monday + 1800}, 1, 1),
+		('evt-old', 'user-1', 'Since 1970', '', '', '[]', 'daily', '[]', NULL, NULL, 1, NULL, NULL, '[]', NULL, NULL, ${sec("1970-01-01T17:00:00Z")}, ${sec("1970-01-01T18:00:00Z")}, 1, 1);
+	INSERT INTO calendar_event_overrides (id, event_id, occurrence_ms, starts_at, ends_at, title, description, location, created_at, updated_at) VALUES
+		('ov-1', 'evt-weekly', ${Date.parse("2026-11-16T17:00:00Z")}, ${sec("2026-11-16T19:00:00Z")}, ${sec("2026-11-16T20:00:00Z")}, 'Moved sync', NULL, 'Video', 1, 1),
+		('ov-2', 'evt-weekly', ${Date.parse("2026-11-12T17:00:00Z")}, ${sec("2026-11-12T17:00:00Z")}, ${sec("2026-11-12T17:30:00Z")}, NULL, NULL, NULL, 1, 1),
+		('ov-4', 'evt-weekdays', ${Date.parse("2026-11-05T17:00:00Z")}, ${sec("2026-11-05T17:00:00Z")}, ${sec("2026-11-05T17:30:00Z")}, NULL, NULL, NULL, 1, 1),
+		('ov-5', 'evt-old', ${Date.parse("1970-01-01T17:00:00Z") + 20000 * 86400000}, ${sec("2024-10-04T19:00:00Z")}, ${sec("2024-10-04T20:00:00Z")}, 'Still edited', NULL, NULL, 1, 1);
+`;
+
+const sessionUser = { id: "user-1", calendarEnabled: true, timeZone: "UTC" };
+const secondUser = { id: "user-2", calendarEnabled: true, timeZone: "UTC" };
+const keyWith = (scopes, user = sessionUser) => ({ keyId: "k1", userId: user.id, scopes, mailboxIds: null, user });
+const req = (body, headers = {}) => new Request("http://localhost/api/import/calendar", { method: "POST", headers: { "content-type": "text/calendar", ...headers }, body });
+
+async function setup(t, { user = sessionUser, key = null, seedSql = seed } = {}) {
+	const { env, sqlite } = await newDatabase(t, seedSql);
+	globalThis.calImportEnv = env;
+	globalThis.calImportUser = user;
+	globalThis.calImportKey = key;
+	return sqlite;
+}
+
+const ics = (lines) => `BEGIN:VCALENDAR\r\nVERSION:2.0\r\n${lines.join("\r\n")}\r\nEND:VCALENDAR\r\n`;
+const vevent = (lines) => ["BEGIN:VEVENT", ...lines, "END:VEVENT"];
+
+const eventsOf = (sqlite, userId) => sqlite.prepare("SELECT * FROM calendar_events WHERE user_id = ? ORDER BY title").all(userId);
+const overridesOf = (sqlite, eventId) => sqlite.prepare("SELECT * FROM calendar_event_overrides WHERE event_id = ? ORDER BY occurrence_ms").all(eventId);
+
+test("a session user imports a raw text/calendar body", async (t) => {
+	const sqlite = await setup(t, { user: secondUser });
+	const res = await app.route.POST(req(ics(vevent(["UID:a-1", "DTSTART:20261103T170000Z", "DTEND:20261103T180000Z", "SUMMARY:Hello"]))));
+	assert.equal(res.status, 200);
+	const body = await res.json();
+	assert.equal(body.imported, 1);
+	assert.equal(body.skipped, 0);
+	assert.deepEqual(body.errors, []);
+	const [event] = eventsOf(sqlite, "user-2");
+	assert.equal(event.title, "Hello");
+	assert.equal(event.starts_at, sec("2026-11-03T17:00:00Z"));
+	assert.equal(event.ends_at, sec("2026-11-03T18:00:00Z"));
+	// Imported events are user events: the invitation columns stay at their defaults.
+	assert.equal(event.response_status, null);
+	assert.equal(event.invite_sender, null);
+	assert.equal(event.event_sequence, 0);
+});
+
+test("a Bearer key needs the calendar:write scope", async (t) => {
+	const body = ics(vevent(["UID:a-1", "DTSTART:20261103T170000Z", "SUMMARY:x"]));
+	await setup(t, { user: null, key: keyWith(["calendar:read"]) });
+	assert.equal((await app.route.POST(req(body, { authorization: "Bearer ep_k" }))).status, 403);
+	await setup(t, { user: null, key: keyWith(["calendar:write"], secondUser) });
+	assert.equal((await app.route.POST(req(body, { authorization: "Bearer ep_k" }))).status, 200);
+});
+
+test("no session and no key is a 401", async (t) => {
+	await setup(t, { user: null });
+	assert.equal((await app.route.POST(req(ics(vevent(["UID:x", "DTSTART:20261103T170000Z", "SUMMARY:x"]))))).status, 401);
+});
+
+test("malformed input gets a clean 4xx, never a 500", async (t) => {
+	await setup(t);
+	for (const [body, error] of [
+		["this is not ics", "INVALID_ICS"],
+		["", "Empty calendar file"],
+		["   ", "Empty calendar file"],
+		[ics([]), "INVALID_ICS"], // parses, but holds no events
+	]) {
+		const res = await app.route.POST(req(body));
+		assert.equal(res.status, 400, `status for ${JSON.stringify(body.slice(0, 30))}`);
+		assert.equal((await res.json()).error, error);
+	}
+	// A VEVENT without DTSTART is skipped per event, not a whole-file failure.
+	const res = await app.route.POST(req(ics([...vevent(["UID:no-dt", "SUMMARY:no dtstart"]), ...vevent(["UID:ok", "DTSTART:20261103T170000Z", "SUMMARY:ok"])])));
+	assert.equal(res.status, 200);
+	const json = await res.json();
+	assert.equal(json.imported, 1);
+	assert.equal(json.skipped, 1);
+	assert.ok(json.errors.some((e) => e.includes("no-dt")));
+});
+
+test("oversized input fails explicitly with IMPORT_LIMIT_EXCEEDED", async (t) => {
+	await setup(t);
+	const res = await app.route.POST(req("BEGIN:VCALENDAR", { "content-length": String(5 * 1024 * 1024) }));
+	assert.equal(res.status, 413);
+	assert.equal((await res.json()).error, "IMPORT_LIMIT_EXCEEDED");
+});
+
+test("more than MAX_IMPORT_EVENTS events fails explicitly", async (t) => {
+	await setup(t);
+	const vevents = Array.from({ length: app.MAX_IMPORT_EVENTS + 1 }, (_, i) => vevent([`UID:m-${i}`, "DTSTART:20261103T170000Z", "SUMMARY:x"])).flat();
+	const res = await app.route.POST(req(ics(vevents)));
+	assert.equal(res.status, 413);
+	assert.equal((await res.json()).error, "IMPORT_LIMIT_EXCEEDED");
+});
+
+test("a multipart file upload imports the same way", async (t) => {
+	const sqlite = await setup(t, { user: secondUser });
+	const form = new FormData();
+	form.append("file", new File([ics(vevent(["UID:mp-1", "DTSTART:20261103T170000Z", "SUMMARY:from file"]))], "cal.ics", { type: "text/calendar" }));
+	const res = await app.route.POST(new Request("http://localhost/api/import/calendar", { method: "POST", body: form }));
+	assert.equal(res.status, 200);
+	assert.equal((await res.json()).imported, 1);
+	assert.equal(eventsOf(sqlite, "user-2")[0].title, "from file");
+});
+
+test("re-importing an unchanged file is a no-op, not a second copy", async (t) => {
+	const sqlite = await setup(t, { user: secondUser });
+	const body = ics(vevent(["UID:dup", "DTSTART:20261103T170000Z", "SUMMARY:dup"]));
+	assert.equal((await (await app.route.POST(req(body))).json()).imported, 1);
+	const again = await (await app.route.POST(req(body))).json();
+	assert.equal(again.imported, 0);
+	assert.equal(again.skipped, 1);
+	assert.equal(eventsOf(sqlite, "user-2").length, 1);
+	// The same file for another user is its own event: ids are scoped per user.
+	globalThis.calImportUser = sessionUser;
+	const other = await (await app.route.POST(req(body))).json();
+	assert.equal(other.imported, 1);
+	assert.equal(eventsOf(sqlite, "user-1").filter((event) => event.title === "dup").length, 1);
+});
+
+const L = (...lines) => `${lines.join("\r\n")}\r\n`;
+const googleFixture = L(
+	"BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Google Inc//Google Calendar 70.9054//EN",
+	"BEGIN:VTIMEZONE", "TZID:America/New_York",
+	"BEGIN:STANDARD", "DTSTART:20071104T020000", "RRULE:FREQ=YEARLY;BYMONTH=11;BYDAY=1SU", "TZOFFSETFROM:-0400", "TZOFFSETTO:-0500", "TZNAME:EST", "END:STANDARD",
+	"BEGIN:DAYLIGHT", "DTSTART:20070311T020000", "RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=2SU", "TZOFFSETFROM:-0500", "TZOFFSETTO:-0400", "TZNAME:EDT", "END:DAYLIGHT",
+	"END:VTIMEZONE",
+	...vevent(["UID:g-1", "DTSTAMP:20261101T000000Z", "DTSTART;TZID=America/New_York:20261104T090000", "DTEND;TZID=America/New_York:20261104T100000", "SUMMARY:Google weekly", "RRULE:FREQ=WEEKLY;BYDAY=WE;COUNT=6", "EXDATE;TZID=America/New_York:20261111T090000"]),
+	...vevent(["UID:g-1", "RECURRENCE-ID;TZID=America/New_York:20261118T090000", "DTSTART;TZID=America/New_York:20261118T110000", "DTEND;TZID=America/New_York:20261118T120000", "SUMMARY:Google weekly moved"]),
+	// Feb-29 yearly, foreign form (no BYMONTH/BYSETPOS encoding).
+	...vevent(["UID:f-leap", "DTSTART:20240229T090000Z", "DTEND:20240229T100000Z", "SUMMARY:leap", "RRULE:FREQ=YEARLY"]),
+	// Fifth-weekday monthly clamps to "last" like the app's own 5 does.
+	...vevent(["UID:f-5th", "DTSTART:20260330T090000Z", "DTEND:20260330T100000Z", "SUMMARY:fifth", "RRULE:FREQ=MONTHLY;BYDAY=5MO"]),
+	// A detached occurrence on no rule instant becomes an extra occurrence.
+	...vevent(["UID:f-det", "DTSTART:20261102T090000Z", "DTEND:20261102T100000Z", "SUMMARY:det master", "RRULE:FREQ=WEEKLY"]),
+	...vevent(["UID:f-det", "RECURRENCE-ID:20261105T090000Z", "DTSTART:20261105T150000Z", "DTEND:20261105T160000Z", "SUMMARY:det extra", "DESCRIPTION:moved"]),
+	// Floating time resolves in the request/user zone (America/New_York here).
+	...vevent(["UID:f-float", "DTSTART:20261103T090000", "DTEND:20261103T100000", "SUMMARY:floating"]),
+	// All-day DATE events become midnight to midnight in the resolved zone.
+	...vevent(["UID:f-day", "DTSTART;VALUE=DATE:20261105", "DTEND;VALUE=DATE:20261106", "SUMMARY:all day"]),
+	// A display alarm maps to reminder minutes; other actions are noted and skipped.
+	...vevent(["UID:f-alarm", "DTSTART:20261103T090000Z", "SUMMARY:alarmed", "BEGIN:VALARM", "ACTION:EMAIL", "TRIGGER:-PT10M", "END:VALARM", "BEGIN:VALARM", "ACTION:DISPLAY", "TRIGGER:-PT30M", "END:VALARM"]),
+	// A rule the model cannot express degrades to a single occurrence with a note.
+	...vevent(["UID:f-unsup", "DTSTART:20261102T090000Z", "SUMMARY:unsup", "RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,WE"]),
+	// DTSTART on a weekday the BYDAY filter excludes stays an instance via an extra.
+	...vevent(["UID:f-anchor", "DTSTART:20261104T090000Z", "DTEND:20261104T093000Z", "SUMMARY:anchor", "RRULE:FREQ=WEEKLY;BYDAY=TU"]),
+	// A cancelled detached occurrence excludes its instant.
+	...vevent(["UID:f-cd", "DTSTART:20261102T090000Z", "SUMMARY:cd", "RRULE:FREQ=DAILY;COUNT=5"]),
+	...vevent(["UID:f-cd", "RECURRENCE-ID:20261104T090000Z", "DTSTART:20261104T090000Z", "STATUS:CANCELLED"]),
+	// An orphan detached occurrence imports standalone.
+	...vevent(["UID:f-orph", "RECURRENCE-ID:20261109T090000Z", "DTSTART:20261109T120000Z", "DTEND:20261109T130000Z", "SUMMARY:orphan"]),
+	// A custom zone resolves through the file's VTIMEZONE but recurs in UTC.
+	"BEGIN:VTIMEZONE", "TZID:Custom/Zone", "BEGIN:STANDARD", "DTSTART:19670101T000000", "TZOFFSETFROM:+0300", "TZOFFSETTO:+0300", "END:STANDARD", "END:VTIMEZONE",
+	...vevent(["UID:f-cz", "DTSTART;TZID=Custom/Zone:20261102T090000", "DTEND;TZID=Custom/Zone:20261102T100000", "SUMMARY:custom zone", "RRULE:FREQ=DAILY;COUNT=3"]),
+	"END:VCALENDAR");
+
+test("a foreign file maps honestly onto the app model", async (t) => {
+	const sqlite = await setup(t, { user: { id: "user-2", calendarEnabled: true, timeZone: "America/New_York" } });
+	const res = await app.route.POST(req(googleFixture));
+	assert.equal(res.status, 200);
+	const body = await res.json();
+	assert.equal(body.imported, 12);
+	assert.equal(body.skipped, 0);
+	const rows = Object.fromEntries(eventsOf(sqlite, "user-2").map((row) => [row.title, row]));
+
+	// TZID resolves through Intl: 09:00 EST -> 14:00Z, and the zone name is stored.
+	const google = rows["Google weekly"];
+	assert.equal(google.repeat, "weekly");
+	assert.equal(google.time_zone, "America/New_York");
+	assert.equal(google.starts_at, sec("2026-11-04T14:00:00Z"));
+	assert.equal(google.repeat_until, sec("2026-12-09T14:00:01Z")); // COUNT=6 -> sixth Wednesday + 1s.
+	assert.deepEqual(JSON.parse(google.excluded_occurrences), [Date.parse("2026-11-11T14:00:00Z")]);
+	const gOverrides = overridesOf(sqlite, google.id);
+	assert.equal(gOverrides.length, 1);
+	assert.equal(gOverrides[0].occurrence_ms, Date.parse("2026-11-18T14:00:00Z"));
+	assert.equal(gOverrides[0].starts_at, sec("2026-11-18T16:00:00Z"));
+	assert.equal(gOverrides[0].title, "Google weekly moved");
+
+	assert.equal(rows["leap"].repeat, "yearly");
+	assert.equal(rows["fifth"].repeat, "monthly");
+	assert.equal(rows["fifth"].repeat_weekday, 1);
+	assert.equal(rows["fifth"].repeat_week, -1);
+
+	const detOverrides = overridesOf(sqlite, rows["det master"].id);
+	assert.equal(detOverrides.length, 1);
+	assert.equal(detOverrides[0].occurrence_ms, Date.parse("2026-11-05T09:00:00Z"));
+	assert.equal(detOverrides[0].starts_at, sec("2026-11-05T15:00:00Z"));
+	assert.equal(detOverrides[0].title, "det extra");
+	assert.equal(detOverrides[0].description, "moved");
+
+	// Floating reads in the user's zone (EST = UTC-5) and keeps it for recurrence.
+	assert.equal(rows["floating"].starts_at, sec("2026-11-03T14:00:00Z"));
+	assert.equal(rows["floating"].time_zone, "America/New_York");
+	// All-day: midnight to midnight in the resolved zone.
+	assert.equal(rows["all day"].starts_at, sec("2026-11-05T05:00:00Z"));
+	assert.equal(rows["all day"].ends_at, sec("2026-11-06T05:00:00Z"));
+
+	assert.equal(rows["alarmed"].reminder_minutes, 30);
+	assert.equal(rows["unsup"].repeat, "none");
+	assert.equal(rows["orphan"].repeat, "none");
+	assert.equal(rows["orphan"].starts_at, sec("2026-11-09T12:00:00Z"));
+
+	// The Tuesday-filtered series keeps its Wednesday DTSTART as an extra occurrence.
+	const anchor = rows["anchor"];
+	assert.equal(anchor.repeat, "weekdays");
+	assert.equal(anchor.repeat_days, "[2]");
+	const aOverrides = overridesOf(sqlite, anchor.id);
+	assert.equal(aOverrides.length, 1);
+	assert.equal(aOverrides[0].occurrence_ms, Date.parse("2026-11-04T09:00:00Z"));
+
+	// The cancelled detached occurrence lands in excludedOccurrences.
+	assert.deepEqual(JSON.parse(rows["cd"].excluded_occurrences), [Date.parse("2026-11-04T09:00:00Z")]);
+	assert.equal(rows["cd"].repeat_until, sec("2026-11-06T09:00:01Z"));
+
+	// The custom zone resolves instants through its VTIMEZONE (+03:00) and recurs in UTC.
+	const custom = rows["custom zone"];
+	assert.equal(custom.starts_at, sec("2026-11-02T06:00:00Z"));
+	assert.equal(custom.time_zone, null);
+	assert.equal(custom.repeat_until, sec("2026-11-04T06:00:01Z"));
+
+	// The notes explain every dropped piece.
+	assert.ok(body.errors.some((e) => e.includes("ACTION=EMAIL")));
+	assert.ok(body.errors.some((e) => e.includes("not supported; imported as a single occurrence")));
+	assert.ok(body.errors.some((e) => e.includes("VTIMEZONE")));
+	assert.ok(body.errors.some((e) => e.includes("without its series")));
+});
+
+test("an export round-trips through import field-for-field", async (t) => {
+	const sqlite = await setup(t);
+	const download = await app.exportRoute.GET(new Request("http://localhost/api/export/calendar"));
+	assert.equal(download.status, 200);
+	const text = await download.text();
+
+	globalThis.calImportUser = secondUser;
+	const res = await app.route.POST(req(text));
+	assert.equal(res.status, 200);
+	const body = await res.json();
+	assert.equal(body.skipped, 0);
+
+	const expectedColor = app.normalizeCalendarColor(undefined);
+	const originals = Object.fromEntries(eventsOf(sqlite, "user-1").map((row) => [row.title, row]));
+	const imported = Object.fromEntries(eventsOf(sqlite, "user-2").map((row) => [row.title, row]));
+	assert.deepEqual(Object.keys(imported).sort(), Object.keys(originals).sort());
+	const lastWeek = (week) => (week === 5 ? -1 : week); // the app reads a fifth week as "last".
+	for (const [title, want] of Object.entries(originals)) {
+		const got = imported[title];
+		for (const column of ["title", "description", "location", "repeat", "repeat_days", "repeat_anchor_day", "repeat_interval", "repeat_weekday", "repeat_until", "excluded_occurrences", "time_zone", "starts_at", "ends_at", "reminder_minutes"]) {
+			assert.deepEqual(got[column], want[column], `${title}.${column}`);
+		}
+		assert.deepEqual(lastWeek(got.repeat_week), lastWeek(want.repeat_week), `${title}.repeat_week`);
+		// COLOR is not exported, so the import lands on the app default.
+		assert.equal(got.color, expectedColor, `${title}.color`);
+		// The exported attendee list is the trimmed, valid subset of what was stored.
+		const wantAttendees = JSON.parse(want.attendees).map((a) => a.trim()).filter((a) => /^[^\s<>",;:@]+@[^\s<>",;:@]+$/.test(a));
+		assert.deepEqual(JSON.parse(got.attendees), wantAttendees, `${title}.attendees`);
+		// Overrides match by occurrence; a text field the file restated compares against the
+		// effective value (a null override field inherits the series value).
+		const gotOverrides = overridesOf(sqlite, got.id);
+		const wantOverrides = overridesOf(sqlite, want.id);
+		assert.equal(gotOverrides.length, wantOverrides.length, `${title} overrides`);
+		for (const [index, wantOverride] of wantOverrides.entries()) {
+			const gotOverride = gotOverrides[index];
+			assert.equal(gotOverride.occurrence_ms, wantOverride.occurrence_ms, `${title} override ${index} occurrence_ms`);
+			assert.equal(gotOverride.starts_at, wantOverride.starts_at, `${title} override ${index} starts_at`);
+			assert.equal(gotOverride.ends_at, wantOverride.ends_at, `${title} override ${index} ends_at`);
+			for (const column of ["title", "description", "location"]) {
+				assert.equal(gotOverride[column] ?? want[column], wantOverride[column] ?? want[column], `${title} override ${index} ${column}`);
+			}
+		}
+	}
+});

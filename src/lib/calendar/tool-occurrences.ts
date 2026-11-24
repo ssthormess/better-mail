@@ -47,7 +47,8 @@ function nthWeekday(event: RecurrenceFields): { weekday: number; week: number } 
 		: null;
 }
 
-function occurrenceStart(event: RecurrenceFields, index: number): Date {
+/** The start instant of the series' index-th rule step (index 0 is the master start). Exported for the .ics importer, which walks it to turn an RRULE COUNT into a repeatUntil bound. */
+export function occurrenceStart(event: RecurrenceFields, index: number): Date {
 	if (index === 0) return event.startsAt;
 	// A listed-days repeat steps day by day and filters by weekday, so its interval is always 1.
 	const interval = event.repeat === "weekdays" ? 1 : validInterval(event.repeatInterval);
