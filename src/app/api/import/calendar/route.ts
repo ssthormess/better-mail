@@ -3,6 +3,7 @@ import { and, eq, inArray } from "drizzle-orm";
 import type { BatchItem } from "drizzle-orm/batch";
 import { getDb } from "@/db";
 import { isExternalDatabase } from "@/db/external";
+import { isUniqueConstraintError } from "@/lib/database-errors";
 import { calendarEventOverrides, calendarEvents } from "@/db/schema";
 import { getEnv } from "@/lib/cloudflare";
 import { authorizeCalendarRequest } from "@/lib/calendar/api-auth";
@@ -129,7 +130,11 @@ export async function POST(request: Request) {
 				}
 			}
 		} catch (error) {
-			const outcome: FailureOutcome = atomic ? "clean" : !existing && completed === 0 ? "conflict" : "partial";
+			// On HTTP drivers a rejected statement only means the response failed — the write may
+			// have committed remotely. "conflict" is reserved for a proven unique violation, the
+			// one failure kind where the database itself guarantees nothing was written; every
+			// other first-write failure admits the event may be partially applied.
+			const outcome: FailureOutcome = atomic ? "clean" : !existing && completed === 0 && isUniqueConstraintError(error) ? "conflict" : "partial";
 			failed = { index, event, error, reverted: atomic, outcome };
 			break;
 		}
@@ -199,8 +204,8 @@ function overrideDiffers(existing: typeof calendarEventOverrides.$inferSelect, o
 
 /**
  * How a failed event ended: "clean" is a real rollback (transactional drivers only), "conflict" is
- * a first-write failure on a new event where the row that blocked it belongs to someone else, and
- * "partial" is a mid-event failure on a sequential driver whose committed prefix honestly stays —
- * undo there could destroy a concurrent writer's work, so residue is reported, never claimed away.
+ * a proven duplicate-identity failure — the only kind where the write is guaranteed uncommitted —
+ * and "partial" is every other sequential-path failure whose committed prefix honestly stays.
+ * Undo there could destroy a concurrent writer's work, so residue is reported, never claimed away.
  */
 type FailureOutcome = "clean" | "conflict" | "partial";

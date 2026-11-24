@@ -432,11 +432,13 @@ test("a write failure rolls back its whole event and reports what was applied", 
 // honestly reports no transaction, so the route writes sequentially — the shape lazyExecutor
 // produces for HTTP protocols. hooks.beforeWrite/afterWrite run around each committed write
 // statement, letting a test act as a concurrent request between this one's statements; hooks.spy,
-// when an array, records every mutating statement kind the route issues.
+// when an array, records every mutating statement kind the route issues; hooks.failWith rejects
+// the NEXT awaited write with the given error after it committed — a lost HTTP response.
 async function sequentialDriver(t, seedSql, hooks = {}) {
 	const { sqlite, db } = await newDatabase(t, seedSql);
 	globalThis.calImportUser = secondUser;
 	globalThis.calImportKey = null;
+	const racy = hooks.beforeWrite || hooks.afterWrite || hooks.failWith !== undefined;
 	// Wrap every builder in the chain (insert().values(), update().set().where()) so the statement
 	// the route awaits runs the hooks around its execution — a concurrent request between writes.
 	const wrapChain = (obj) => new Proxy(obj, {
@@ -448,6 +450,11 @@ async function sequentialDriver(t, seedSql, hooks = {}) {
 					if (hooks.beforeWrite) await hooks.beforeWrite(sqlite);
 					const value = await target;
 					if (hooks.afterWrite) await hooks.afterWrite(sqlite);
+					if (hooks.failWith) {
+						const failure = hooks.failWith;
+						hooks.failWith = undefined;
+						throw failure;
+					}
 					return value;
 				})().then(resolve, reject);
 			}
@@ -464,7 +471,7 @@ async function sequentialDriver(t, seedSql, hooks = {}) {
 			createDrizzle: () => new Proxy(db, {
 				get: (target, prop) => {
 					if (hooks.spy && (prop === "insert" || prop === "update" || prop === "delete")) hooks.spy.push(prop);
-					if ((hooks.beforeWrite || hooks.afterWrite) && (prop === "insert" || prop === "update")) return (...args) => wrapChain(Reflect.get(target, prop).apply(target, args));
+					if (racy && (prop === "insert" || prop === "update")) return (...args) => wrapChain(Reflect.get(target, prop).apply(target, args));
 					return Reflect.get(target, prop);
 				},
 			}),
@@ -589,6 +596,22 @@ test("a master deleted mid-import is never written back", async (t) => {
 	assert.notEqual(body.reverted, true);
 	assert.equal(eventsOf(sqlite, "user-2").length, 0);
 	assert.deepEqual(spy.filter((kind) => kind !== "insert"), ["update"]); // the one committed update; nothing after
+});
+
+test("a first-write failure that may have committed admits it", async (t) => {
+	// The master insert commits remotely, then the HTTP response is lost: completed===0 only proves
+	// the response failed, so the report must admit the event may exist — never claim it wasn't applied.
+	const sqlite = await sequentialDriver(t, seed, { failWith: new Error("HTTP response lost after database committed") });
+	const res = await app.route.POST(req(ics(vevent(["UID:ambiguous", "DTSTART:20261102T090000Z", "SUMMARY:Committed"]))));
+	assert.equal(res.status, 500);
+	const body = await res.json();
+	assert.equal(body.error, "IMPORT_PARTIAL_FAILURE");
+	assert.equal(body.failed, 1);
+	assert.notEqual(body.reverted, true);
+	assert.ok(body.detail.includes("partially applied"));
+	assert.ok(!body.detail.includes("not applied"));
+	assert.ok(!body.detail.includes("conflicting event"));
+	assert.equal(eventsOf(sqlite, "user-2").length, 1); // the write really did commit
 });
 
 test("an uncontended failed re-import admits its own committed residue", async (t) => {
