@@ -74,9 +74,12 @@ interface CloudflareEnv {
 	GITHUB_UPDATE_REPO?: string;
 	/**
 	 * "node" when served by the self-hosted runtime in server/; "cloudflare" when deployed on
-	 * hosted Cloudflare Workers (wrangler vars — the positive public-only-egress assertion).
-	 * Unset on a Workers-family runtime means hosted egress cannot be proven and
-	 * egress-sensitive code must fail closed.
+	 * hosted Cloudflare Workers — the positive public-only-egress assertion. Set it as a Worker
+	 * variable or secret on the hosted deployment only (dashboard / `wrangler secret` / CI):
+	 * never in wrangler vars or .dev.vars, which reach `wrangler dev`, where workerd has real
+	 * private egress and the assertion would be false. Pairs with global_fetch_strictly_public —
+	 * the two must move together in deployment config. Unset on a Workers-family runtime means
+	 * hosted egress cannot be proven and egress-sensitive code must fail closed.
 	 */
 	MAILFLARE_RUNTIME?: "node" | "cloudflare";
 	/** Shared secret the Cloudflare email relay signs inbound webhooks with (self-hosted only). */

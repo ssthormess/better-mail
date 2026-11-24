@@ -508,6 +508,24 @@ test("a Workers runtime that cannot assert hosted public egress fails closed", a
 	assert.equal(calls.length, 0, "nothing was fetched unpinned on an unasserted Workers runtime");
 });
 
+test("the checked-in wrangler configs cannot carry the hosted-egress assertion into local dev", async () => {
+	// vars in wrangler config reach `wrangler dev` unchanged, and local workerd has real private
+	// egress — the assertion would be a lie there (gate-proved: a local workerd with the repo's
+	// config fetched 127.0.0.1:200). The hosted deployment sets MAILFLARE_RUNTIME as a Worker
+	// variable/secret only, so no checked-in config may assign it the asserted value — in any
+	// scope (top-level vars, env.<name>.vars, or dev overrides), present or future.
+	const { readFile } = await import("node:fs/promises");
+	const asserted = /"MAILFLARE_RUNTIME"\s*:\s*"cloudflare"/;
+	for (const file of ["wrangler.jsonc", "wrangler.jsonc.example"]) {
+		const config = await readFile(new URL(`../${file}`, import.meta.url), "utf-8");
+		assert.equal(asserted.test(config), false, `${file} must not assign the hosted-egress assertion`);
+	}
+	// A dev.vars override key belongs to wrangler 3; the local override file is .dev.vars, which
+	// is gitignored — the only committed local scope is .dev.vars.example, and it must not set it.
+	const devVarsExample = await readFile(new URL("../.dev.vars.example", import.meta.url), "utf-8");
+	assert.equal(/^MAILFLARE_RUNTIME\s*=/m.test(devVarsExample), false, ".dev.vars.example must not assert hosted egress");
+});
+
 test("a cancelled-only snapshot keeps the stored events and records the anomaly", async (t) => {
 	const { env, sqlite } = await setup(t);
 	let body = feedV1;

@@ -55,8 +55,9 @@ export type FeedFetchOptions = {
 	pinConnection?: (hostname: string, addresses: string[]) => Promise<FeedConnectionPin>;
 	/**
 	 * The deployment positively asserts its fetch egress is public-internet-only — on this repo
-	 * that is MAILFLARE_RUNTIME=cloudflare, set by the hosted deployment's wrangler vars (which
-	 * also enable the global_fetch_strictly_public compat flag). Workers-family runtimes have no
+	 * that is MAILFLARE_RUNTIME=cloudflare, set as a Worker variable/secret on the hosted
+	 * deployment only (dashboard, `wrangler secret`, CI — never wrangler vars, which `wrangler
+	 * dev` would inherit while having real private egress). Workers-family runtimes have no
 	 * socket pin and rely on this assertion; unset means it was not made and they fail closed.
 	 */
 	publicEgressAsserted?: boolean;

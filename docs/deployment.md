@@ -122,6 +122,12 @@ npm run db:migrate:remote
 
 Remote migrations require the target account's `database_id` in your local `wrangler.jsonc`. Do not commit an account-specific database ID to a reusable repository.
 
+## Deployment-managed runtime variables
+
+Some values are deployment state, not shared config: set them as Worker variables or secrets (dashboard, `npx wrangler secret put`, or CI env) — never in `wrangler.jsonc` `vars`, which `wrangler dev` reads unchanged, and never in `.dev.vars`, which only exists for local dev.
+
+`MAILFLARE_RUNTIME=cloudflare` is the one the hosted deployment needs: it asserts that the Worker's fetch egress is public-internet-only, which the webcal subscription guard relies on — without it, feed fetches fail closed on Workers (`pinning_unavailable`) rather than trust an egress they cannot prove. It must move together with the `global_fetch_strictly_public` compatibility flag: the code cannot inspect compat flags at runtime, so a deployment that keeps the variable but drops the flag asserts a guarantee that does not exist. Self-hosted workerd deployments allow private egress and must not set it; local `wrangler dev` must stay unasserted the same way, which is why the value cannot live in committed config.
+
 ## Object storage (R2, Backblaze B2 or AWS S3)
 
 Raw mail, attachments, Drive files, avatars, branding icons, JMAP uploads and backups all live in one bucket. By default that is the `BUCKET` R2 binding in `wrangler.jsonc`. To use Backblaze B2 instead, set four Worker variables (as secrets, or in `.dev.vars` locally):

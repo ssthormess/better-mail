@@ -1,3 +1,7 @@
+# Do NOT set MAILFLARE_RUNTIME here or anywhere in local dev: it asserts hosted Cloudflare's
+# public-only fetch egress, which local workerd does not have — egress-sensitive code (webcal
+# feeds) must stay fail-closed on this runtime. The hosted deployment sets it only.
+
 # Preferred: scoped API token.
 # This is an app runtime token, not the Cloudflare deploy/build token.
 CF_TOKEN=your_api_token_with_zone_email_permissions

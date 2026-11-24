@@ -20,8 +20,12 @@ export function isNodeRuntime(env?: Pick<CloudflareEnv, "MAILFLARE_RUNTIME">): b
  * True only when the deployment positively asserts its fetch egress is public-internet-only —
  * hosted Cloudflare Workers, where the platform refuses non-public destinations and the worker
  * config also sets the global_fetch_strictly_public compat flag. MAILFLARE_RUNTIME=cloudflare is
- * that assertion, declared in wrangler vars; a self-hosted workerd can allow private egress and
- * must not set it, so anything but the explicit value reads false — callers must fail closed.
+ * that assertion, set as a Worker variable or secret on the hosted deployment only (dashboard,
+ * `wrangler secret`, CI): it must NOT live in wrangler vars, which `wrangler dev` reads
+ * unchanged — local workerd has real private egress, so the assertion would be false there, and
+ * a self-hosted workerd can allow private egress for the same reason. The flag is
+ * runtime-invisible, so the var and the compat flag must move together in deployment config.
+ * Anything but the explicit value reads false — callers must fail closed.
  */
 export function hasPublicEgressGuarantee(env?: Pick<CloudflareEnv, "MAILFLARE_RUNTIME">): boolean {
 	return (env ?? getNodeEnv())?.MAILFLARE_RUNTIME === "cloudflare";

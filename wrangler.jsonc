@@ -8,12 +8,10 @@
 		"nodejs_compat",
 		"global_fetch_strictly_public"
 	],
-	"vars": {
-		// Positive assertion of hosted-Workers semantics — the platform's public-only fetch
-		// egress above — so egress-sensitive code (webcal feeds) can rely on it and fail closed
-		// everywhere else. Self-hosted workerd can allow private egress and must not set this.
-		"MAILFLARE_RUNTIME": "cloudflare",
-	},
+	// MAILFLARE_RUNTIME is deliberately NOT set here: vars reach `wrangler dev` unchanged, and
+	// local workerd has real private egress, so the hosted-egress assertion would be false there.
+	// It is a Worker variable/secret set on the hosted deployment only (dashboard, `wrangler
+	// secret`, or CI) — keep_vars preserves it across deploys. See docs/deployment.md.
 	"assets": {
 		"binding": "ASSETS",
 		"not_found_handling": "none",
