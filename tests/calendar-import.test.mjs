@@ -428,20 +428,41 @@ test("a write failure rolls back its whole event and reports what was applied", 
 	assert.ok(!body.detail.includes("forced override failure"));
 });
 
-// env.DB fakes a Neon-class external driver: the drizzle handle is real, but its batch runs
-// statements sequentially and the executor honestly reports no transaction — the shape
-// lazyExecutor produces for HTTP protocols. Returns the handle to the raw sqlite for triggers.
-async function sequentialDriver(t, seedSql) {
+// env.DB fakes a Neon-class external driver: the drizzle handle is real, but the executor
+// honestly reports no transaction, so the route writes sequentially — the shape lazyExecutor
+// produces for HTTP protocols. hooks.beforeWrite/afterWrite run around each committed write
+// statement, letting a test act as a concurrent request between this one's statements.
+async function sequentialDriver(t, seedSql, hooks = {}) {
 	const { sqlite, db } = await newDatabase(t, seedSql);
 	globalThis.calImportUser = secondUser;
 	globalThis.calImportKey = null;
+	// Wrap every builder in the chain (insert().values(), update().set().where()) so the statement
+	// the route awaits runs the hooks around its execution — a concurrent request between writes.
+	const wrapChain = (obj) => new Proxy(obj, {
+		get: (target, prop) => {
+			if (prop === "then") {
+				const then = Reflect.get(target, prop);
+				if (typeof then !== "function") return then;
+				return (resolve, reject) => (async () => {
+					if (hooks.beforeWrite) await hooks.beforeWrite(sqlite);
+					const value = await target;
+					if (hooks.afterWrite) await hooks.afterWrite(sqlite);
+					return value;
+				})().then(resolve, reject);
+			}
+			const value = Reflect.get(target, prop);
+			if (typeof value !== "function") return value;
+			return (...args) => {
+				const out = value.apply(target, args);
+				return out && typeof out === "object" ? wrapChain(out) : out;
+			};
+		},
+	});
 	globalThis.calImportEnv = {
 		DB: {
 			createDrizzle: () => new Proxy(db, {
-				get: (target, prop) => (prop === "batch"
-					? async (statements) => {
-						for (const statement of statements) await statement;
-					}
+				get: (target, prop) => ((hooks.beforeWrite || hooks.afterWrite) && (prop === "insert" || prop === "update")
+					? (...args) => wrapChain(Reflect.get(target, prop).apply(target, args))
 					: Reflect.get(target, prop)),
 			}),
 			sqlExecutor: { dialect: "postgres", query: async () => { throw new Error("unreachable"); }, atomicBatch: async () => false },
@@ -470,7 +491,7 @@ test("on a driver without transactions a failed event is cleaned up and reported
 	assert.equal(body.failed, 1);
 	assert.equal(body.reverted, true);
 	assert.equal(body.unattempted, 1);
-	assert.ok(body.detail.includes("partial writes were removed"));
+	assert.ok(body.detail.includes("no partial writes"));
 	// Sequential execution committed the failed event's master before the override aborted;
 	// compensation removed it, so storage looks exactly like the transactional case.
 	assert.deepEqual(eventsOf(sqlite, "user-2").map((event) => event.title), ["First"]);
@@ -495,10 +516,64 @@ test("when cleanup also fails the response admits partial rows may remain", asyn
 	assert.equal(body.error, "IMPORT_PARTIAL_FAILURE");
 	assert.equal(body.failed, 1);
 	assert.equal(body.reverted, false);
-	assert.ok(body.detail.includes("may remain"));
+	assert.ok(body.detail.includes("inconsistent"));
 	// The failed event's master committed before the abort and the blocked cleanup left it: the
 	// report counts it as failed, not applied, and never claims the store is clean.
 	assert.deepEqual(eventsOf(sqlite, "user-2").map((event) => event.title), ["First", "Series"]);
+});
+
+test("losing a same-event insert race leaves the concurrent winner's row alone", async (t) => {
+	// Two imports of the same UID both read not-present; the competitor commits between this
+	// request's preflight and its first write, so the insert fails on the duplicate primary key.
+	const winnerId = `evt_i_${createHash("sha256").update("user-2uid:race").digest("hex")}`;
+	let won = false;
+	const sqlite = await sequentialDriver(t, seed, {
+		beforeWrite: async (sqlite) => {
+			if (won) return;
+			won = true;
+			sqlite.exec(`INSERT INTO calendar_events (id, user_id, title, description, location, attendees, repeat, repeat_days, repeat_interval, excluded_occurrences, starts_at, ends_at, created_at, updated_at) VALUES ('${winnerId}', 'user-2', 'Race winner', '', '', '[]', 'none', '[]', 1, '[]', ${sec("2026-11-02T09:00:00Z")}, ${sec("2026-11-02T09:30:00Z")}, 1, 1)`);
+		},
+	});
+	const res = await app.route.POST(req(ics(vevent(["UID:race", "DTSTART:20261102T090000Z", "DTEND:20261102T093000Z", "SUMMARY:Race winner"]))));
+	assert.equal(res.status, 500);
+	const body = await res.json();
+	assert.equal(body.error, "IMPORT_PARTIAL_FAILURE");
+	assert.equal(body.imported, 0);
+	assert.equal(body.failed, 1);
+	// Nothing this request wrote existed, so there was nothing to revert — and the response does
+	// not claim a revert over a row that belongs to the winner.
+	assert.notEqual(body.reverted, true);
+	const rows = eventsOf(sqlite, "user-2");
+	assert.equal(rows.length, 1);
+	assert.equal(rows[0].id, winnerId);
+	assert.equal(rows[0].title, "Race winner");
+});
+
+test("a master deleted mid-import is not resurrected by the revert", async (t) => {
+	// The master update commits, a concurrent request deletes the event, then the override
+	// insert fails: the revert must see the row is gone instead of writing it back.
+	let race = false;
+	const sqlite = await sequentialDriver(t, seed, {
+		afterWrite: async (sqlite) => {
+			if (!race) return;
+			race = false;
+			sqlite.exec("DELETE FROM calendar_events WHERE user_id = 'user-2'");
+		},
+	});
+	sqlite.exec(`CREATE TRIGGER fail_override BEFORE INSERT ON calendar_event_overrides WHEN NEW.occurrence_ms = ${Date.parse("2026-11-09T09:00:00Z")} BEGIN SELECT RAISE(ABORT, 'forced override failure'); END;`);
+	const first = await app.route.POST(req(ics(vevent(["UID:racedel", "DTSTART:20261102T090000Z", "DTEND:20261102T100000Z", "SUMMARY:Series", "RRULE:FREQ=WEEKLY"]))));
+	assert.equal(first.status, 200);
+	race = true;
+	const res = await app.route.POST(req(ics([
+		...vevent(["UID:racedel", "DTSTART:20261102T090000Z", "DTEND:20261102T100000Z", "SUMMARY:Series revised", "RRULE:FREQ=WEEKLY"]),
+		...vevent(["UID:racedel", "RECURRENCE-ID:20261109T090000Z", "DTSTART:20261109T110000Z", "DTEND:20261109T120000Z", "SUMMARY:Moved"]),
+	])));
+	assert.equal(res.status, 500);
+	const body = await res.json();
+	assert.equal(body.error, "IMPORT_PARTIAL_FAILURE");
+	assert.equal(body.failed, 1);
+	assert.notEqual(body.reverted, true);
+	assert.equal(eventsOf(sqlite, "user-2").length, 0);
 });
 
 test("the export feed for a fixed fixture still hashes to its pinned digest", async () => {
