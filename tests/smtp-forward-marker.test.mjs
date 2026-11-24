@@ -21,7 +21,8 @@ const mocks = {
 	"@/db": `export function getDb() { const q = { select: () => q, from: () => q, where: () => q, limit: async () => [{ id: "d" }] }; return q; }`,
 	"@/db/schema": `export const domains = { id: "id", hostname: "hostname" };
 		export const messages = {};
-		export const messageAttachments = {};`,
+		export const messageAttachments = {};
+		export const routingRules = {};`,
 	"./smtp-auth": "export async function verifySmtpAuthentication() { return undefined; }",
 	"@/lib/email/routing": "export async function resolveInboundAddress() { return null; } export async function recordRuleMatch() {}",
 };

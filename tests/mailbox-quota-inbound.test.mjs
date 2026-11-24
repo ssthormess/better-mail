@@ -388,3 +388,76 @@ test("the SMTP listener rejects an over-quota recipient at RCPT and drops a late
 	assert.match(await reply("RCPT TO:<sized@one.test>\r\n"), /^250/, "without SIZE the same mailbox is accepted on usage alone");
 	assert.match(await reply("QUIT\r\n"), /^221/);
 });
+
+test("the SMTP listener only bounces decisions that really store, and only claims 250 when something delivered", async (t) => {
+	silence(t);
+	const { env, sqlite, objects, queued } = await setup(t, {
+		limit: 1000,
+		// fwd@ is the fallback mailbox on a domain catch-all forward and already over
+		// cap; solo@ fits at RCPT but not once the body arrives; direct@ is an
+		// over-cap mailbox with its own mailbox-scope forward rule, which can only
+		// be evaluated at DATA when the headers exist.
+		seed: `
+			INSERT INTO mailboxes (id, user_id, domain_id, local_part, created_at) VALUES
+				('fwd', 'admin', 'one', 'fwd', 1),
+				('solo', 'admin', 'one', 'solo', 1),
+				('direct', 'admin', 'one', 'direct', 1);
+			INSERT INTO messages (id, user_id, mailbox_id, direction, from_addr, to_addr, text_body, status, created_at) VALUES
+				('m-fwd', 'admin', 'fwd', 'inbound', 'a@x.test', 'fwd@one.test', '${"f".repeat(1100)}', 'received', 1),
+				('m-solo', 'admin', 'solo', 'inbound', 'a@x.test', 'solo@one.test', '${"s".repeat(950)}', 'received', 1),
+				('m-direct', 'admin', 'direct', 'inbound', 'a@x.test', 'direct@one.test', '${"d".repeat(1100)}', 'received', 1);
+			INSERT INTO routing_rules (id, user_id, domain_id, scope, mailbox_id, pattern, action, forward_to, keep_copy, enabled, priority, created_at) VALUES
+				('pf', 'admin', 'one', 'domain', 'fwd', '*', 'forward', 'team@elsewhere.test', 0, 1, 10, 1),
+				('mf', 'admin', 'one', 'mailbox', 'direct', '*', 'forward', 'dest@somewhere.test', 0, 1, 10, 1);
+		`,
+	});
+	const forwarded = [];
+	const server = startSmtpListener(env, { sendRaw: async (_from, to) => { forwarded.push(to); return true; } }, { port: 0, host: "127.0.0.1", maxSize: 65536, hostname: "mx.one.test", tls: null });
+	t.after(async () => new Promise((resolve) => server.close(resolve)));
+	await once(server.server, "listening");
+	const socket = net.connect({ host: "127.0.0.1", port: server.server.address().port });
+	t.after(() => socket.destroy());
+	const lines = readline.createInterface({ input: socket })[Symbol.asyncIterator]();
+	const reply = async (wire) => {
+		if (wire) socket.write(wire);
+		for (;;) {
+			const { value, done } = await lines.next();
+			if (done) throw Error("SMTP socket closed");
+			if (/^\d{3} /.test(value)) return value;
+		}
+	};
+	await reply();
+	await reply("EHLO sender.example\r\n");
+	// A forward that keeps no copy stores nothing: the fallback mailbox being over
+	// cap must not bounce it at RCPT.
+	assert.match(await reply("MAIL FROM:<sender@example.test>\r\n"), /^250/);
+	assert.match(await reply("RCPT TO:<nobody@one.test>\r\n"), /^250/, "pure forward stays accepted");
+	assert.match(await reply("DATA\r\n"), /^354/);
+	assert.match(await reply("From: s@x.test\r\nTo: nobody@one.test\r\n\r\nhi\r\n.\r\n"), /^250/);
+	assert.deepEqual(forwarded, ["team@elsewhere.test"], "the forward ran");
+	assert.equal(objects.size, 0, "nothing staged");
+	assert.equal(queued.length, 0, "nothing queued");
+	// The same rule keeping a copy does store — the over-cap fallback refuses at RCPT.
+	sqlite.exec("UPDATE routing_rules SET keep_copy = 1 WHERE id = 'pf'");
+	assert.match(await reply("MAIL FROM:<sender@example.test>\r\n"), /^250/);
+	assert.match(await reply("RCPT TO:<nobody@one.test>\r\n"), /^550/, "keep-copy forward on an over-cap fallback refuses at RCPT");
+	assert.match(await reply("RSET\r\n"), /^250/);
+	// A direct mailbox with a forward rule is provisional at RCPT — the rule needs
+	// headers DATA hasn't seen, so the cap verdict waits and the forward still runs.
+	assert.match(await reply("MAIL FROM:<sender@example.test>\r\n"), /^250/);
+	assert.match(await reply("RCPT TO:<direct@one.test>\r\n"), /^250/, "mailbox forward rules defer the quota verdict to DATA");
+	assert.match(await reply("DATA\r\n"), /^354/);
+	assert.match(await reply("From: s@x.test\r\nTo: direct@one.test\r\n\r\nhi\r\n.\r\n"), /^250/);
+	assert.deepEqual(forwarded, ["team@elsewhere.test", "dest@somewhere.test"]);
+	// A sole accepted recipient that drops at DATA with zero delivery side effects
+	// is a real bounce, not a false "queued".
+	assert.match(await reply("MAIL FROM:<sender@example.test>\r\n"), /^250/);
+	assert.match(await reply("RCPT TO:<solo@one.test>\r\n"), /^250/, "solo fits until the real size is known");
+	assert.match(await reply("DATA\r\n"), /^354/);
+	const end = await reply("From: s@x.test\r\nTo: solo@one.test\r\n\r\n" + "a".repeat(150) + "\r\n.\r\n");
+	assert.match(end, /^550/, "all recipients dropped with no delivery is a bounce");
+	assert.match(end, /storage limit/, "carries the quota reason");
+	assert.equal(queued.length, 0);
+	assert.equal(objects.size, 0);
+	assert.match(await reply("QUIT\r\n"), /^221/);
+});

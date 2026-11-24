@@ -4,11 +4,11 @@ import type { SMTPServerSession } from "smtp-server";
 import { intakeIncomingMail } from "@/lib/email/intake";
 import { inboundAttachmentLimitReasonFromRaw } from "@/lib/email/inbound-attachments";
 import { INBOUND_QUOTA_REJECT_REASON, mailboxInboundQuotaExceeded } from "@/lib/email/mailbox-quota";
-import { recordRuleMatch, resolveInboundAddress } from "@/lib/email/routing";
+import { recordRuleMatch, resolveInboundAddress, type RoutingDecision } from "@/lib/email/routing";
 import { isPublicIpv4 } from "@/lib/spam/domain-utils";
-import { getDb } from "@/db";
-import { domains } from "@/db/schema";
-import { eq } from "drizzle-orm";
+import { getDb, type AppDatabase } from "@/db";
+import { domains, routingRules } from "@/db/schema";
+import { and, eq } from "drizzle-orm";
 import { verifySmtpAuthentication } from "./smtp-auth";
 import type { Mailer } from "./mailer";
 
@@ -118,6 +118,8 @@ export function startSmtpListener(
 					sender: from,
 					mta: options.hostname,
 				});
+				let delivered = 0;
+				let dropReason: string | null = null;
 				for (const recipient of session.envelope.rcptTo) {
 					const result = await intakeIncomingMail(
 						env,
@@ -139,7 +141,19 @@ export function startSmtpListener(
 					// 550 would falsely report failure for recipients already stored.
 					if (result.action === "reject") {
 						console.warn(`SMTP recipient ${recipient.address} dropped at DATA: ${result.reason}`);
+						dropReason ??= result.reason;
+						continue;
 					}
+					// A queued copy or a completed forward is a real delivery side effect.
+					delivered += 1;
+				}
+				// ...but when every accepted recipient dropped and nothing was stored,
+				// queued or forwarded anywhere, answering "queued" would lie. DATA is
+				// still a bounce surface: report the failure a Worker setReject would
+				// have made.
+				if (delivered === 0) {
+					callback(Object.assign(new Error(dropReason ?? "Message rejected"), { responseCode: 550 }));
+					return;
 				}
 				callback();
 			});
@@ -171,10 +185,37 @@ async function recipientRejectReason(env: CloudflareEnv, from: string, to: strin
 		if (decision.ruleId) await recordRuleMatch(db, decision.ruleId).catch(() => undefined);
 		return decision.rejectReason ?? "Message rejected by routing rule";
 	}
-	if (decision?.mailbox && await mailboxInboundQuotaExceeded(env, db, decision.mailbox.mailboxId, declaredSize)) {
+	if (decision?.mailbox && await willStoreCopyAtData(db, decision) && await mailboxInboundQuotaExceeded(env, db, decision.mailbox.mailboxId, declaredSize)) {
 		return INBOUND_QUOTA_REJECT_REASON;
 	}
 	return null;
+}
+
+/**
+ * True when an RCPT-time routing decision definitely lands a copy in its mailbox.
+ * A domain-rule store or keep-copy forward resolves identically at DATA — domain
+ * rules match on envelope fields only — so those always store. A mailbox reached
+ * directly is only provisionally a store while it has enabled mailbox-scope
+ * forward rules: they match on headers DATA hasn't seen and can rewrite the
+ * delivery to a pure forward that stores nothing. Pure forwards store nothing
+ * and never gate on quota; unresolved decisions let the DATA path decide.
+ */
+async function willStoreCopyAtData(db: AppDatabase, decision: RoutingDecision): Promise<boolean> {
+	if (!decision.mailbox) return false;
+	if (decision.action === "forward") return decision.keepCopy === true;
+	if (decision.action !== "store") return false;
+	if (decision.ruleId !== undefined) return true;
+	const [rule] = await db
+		.select({ id: routingRules.id })
+		.from(routingRules)
+		.where(and(
+			eq(routingRules.mailboxId, decision.mailbox.mailboxId),
+			eq(routingRules.scope, "mailbox"),
+			eq(routingRules.action, "forward"),
+			eq(routingRules.enabled, true),
+		))
+		.limit(1);
+	return !rule;
 }
 
 /** Header map in the shape the Worker handler provides: lower-cased names, folded lines joined. */
