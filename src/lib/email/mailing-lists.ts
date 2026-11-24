@@ -54,6 +54,14 @@ export type MailingListExpansion = {
 	deliveries: MailingListDelivery[];
 	skipped: SkippedListMember[];
 	/**
+	 * False when traversal truncated a member edge — the cycle guard or
+	 * the depth cap — anywhere in the expansion graph, so the delivery
+	 * set may be missing members a scan never enumerated. Folded from
+	 * the branch results after traversal, so it reflects every edge's
+	 * final outcome rather than the order branches were reached in.
+	 */
+	complete: boolean;
+	/**
 	 * Held roots whose hold produced no deliverable reviewer — neither an
 	 * owner member nor the list's owning user — anywhere in the expansion
 	 * graph. The caller retains the raw object under `held/<listId>/` for
@@ -102,6 +110,13 @@ type MemberEdge = {
 	/** The member row that created this edge, kept for skip reporting. */
 	memberEmail: string;
 	blocked: "cycle" | "depth" | null;
+	/**
+	 * The child result this edge's last traversal consumed — null while
+	 * the edge is untraversed or was blocked. The settlement pass judges
+	 * a result on the completeness of what it actually folded, so the
+	 * record keeps the consumed object, not a recomputed lookup.
+	 */
+	result: BranchResult | null;
 };
 
 /**
@@ -113,8 +128,10 @@ type MemberEdge = {
  * were traversed at — so a deeper-computed result re-traverses when a
  * shallower reach can go further. `complete` flags truncation: false when
  * a member edge's traversal was cut by the cycle guard or the depth cap
- * on the last traversal. `projected` marks a restricted view derived from
- * the full result rather than a member scan of its own.
+ * on the last traversal, or when a child result it consumed settled
+ * incomplete — an incomplete branch folded upward reads identically to a
+ * truncated one. `projected` marks a restricted view derived from the
+ * full result rather than a member scan of its own.
  */
 type BranchResult = {
 	listId: string;
@@ -202,7 +219,30 @@ export async function expandMailingListDeliveries(
 	// its scan so a descendant edge that points back at it folds the real
 	// record instead of finding none.
 	if (ownersOnly) ensureHeld(state, list);
-	await expandList(db, list.listId, envelopeFrom, state, ownersOnly ? "restricted" : "full", 0);
+	const root = await expandList(db, list.listId, envelopeFrom, state, ownersOnly ? "restricted" : "full", 0);
+
+	// Completeness settles like every other verdict — after traversal, not
+	// mid-reach. A result is complete only when no edge was blocked and
+	// every child result its edges consumed settled complete itself; flags
+	// only downgrade, so the sweep converges. A cached hit on an incomplete
+	// result then answers flagged-incomplete rather than masquerading as a
+	// fully verified expansion.
+	let settling = true;
+	while (settling) {
+		settling = false;
+		for (const slots of state.results.values()) {
+			for (const result of [slots.full, slots.restricted]) {
+				if (!result?.complete) continue;
+				for (const edge of result.edges.values()) {
+					if (edge.blocked || edge.result?.complete === false) {
+						result.complete = false;
+						settling = true;
+						break;
+					}
+				}
+			}
+		}
+	}
 
 	// Ordinary deliveries are the union of every full branch's own entries:
 	// a list contributes its members to the fan-out exactly when an unheld
@@ -297,7 +337,12 @@ export async function expandMailingListDeliveries(
 	for (const [mailboxId, delivery] of reviewer) {
 		if (!deliveries.has(mailboxId)) deliveries.set(mailboxId, delivery);
 	}
-	return { deliveries: [...deliveries.values()], skipped: state.skipped, retained: [...retained.values()] };
+	return {
+		deliveries: [...deliveries.values()],
+		skipped: state.skipped,
+		retained: [...retained.values()],
+		complete: root.result?.complete ?? false,
+	};
 }
 
 /**
@@ -326,7 +371,7 @@ function projectRestricted(full: BranchResult): BranchResult {
 		listId: full.listId,
 		restriction: "restricted",
 		depth: full.depth,
-		complete: [...edges.values()].every((edge) => !edge.blocked),
+		complete: full.complete && [...edges.values()].every((edge) => !edge.blocked),
 		projected: true,
 		entries,
 		edges,
@@ -437,12 +482,14 @@ async function expandList(
 		for (const edge of result.edges.values()) {
 			const childResult = await expandList(db, edge.list.listId, envelopeFrom, state, edge.held ? "restricted" : restriction, depth + 1);
 			edge.blocked = childResult.blocked;
-			if (!childResult.blocked) continue;
-			// A truncated edge marks the parent incomplete — the record
-			// keeps the edge, so the loss is visible rather than a silent
+			edge.result = childResult.result;
+			// A truncated edge — or a child whose own result settled
+			// incomplete — marks the parent incomplete: the record keeps
+			// the edge, so the loss is visible rather than a silent
 			// "verified no members". A held edge blocked by a live cycle is
 			// not a skipped member: its own frame is already expanding it.
-			result.complete = false;
+			if (childResult.blocked || childResult.result?.complete === false) result.complete = false;
+			if (!childResult.blocked) continue;
 			if (childResult.blocked === "depth") pushSkipped(state, edge.memberEmail, "too-deep");
 			else if (!edge.held) pushSkipped(state, edge.memberEmail, "already-expanded");
 		}
@@ -505,6 +552,7 @@ async function scanList(
 				ownerRow: member.role === "owner",
 				memberEmail: member.email,
 				blocked: null,
+				result: null,
 			});
 			if (held) ensureHeld(state, decision.list);
 			continue;
@@ -584,9 +632,12 @@ export async function deliverToMailingList(
 	options: { ownersOnly?: boolean } = {},
 ): Promise<void> {
 	const db = getDb(env);
-	const { deliveries, skipped, retained } = await expandMailingListDeliveries(db, list, payload.from, options);
+	const { deliveries, skipped, retained, complete } = await expandMailingListDeliveries(db, list, payload.from, options);
 	if (options.ownersOnly) {
 		console.info(`Mailing list ${list.localPart}@${list.hostname}: post from ${payload.from} held for owner review`);
+	}
+	if (!complete) {
+		console.warn(`Mailing list ${list.localPart}@${list.hostname}: expansion incomplete — some member branches were cut by the cycle guard or depth cap`);
 	}
 	if (skipped.length) {
 		console.info(`Mailing list ${list.localPart}@${list.hostname}: skipped ${skipped.map((member) => `${member.email} (${member.reason})`).join(", ")}`);

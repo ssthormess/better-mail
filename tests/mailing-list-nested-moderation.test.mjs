@@ -20,8 +20,10 @@ await build({
 		contents: `
 			export { SqliteDatabase } from "./server/runtime/sqlite-database.ts";
 			export { applyMigrations } from "./server/runtime/migrate.ts";
+			export { getDb } from "./src/db/index.ts";
 			export { intakeIncomingMail } from "./src/lib/email/intake.ts";
 			export { processInboundMessage } from "./src/lib/email/inbound.ts";
+			export { expandMailingListDeliveries } from "./src/lib/email/mailing-lists.ts";
 		`,
 		resolveDir: root,
 		sourcefile: "mailing-list-nested-entry.ts",
@@ -36,7 +38,7 @@ await build({
 	alias: { "cloudflare:workers": "./server/runtime/cloudflare-workers.ts" },
 	logLevel: "silent",
 });
-const { SqliteDatabase, applyMigrations, intakeIncomingMail, processInboundMessage } =
+const { SqliteDatabase, applyMigrations, getDb, intakeIncomingMail, processInboundMessage, expandMailingListDeliveries } =
 	await import(pathToFileURL(join(directory, "entry.mjs")).href);
 
 const raw = new TextEncoder().encode("From: sender@ext.test\r\nTo: all@one.test\r\nSubject: hi\r\nMessage-ID: <1@ext.test>\r\n\r\nbody\r\n").buffer;
@@ -84,6 +86,12 @@ function mailByMailbox(database) {
 
 function mailboxSet(database) {
 	return new Set(mailByMailbox(database).map((row) => row.mailboxId));
+}
+
+// The traversal root expandMailingListDeliveries expects is the routing
+// decision's ResolvedList — a plain record the test can state directly.
+function resolvedList(id, userId = "admin") {
+	return { listId: id, userId, domainId: "one", localPart: id, hostname: "one.test", name: id };
 }
 
 function heldKeys(objects) {
@@ -618,4 +626,64 @@ test("an unheld member list inside a held branch joins reviewers only through an
 			`ownerRow=${ownerRow} changed the reviewer set`,
 		);
 	}
+});
+
+test("an incomplete child result poisons every ancestor that consumed it", async (t) => {
+	const { database } = await setup(t);
+	// A->B->A where a moderates the sender: b's edge back into a's live
+	// compute is a held re-entry the cycle guard cuts, so b settles
+	// incomplete — and a cannot cache itself complete on top of the
+	// truncated branch it consumed. x reaches b through a second edge:
+	// the cached hit on b's flagged result must poison x the same way a
+	// live compute would.
+	insertList(database, { id: "a", localPart: "a", moderated: 1, members: ["b@one.test", "x@one.test"] });
+	insertList(database, { id: "b", localPart: "b", members: ["a@one.test"] });
+	insertList(database, { id: "x", localPart: "x", members: ["b@one.test"] });
+	const db = getDb({ DB: database });
+
+	const expansion = await expandMailingListDeliveries(db, resolvedList("a"), "stranger@ext.test");
+	assert.equal(expansion.complete, false);
+});
+
+test("every ancestor above a depth-capped edge reports incomplete", async (t) => {
+	const { database } = await setup(t);
+	insertList(database, { id: "a", localPart: "a", members: ["c1@one.test"] });
+	insertList(database, { id: "c1", localPart: "c1", members: ["c2@one.test"] });
+	insertList(database, { id: "c2", localPart: "c2", members: ["c3@one.test"] });
+	insertList(database, { id: "c3", localPart: "c3", members: ["c4@one.test"] });
+	insertList(database, { id: "c4", localPart: "c4", members: ["deep@one.test"] });
+	insertList(database, { id: "deep", localPart: "deep", members: ["bob@one.test"] });
+	const db = getDb({ DB: database });
+
+	// deep sits at depth 5, one level past the cap: c4's edge is cut and
+	// the incomplete flag has to walk the whole chain back to the root —
+	// on a linear chain the root flag can only be false if every ancestor
+	// propagated it.
+	const expansion = await expandMailingListDeliveries(db, resolvedList("a"), "stranger@ext.test");
+	assert.equal(expansion.complete, false);
+	assert.deepEqual(expansion.skipped, [{ email: "deep@one.test", reason: "too-deep" }]);
+});
+
+test("the root stays incomplete and is never served as a cached complete", async (t) => {
+	const { database } = await setup(t);
+	// The gate's explicit assertion: the A->B->A hold cycle leaves the
+	// root flag downgraded — and a second query on a must not get a
+	// cached-complete answer. The traversal cache lives inside one
+	// expansion, so the second call recomputes and has to land on the
+	// same flagged-incomplete result.
+	insertList(database, { id: "a", localPart: "a", moderated: 1, members: ["b@one.test"] });
+	insertList(database, { id: "b", localPart: "b", members: ["a@one.test"] });
+	const db = getDb({ DB: database });
+
+	const first = await expandMailingListDeliveries(db, resolvedList("a"), "stranger@ext.test");
+	const second = await expandMailingListDeliveries(db, resolvedList("a"), "stranger@ext.test");
+	assert.equal(first.complete, false);
+	assert.equal(second.complete, false);
+
+	// Control: a complete graph still reports complete — the flag is not
+	// unconditionally poisoned.
+	insertList(database, { id: "plain", localPart: "plain", members: ["bob@one.test", "leaf@one.test"] });
+	insertList(database, { id: "leaf", localPart: "leaf", members: ["ann@one.test"] });
+	const healthy = await expandMailingListDeliveries(db, resolvedList("plain"), "stranger@ext.test");
+	assert.equal(healthy.complete, true);
 });
