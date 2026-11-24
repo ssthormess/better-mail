@@ -408,6 +408,7 @@ test("every fetch hop pins the connection to the addresses the DNS check approve
 	const resolutions = [];
 	const pins = [];
 	const requests = [];
+	let closed = false;
 	const result = await app.fetchCalendarFeed("https://feeds.example/release.ics", {
 		resolveHost: async (hostname) => {
 			// A hostile resolver that would answer differently on a second lookup: the pinned set
@@ -417,7 +418,7 @@ test("every fetch hop pins the connection to the addresses the DNS check approve
 		},
 		pinConnection: async (hostname, addresses) => {
 			pins.push({ hostname, addresses });
-			return { cf: { resolveOverride: addresses[0] } };
+			return { dispatcher: { close: async () => { closed = true; } } };
 		},
 		fetch: async (input, init) => {
 			requests.push({ url: String(input), init });
@@ -428,9 +429,11 @@ test("every fetch hop pins the connection to the addresses the DNS check approve
 	assert.deepEqual(resolutions, ["feeds.example"], "one resolution per hop");
 	assert.equal(pins.length, 1);
 	assert.deepEqual(pins[0].addresses, [PUBLIC_IP], "the pin is the validated address set");
-	assert.equal(requests[0].init.cf.resolveOverride, PUBLIC_IP, "the request goes to the checked address");
+	assert.equal(requests[0].init.dispatcher.close !== undefined, true, "the request goes out on the pinned dispatcher");
+	assert.equal(requests[0].init.cf, undefined, "no fabricated cf option is emitted");
 	assert.equal(new URL(requests[0].url).hostname, "feeds.example", "the URL keeps its hostname for Host/SNI");
 	assert.equal(requests[0].init.redirect, "manual");
+	assert.equal(closed, true, "the per-hop dispatcher is closed after the hop");
 
 	// On this Node runtime the default pin is a per-request undici dispatcher carrying the lookup.
 	const defaultCalls = stubFetch(t, { serve: () => feedResponse(feedV1) });
@@ -446,6 +449,63 @@ test("every fetch hop pins the connection to the addresses the DNS check approve
 		(error) => error instanceof app.FeedFetchError && error.code === "pinning_unavailable",
 	);
 	assert.equal(closedCalls.length, 0, "nothing was fetched unpinned");
+});
+
+// Workers-family runtimes (navigator.userAgent "Cloudflare-Workers") have no per-request socket
+// pin: cf.resolveOverride only honors same-zone proxied hostnames and startTls hostname
+// verification is inert on the edge (workerd#6903). The fetch instead relies on the platform's
+// public-only egress plus TLS hostname verification — but only when the deployment positively
+// asserts hosted egress (MAILFLARE_RUNTIME=cloudflare); anything else fails closed.
+const asWorkersRuntime = (t) => {
+	const original = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+	Object.defineProperty(globalThis, "navigator", { value: { userAgent: "Cloudflare-Workers" }, configurable: true });
+	t.after(() => {
+		if (original) Object.defineProperty(globalThis, "navigator", original);
+	});
+};
+
+test("on asserted hosted Workers the platform egress carries the guard, still validating every hop", async (t) => {
+	await setup(t);
+	asWorkersRuntime(t);
+	const resolved = [];
+	const calls = stubFetch(t, {
+		resolve: (name) => {
+			resolved.push(name);
+			return PUBLIC_IP;
+		},
+		serve: (url) => (url.pathname === "/a.ics" ? new Response(null, { status: 302, headers: { location: "https://other.example/b.ics" } }) : feedResponse(feedV1)),
+	});
+	const result = await app.fetchCalendarFeed("https://feeds.example/a.ics", { publicEgressAsserted: true });
+	assert.equal(result.outcome, "fetched");
+	// Each hop resolves A and AAAA, so a hostname appears once per record type — dedupe to hops.
+	assert.deepEqual([...new Set(resolved)], ["feeds.example", "other.example"], "DoH validation still runs per hop on Workers");
+	for (const call of calls) {
+		assert.equal(call.init.cf, undefined, "no fabricated cf option is emitted");
+		assert.equal(call.init.dispatcher, undefined, "no socket pin exists on Workers — platform egress carries it");
+	}
+
+	// A private-range answer still rejects on the asserted runtime — the DoH check is the
+	// defense-in-depth layer and must not be skipped just because the platform also filters.
+	const privateCalls = stubFetch(t, {
+		resolve: () => "10.0.0.1",
+		serve: () => feedResponse(feedV1),
+	});
+	await assert.rejects(
+		app.fetchCalendarFeed("https://feeds.example/release.ics", { publicEgressAsserted: true }),
+		(error) => error instanceof app.FeedFetchError && error.code === "not_public",
+	);
+	assert.equal(privateCalls.length, 0);
+});
+
+test("a Workers runtime that cannot assert hosted public egress fails closed", async (t) => {
+	await setup(t);
+	asWorkersRuntime(t);
+	const calls = stubFetch(t, { serve: () => feedResponse(feedV1) });
+	await assert.rejects(
+		app.fetchCalendarFeed("https://feeds.example/release.ics"),
+		(error) => error instanceof app.FeedFetchError && error.code === "pinning_unavailable",
+	);
+	assert.equal(calls.length, 0, "nothing was fetched unpinned on an unasserted Workers runtime");
 });
 
 test("a cancelled-only snapshot keeps the stored events and records the anomaly", async (t) => {

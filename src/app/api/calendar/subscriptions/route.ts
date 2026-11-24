@@ -8,6 +8,7 @@ import { authorizeCalendarRequest } from "@/lib/calendar/api-auth";
 import { readJsonObject } from "@/lib/http/request";
 import { isUniqueConstraintError } from "@/lib/database-errors";
 import { getRequestTimeZone } from "@/lib/time/utils";
+import { hasPublicEgressGuarantee } from "@/lib/runtime";
 import { fetchCalendarFeed, FeedFetchError, normalizeFeedUrl } from "@/lib/calendar/subscription-feed";
 import { IcsLimitError, IcsParseError, prepareCalendarImport } from "@/lib/calendar/ics-import";
 import { MAX_REFRESH_INTERVAL_SEC, MIN_REFRESH_INTERVAL_SEC, normalizeRefreshIntervalSec, subscriptionIdScheme, syncFeedEvents } from "@/lib/calendar/subscriptions";
@@ -63,7 +64,7 @@ export async function POST(request: Request) {
 	if (dupe) return NextResponse.json({ error: "Already subscribed to this feed" }, { status: 409 });
 	let fetched;
 	try {
-		fetched = await fetchCalendarFeed(feedUrl);
+		fetched = await fetchCalendarFeed(feedUrl, { publicEgressAsserted: hasPublicEgressGuarantee(env) });
 	} catch (fetchError) {
 		if (fetchError instanceof FeedFetchError) return feedErrorResponse(fetchError);
 		throw fetchError;

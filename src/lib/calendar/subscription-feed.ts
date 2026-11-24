@@ -36,11 +36,16 @@ export class FeedFetchError extends Error {
 }
 
 /**
- * Extra fields a pinned request puts on the fetch init bag. `dispatcher` is undici's per-request
- * override on Node; `cf.resolveOverride` is the Workers equivalent — both keep Host/SNI on the URL
- * while the socket goes to the checked address.
+ * How one hop's connection is bound to the checked outcome. `dispatcher` is undici's per-request
+ * override on Node: the socket only ever reaches the validated addresses while Host/SNI stay on
+ * the URL hostname. `platformEgress` instead records that the runtime itself guarantees
+ * public-internet-only egress — hosted Cloudflare Workers — where no per-request socket pin
+ * exists (see defaultPinConnection). A pin carrying neither is not a pin and fails closed.
  */
-export type FeedConnectionPin = { dispatcher?: { close?: () => Promise<unknown> }; cf?: { resolveOverride: string } };
+export type FeedConnectionPin = {
+	dispatcher?: { close?: () => Promise<unknown> };
+	platformEgress?: "cloudflare-workers";
+};
 
 export type FeedFetchOptions = {
 	fetch?: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
@@ -48,6 +53,13 @@ export type FeedFetchOptions = {
 	resolveHost?: (hostname: string) => Promise<string[]>;
 	/** Turns the validated addresses into a connection pin; defaults to the runtime's facility. */
 	pinConnection?: (hostname: string, addresses: string[]) => Promise<FeedConnectionPin>;
+	/**
+	 * The deployment positively asserts its fetch egress is public-internet-only — on this repo
+	 * that is MAILFLARE_RUNTIME=cloudflare, set by the hosted deployment's wrangler vars (which
+	 * also enable the global_fetch_strictly_public compat flag). Workers-family runtimes have no
+	 * socket pin and rely on this assertion; unset means it was not made and they fail closed.
+	 */
+	publicEgressAsserted?: boolean;
 	/** Validators from the previous fetch; a 304 answer skips the body entirely. */
 	etag?: string | null;
 	lastModified?: string | null;
@@ -109,15 +121,32 @@ async function resolvePublicHost(resolve: (hostname: string) => Promise<string[]
 type UndiciAgent = new (options: { connect: { lookup: (hostname: string, options: unknown, callback: (error: Error | null, addresses: { address: string; family: number }[]) => void) => void } }) => { close(): Promise<void> };
 
 /**
- * Binds the checked addresses to the connection itself. On Workers `cf.resolveOverride` pins
- * resolution per request while Host and SNI still come from the URL; on Node a per-request undici
- * Agent answers DNS lookups with the already-validated list — same guarantee. A runtime that
- * offers neither (e.g. a plain Bun/Deno fetch) fails closed rather than silently fetching
- * unpinned. The URL is never rewritten to an IP literal.
+ * Binds the checked addresses to the connection itself — or proves the platform already does.
+ *
+ * Workers-family runtimes (navigator.userAgent "Cloudflare-Workers", set by workerd whether it is
+ * hosted on Cloudflare or self-hosted) offer NO per-request socket pin: `cf.resolveOverride` only
+ * honors hostnames proxied on the same Cloudflare zone and ignores IP literals or external names,
+ * and `cloudflare:sockets` Socket.startTls({expectedServerHostname}) sends no SNI on the
+ * production edge (cloudflare/workerd#6903, open), so the connect-to-IP-plus-TLS path cannot
+ * work either. What carries the guarantee on hosted Workers instead is the platform: fetch() can
+ * only reach the public internet — workerd refuses non-public destinations (workerd discussion
+ * #1523), this deployment additionally sets the global_fetch_strictly_public compat flag — and
+ * TLS certificate verification binds the socket to the URL hostname, so a hop re-resolving to a
+ * different public address still can only complete against a peer holding a cert for that name.
+ * The DoH validation above stays as defense-in-depth on top of those two platform guarantees.
+ *
+ * That platform backstop exists ONLY where the deployment asserts it: a self-hosted workerd can
+ * be configured with private egress (ExternalServer bindings), in which case there is neither a
+ * pin nor an egress filter. Unasserted Workers runtimes therefore fail closed — as does any
+ * runtime with no pinning facility at all (e.g. a plain Bun/Deno fetch). On Node a per-request
+ * undici Agent answers DNS lookups with the already-validated address list — the resolution the
+ * fetcher actually uses is the one the check approved, no TOCTOU gap. The URL is never rewritten
+ * to an IP literal anywhere.
  */
-async function defaultPinConnection(_hostname: string, addresses: string[]): Promise<FeedConnectionPin> {
+async function defaultPinConnection(_hostname: string, addresses: string[], publicEgressAsserted: boolean): Promise<FeedConnectionPin> {
 	if (typeof navigator !== "undefined" && navigator.userAgent === "Cloudflare-Workers") {
-		return { cf: { resolveOverride: addresses[0] } };
+		if (!publicEgressAsserted) throw new FeedFetchError("Connection pinning is unavailable on this runtime", "pinning_unavailable");
+		return { platformEgress: "cloudflare-workers" };
 	}
 	let Agent: UndiciAgent;
 	try {
@@ -175,10 +204,12 @@ async function readLimitedBody(response: Response, maxBytes: number, signal: Abo
 
 /**
  * GETs a webcal/https feed through the SSRF guard: the hostname must parse clean, resolve only to
- * public addresses, and each hop's connection is pinned to the addresses that check approved —
- * resolve, validate, pin, fetch, in that order, repeated on every redirect hop. Redirects may only
- * go to https and the body is capped while it streams. A runtime that cannot pin a connection
- * fails closed rather than trusting a second, uncontrolled resolution.
+ * public addresses, and each hop's connection is bound to the outcome of that check — pinned to
+ * the validated addresses on Node, or riding the platform's public-only egress on asserted
+ * hosted Workers — resolve, validate, pin, fetch, in that order, repeated on every redirect hop.
+ * Redirects may only go to https and the body is capped while it streams. A runtime that can
+ * neither pin a connection nor assert public-only egress fails closed rather than trusting a
+ * second, uncontrolled resolution.
  * Sends If-None-Match/If-Modified-Since when validators are held; a 304 short-circuits the refresh.
  */
 export async function fetchCalendarFeed(value: string, options: FeedFetchOptions = {}): Promise<FeedFetchResult> {
@@ -186,7 +217,7 @@ export async function fetchCalendarFeed(value: string, options: FeedFetchOptions
 	const maxBytes = options.maxBytes ?? FEED_MAX_BYTES;
 	const maxRedirects = options.maxRedirects ?? FEED_MAX_REDIRECTS;
 	const resolveHost = options.resolveHost ?? defaultResolveHost;
-	const pinConnection = options.pinConnection ?? defaultPinConnection;
+	const pinConnection = options.pinConnection ?? ((hostname: string, addresses: string[]) => defaultPinConnection(hostname, addresses, options.publicEgressAsserted === true));
 	const controller = new AbortController();
 	const timeout = setTimeout(() => controller.abort(), options.timeoutMs ?? FEED_TIMEOUT_MS);
 	try {
@@ -194,7 +225,7 @@ export async function fetchCalendarFeed(value: string, options: FeedFetchOptions
 		for (let redirects = 0; ; redirects += 1) {
 			const addresses = await resolvePublicHost(resolveHost, current.hostname);
 			const pin = await pinConnection(current.hostname, addresses);
-			if (!pin.dispatcher && !pin.cf?.resolveOverride) throw new FeedFetchError("Connection pinning is unavailable on this runtime", "pinning_unavailable");
+			if (!pin.dispatcher && pin.platformEgress !== "cloudflare-workers") throw new FeedFetchError("Connection pinning is unavailable on this runtime", "pinning_unavailable");
 			try {
 				const headers: Record<string, string> = {
 					Accept: "text/calendar, application/ics, text/plain;q=0.8, */*;q=0.1",
@@ -210,7 +241,8 @@ export async function fetchCalendarFeed(value: string, options: FeedFetchOptions
 						cache: "no-store",
 						redirect: "manual",
 						signal: controller.signal,
-						...pin,
+						// Only a real dispatcher key goes into init — no fabricated cf options.
+						...(pin.dispatcher ? { dispatcher: pin.dispatcher } : {}),
 					} as RequestInit);
 				} catch {
 					if (controller.signal.aborted) throw new FeedFetchError("Calendar feed request timed out", "timeout");

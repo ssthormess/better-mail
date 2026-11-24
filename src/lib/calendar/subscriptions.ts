@@ -4,6 +4,7 @@ import { getDb } from "@/db";
 import { isExternalDatabase } from "@/db/external";
 import { calendarEventOverrides, calendarEvents, calendarSubscriptions, users } from "@/db/schema";
 import { isMissingColumnError, isMissingTableError, isUniqueConstraintError } from "@/lib/database-errors";
+import { hasPublicEgressGuarantee } from "@/lib/runtime";
 import { normalizeTimeZone } from "@/lib/time/utils";
 import { chunkIds } from "./chunks";
 import { prepareCalendarImport, type ImportIdScheme, type ImportEventRow, type ImportOverrideRow, type PreparedCalendarImport } from "./ics-import";
@@ -299,7 +300,7 @@ async function claimSubscription(db: ReturnType<typeof getDb>, subscription: Sub
  * calendar on a transient upstream error would flap, and unsubscribe is the only delete path.
  */
 export async function refreshSubscription(
-	env: Pick<CloudflareEnv, "DB">,
+	env: Pick<CloudflareEnv, "DB" | "MAILFLARE_RUNTIME">,
 	subscription: SubscriptionRow,
 	options: { floatingZone?: string; fetch?: FeedFetchOptions["fetch"]; resolveHost?: FeedFetchOptions["resolveHost"]; pinConnection?: FeedFetchOptions["pinConnection"]; now?: Date } = {},
 ): Promise<RefreshOutcome> {
@@ -312,7 +313,7 @@ export async function refreshSubscription(
 	};
 	let fetched: Awaited<ReturnType<typeof fetchCalendarFeed>>;
 	try {
-		fetched = await fetchCalendarFeed(subscription.feedUrl, { etag: subscription.etag, lastModified: subscription.lastModified, fetch: options.fetch, resolveHost: options.resolveHost, pinConnection: options.pinConnection });
+		fetched = await fetchCalendarFeed(subscription.feedUrl, { etag: subscription.etag, lastModified: subscription.lastModified, fetch: options.fetch, resolveHost: options.resolveHost, pinConnection: options.pinConnection, publicEgressAsserted: hasPublicEgressGuarantee(env) });
 	} catch (error) {
 		if (error instanceof FeedFetchError) return fail(error.httpStatus, error.message);
 		throw error;
@@ -356,7 +357,7 @@ export async function refreshSubscription(
  * failures are recorded on the row and logged, never thrown, so one dead feed cannot starve the
  * others in this tick.
  */
-export async function runCalendarSubscriptionRefresh(env: Pick<CloudflareEnv, "DB">, now: Date): Promise<void> {
+export async function runCalendarSubscriptionRefresh(env: Pick<CloudflareEnv, "DB" | "MAILFLARE_RUNTIME">, now: Date): Promise<void> {
 	try {
 		const db = getDb(env);
 		let cursor = "";

@@ -72,8 +72,13 @@ interface CloudflareEnv {
 	GITHUB_UPDATE_TOKEN?: string;
 	GITHUB_UPDATE_REF?: string;
 	GITHUB_UPDATE_REPO?: string;
-	/** "node" when served by the self-hosted runtime in server/; unset on Workers. */
-	MAILFLARE_RUNTIME?: "node";
+	/**
+	 * "node" when served by the self-hosted runtime in server/; "cloudflare" when deployed on
+	 * hosted Cloudflare Workers (wrangler vars — the positive public-only-egress assertion).
+	 * Unset on a Workers-family runtime means hosted egress cannot be proven and
+	 * egress-sensitive code must fail closed.
+	 */
+	MAILFLARE_RUNTIME?: "node" | "cloudflare";
 	/** Shared secret the Cloudflare email relay signs inbound webhooks with (self-hosted only). */
 	INBOUND_WEBHOOK_SECRET?: string;
 	/** "1" refuses relays that do not sign the header map with a timestamp (relay Worker v2). */
