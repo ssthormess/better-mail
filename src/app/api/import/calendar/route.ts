@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { and, eq, inArray } from "drizzle-orm";
 import type { BatchItem } from "drizzle-orm/batch";
 import { getDb } from "@/db";
+import { isExternalDatabase } from "@/db/external";
 import { calendarEventOverrides, calendarEvents } from "@/db/schema";
 import { getEnv } from "@/lib/cloudflare";
 import { authorizeCalendarRequest } from "@/lib/calendar/api-auth";
@@ -81,14 +82,20 @@ export async function POST(request: Request) {
 	// event that failed, never a master split from its detached occurrences. Whole-file atomicity
 	// is deliberately not used: one bad event should not roll back an entire honest file, and a
 	// batch per event keeps transactions small. A failure reports exactly what was applied.
+	// On D1 the batch is a real transaction; on an external driver the executor says honestly
+	// whether its transaction wrapper gives one — Neon-class HTTP drivers cannot, so a failed
+	// batch there may have committed a prefix and the route compensates instead.
+	const executor = isExternalDatabase(env.DB) ? env.DB.sqlExecutor : null;
+	const atomic = executor ? (executor.atomicBatch ? await executor.atomicBatch() : executor.transaction !== undefined) : true;
 	const changed = new Set<string>();
 	let imported = 0;
 	let unchanged = 0;
 	let overridesWritten = 0;
-	let failed: { index: number; event: ImportEventRow; error: unknown } | null = null;
+	let failed: { index: number; event: ImportEventRow; error: unknown; reverted: boolean } | null = null;
 	for (const [index, event] of prepared.events.entries()) {
 		const existing = existingById.get(event.id);
 		const statements: BatchItem<"sqlite">[] = [];
+		const touched: TouchedOverride[] = [];
 		let eventOverrides = 0;
 		if (!existing) {
 			statements.push(db.insert(calendarEvents).values(event));
@@ -102,6 +109,7 @@ export async function POST(request: Request) {
 			} else if (overrideDiffers(prior, override)) {
 				statements.push(db.update(calendarEventOverrides).set({ startsAt: override.startsAt, endsAt: override.endsAt, title: override.title, description: override.description, location: override.location, updatedAt: new Date() }).where(eq(calendarEventOverrides.id, prior.id)));
 			} else continue;
+			touched.push({ prior: prior ?? null, override });
 			eventOverrides += 1;
 		}
 		if (!statements.length) {
@@ -111,7 +119,7 @@ export async function POST(request: Request) {
 		try {
 			await db.batch(statements as [BatchItem<"sqlite">, ...BatchItem<"sqlite">[]]);
 		} catch (error) {
-			failed = { index, event, error };
+			failed = { index, event, error, reverted: atomic ? true : await compensateFailedEvent(db, event, existing, touched) };
 			break;
 		}
 		if (existing) changed.add(event.id);
@@ -121,19 +129,24 @@ export async function POST(request: Request) {
 	const errors = [...prepared.errors];
 	if (unchanged) errors.push(`${unchanged} unchanged event(s) already imported; skipped`);
 	if (failed) {
-		const { index, event, error } = failed;
+		const { index, event, error, reverted } = failed;
 		const label = `event #${index + 1}${event.title === "(untitled)" ? "" : ` "${event.title.slice(0, 60)}"`}`;
+		// The driver message can embed SQL text with bound parameters and generated ids; the client
+		// needs the coherent outcome, and the diagnostic stays server-side like JMAP's handler.
+		console.error(`calendar import failed writing ${label}`, error);
 		const applied = imported + changed.size + unchanged;
 		const unattempted = prepared.events.length - applied - 1;
+		const residue = atomic ? "its writes were rolled back" : reverted ? "its partial writes were removed" : "some of its rows may remain";
 		return NextResponse.json(
 			{
 				error: "IMPORT_PARTIAL_FAILURE",
-				detail: `${label} could not be written: ${error instanceof Error ? error.message : "database error"}. The ${applied} event(s) before it stay applied; ${unattempted} were not attempted.`,
+				detail: `${label} could not be written; ${residue}. The ${applied} event(s) before it stay applied; ${unattempted} were not attempted.`,
 				imported,
 				updated: changed.size,
 				overrides: overridesWritten,
 				skipped: prepared.skipped + unchanged,
 				failed: 1,
+				reverted,
 				unattempted,
 				errors,
 			},
@@ -168,4 +181,42 @@ function overrideDiffers(existing: typeof calendarEventOverrides.$inferSelect, o
 		const b = override[column];
 		return a instanceof Date || b instanceof Date ? instant(a) !== instant(b) : a !== b;
 	});
+}
+
+type TouchedOverride = {
+	prior: typeof calendarEventOverrides.$inferSelect | null;
+	override: ImportOverrideRow;
+};
+
+/**
+ * On a driver with no real transaction a failed batch may have committed a prefix of this event's
+ * writes. Put storage back the way the file found it: a new event is deleted outright (its fresh
+ * overrides with it), an existing one gets its master and every touched override restored to the
+ * pre-write snapshot the route already read. Best-effort — returns false when any step itself
+ * fails, so the response admits partial rows may remain instead of claiming a clean revert.
+ */
+async function compensateFailedEvent(
+	db: ReturnType<typeof getDb>,
+	event: ImportEventRow,
+	existing: typeof calendarEvents.$inferSelect | undefined,
+	touched: TouchedOverride[],
+): Promise<boolean> {
+	try {
+		if (!existing) {
+			await db.delete(calendarEventOverrides).where(eq(calendarEventOverrides.eventId, event.id));
+			await db.delete(calendarEvents).where(eq(calendarEvents.id, event.id));
+			return true;
+		}
+		await db.update(calendarEvents).set({ ...masterFields(existing), updatedAt: existing.updatedAt }).where(eq(calendarEvents.id, existing.id));
+		for (const { prior, override } of touched) {
+			if (prior) {
+				await db.update(calendarEventOverrides).set({ startsAt: prior.startsAt, endsAt: prior.endsAt, title: prior.title, description: prior.description, location: prior.location, updatedAt: prior.updatedAt }).where(eq(calendarEventOverrides.id, prior.id));
+			} else {
+				await db.delete(calendarEventOverrides).where(and(eq(calendarEventOverrides.eventId, override.eventId), eq(calendarEventOverrides.occurrenceMs, override.occurrenceMs)));
+			}
+		}
+		return true;
+	} catch {
+		return false;
+	}
 }

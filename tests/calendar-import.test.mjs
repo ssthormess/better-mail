@@ -418,11 +418,87 @@ test("a write failure rolls back its whole event and reports what was applied", 
 	assert.equal(body.error, "IMPORT_PARTIAL_FAILURE");
 	assert.equal(body.imported, 1);
 	assert.equal(body.failed, 1);
+	assert.equal(body.reverted, true);
 	assert.equal(body.unattempted, 1);
 	// The aborted batch left no split state: the first event committed, the failed event left
 	// zero rows — neither its master nor half its override set.
 	assert.deepEqual(eventsOf(sqlite, "user-2").map((event) => event.title), ["First"]);
 	assert.equal(sqlite.prepare("SELECT COUNT(*) AS n FROM calendar_event_overrides o JOIN calendar_events e ON o.event_id = e.id WHERE e.user_id = 'user-2'").get().n, 0);
+	// The client gets the outcome, not the driver's message — raw SQL errors stay in the server log.
+	assert.ok(!body.detail.includes("forced override failure"));
+});
+
+// env.DB fakes a Neon-class external driver: the drizzle handle is real, but its batch runs
+// statements sequentially and the executor honestly reports no transaction — the shape
+// lazyExecutor produces for HTTP protocols. Returns the handle to the raw sqlite for triggers.
+async function sequentialDriver(t, seedSql) {
+	const { sqlite, db } = await newDatabase(t, seedSql);
+	globalThis.calImportUser = secondUser;
+	globalThis.calImportKey = null;
+	globalThis.calImportEnv = {
+		DB: {
+			createDrizzle: () => new Proxy(db, {
+				get: (target, prop) => (prop === "batch"
+					? async (statements) => {
+						for (const statement of statements) await statement;
+					}
+					: Reflect.get(target, prop)),
+			}),
+			sqlExecutor: { dialect: "postgres", query: async () => { throw new Error("unreachable"); }, atomicBatch: async () => false },
+		},
+	};
+	return sqlite;
+}
+
+test("on a driver without transactions a failed event is cleaned up and reported", async (t) => {
+	const sqlite = await sequentialDriver(t, seed);
+	const logged = [];
+	const originalError = console.error;
+	console.error = (...args) => logged.push(args);
+	t.after(() => { console.error = originalError; });
+	sqlite.exec(`CREATE TRIGGER fail_override BEFORE INSERT ON calendar_event_overrides WHEN NEW.occurrence_ms = ${Date.parse("2026-11-09T09:00:00Z")} BEGIN SELECT RAISE(ABORT, 'forced override failure'); END;`);
+	const res = await app.route.POST(req(ics([
+		...vevent(["UID:first", "DTSTART:20261101T090000Z", "SUMMARY:First"]),
+		...vevent(["UID:two", "DTSTART:20261102T090000Z", "DTEND:20261102T100000Z", "SUMMARY:Series", "RRULE:FREQ=WEEKLY"]),
+		...vevent(["UID:two", "RECURRENCE-ID:20261109T090000Z", "DTSTART:20261109T110000Z", "DTEND:20261109T120000Z", "SUMMARY:Moved"]),
+		...vevent(["UID:three", "DTSTART:20261103T090000Z", "SUMMARY:Third"]),
+	])));
+	assert.equal(res.status, 500);
+	const body = await res.json();
+	assert.equal(body.error, "IMPORT_PARTIAL_FAILURE");
+	assert.equal(body.imported, 1);
+	assert.equal(body.failed, 1);
+	assert.equal(body.reverted, true);
+	assert.equal(body.unattempted, 1);
+	assert.ok(body.detail.includes("partial writes were removed"));
+	// Sequential execution committed the failed event's master before the override aborted;
+	// compensation removed it, so storage looks exactly like the transactional case.
+	assert.deepEqual(eventsOf(sqlite, "user-2").map((event) => event.title), ["First"]);
+	assert.equal(sqlite.prepare("SELECT COUNT(*) AS n FROM calendar_event_overrides o JOIN calendar_events e ON o.event_id = e.id WHERE e.user_id = 'user-2'").get().n, 0);
+	// The raw driver error is a server-side diagnostic, not client detail.
+	assert.ok(!body.detail.includes("forced override failure"));
+	assert.ok(!body.detail.includes("insert into"));
+	assert.ok(logged.some((args) => String(args[0]).includes("calendar import failed") && String(args[1]).includes("Failed query")));
+});
+
+test("when cleanup also fails the response admits partial rows may remain", async (t) => {
+	const sqlite = await sequentialDriver(t, seed);
+	sqlite.exec(`CREATE TRIGGER fail_override BEFORE INSERT ON calendar_event_overrides WHEN NEW.occurrence_ms = ${Date.parse("2026-11-09T09:00:00Z")} BEGIN SELECT RAISE(ABORT, 'forced override failure'); END;`);
+	sqlite.exec("CREATE TRIGGER block_cleanup BEFORE DELETE ON calendar_events WHEN OLD.user_id = 'user-2' BEGIN SELECT RAISE(ABORT, 'delete blocked'); END;");
+	const res = await app.route.POST(req(ics([
+		...vevent(["UID:first", "DTSTART:20261101T090000Z", "SUMMARY:First"]),
+		...vevent(["UID:two", "DTSTART:20261102T090000Z", "DTEND:20261102T100000Z", "SUMMARY:Series", "RRULE:FREQ=WEEKLY"]),
+		...vevent(["UID:two", "RECURRENCE-ID:20261109T090000Z", "DTSTART:20261109T110000Z", "DTEND:20261109T120000Z", "SUMMARY:Moved"]),
+	])));
+	assert.equal(res.status, 500);
+	const body = await res.json();
+	assert.equal(body.error, "IMPORT_PARTIAL_FAILURE");
+	assert.equal(body.failed, 1);
+	assert.equal(body.reverted, false);
+	assert.ok(body.detail.includes("may remain"));
+	// The failed event's master committed before the abort and the blocked cleanup left it: the
+	// report counts it as failed, not applied, and never claims the store is clean.
+	assert.deepEqual(eventsOf(sqlite, "user-2").map((event) => event.title), ["First", "Series"]);
 });
 
 test("the export feed for a fixed fixture still hashes to its pinned digest", async () => {

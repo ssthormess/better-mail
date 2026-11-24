@@ -19,6 +19,12 @@ export interface SqlExecutor {
 	query(sql: string, params: unknown[], mode: RowMode): Promise<QueryResult>;
 	/** Run `fn` atomically on one connection. Absent for HTTP drivers that cannot hold a transaction open. */
 	transaction?<T>(fn: (tx: SqlExecutor) => Promise<T>): Promise<T>;
+	/**
+	 * Whether `transaction` gives real atomicity — needed because lazyExecutor always supplies a
+	 * `transaction` wrapper and only learns the truth once the real driver is open. Absent means
+	 * the `transaction` property itself is the answer: present is atomic, absent is sequential.
+	 */
+	atomicBatch?(): Promise<boolean>;
 	close?(): Promise<void>;
 }
 
@@ -88,6 +94,9 @@ export function lazyExecutor(dialect: DatabaseDialect, open: () => Promise<SqlEx
 			if (!inner.transaction) return fn(inner);
 			return inner.transaction(fn);
 		},
+		// This wrapper fakes `transaction` even where the inner driver has none (HTTP protocols
+		// cannot hold one open), so callers that need the honest answer ask here.
+		atomicBatch: async () => (await ready()).transaction !== undefined,
 		close: async () => {
 			if (pending) await (await pending).close?.();
 			pending = undefined;
