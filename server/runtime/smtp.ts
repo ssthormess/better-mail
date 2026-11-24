@@ -64,7 +64,7 @@ export function startSmtpListener(
 				return;
 			}
 			const from = session.envelope.mailFrom ? session.envelope.mailFrom.address : "";
-			const declaredSize = Number((session.envelope.mailFrom?.args as { SIZE?: string } | undefined)?.SIZE);
+			const declaredSize = Number(session.envelope.mailFrom ? (session.envelope.mailFrom.args as { SIZE?: string }).SIZE : undefined);
 			recipientRejectReason(env, from, address.address, Number.isFinite(declaredSize) && declaredSize > 0 ? declaredSize : 0).then(
 				(reason) => callback(reason ? Object.assign(new Error(reason), { responseCode: 550 }) : undefined),
 				(error) => {

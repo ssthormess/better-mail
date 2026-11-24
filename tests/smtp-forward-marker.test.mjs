@@ -19,7 +19,9 @@ const mocks = {
 	}`,
 	"@/lib/email/inbound-attachments": "export async function inboundAttachmentLimitReasonFromRaw() { return null; }",
 	"@/db": `export function getDb() { const q = { select: () => q, from: () => q, where: () => q, limit: async () => [{ id: "d" }] }; return q; }`,
-	"@/db/schema": `export const domains = { id: "id", hostname: "hostname" };`,
+	"@/db/schema": `export const domains = { id: "id", hostname: "hostname" };
+		export const messages = {};
+		export const messageAttachments = {};`,
 	"./smtp-auth": "export async function verifySmtpAuthentication() { return undefined; }",
 	"@/lib/email/routing": "export async function resolveInboundAddress() { return null; } export async function recordRuleMatch() {}",
 };
