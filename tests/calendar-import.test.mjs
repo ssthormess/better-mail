@@ -403,6 +403,28 @@ test("an octet-stream body imports and damaged bytes fail cleanly", async (t) =>
 	}
 });
 
+test("a write failure rolls back its whole event and reports what was applied", async (t) => {
+	const sqlite = await setup(t, { user: secondUser });
+	// Fail only the override insert at the second event's occurrence instant.
+	sqlite.exec(`CREATE TRIGGER fail_override BEFORE INSERT ON calendar_event_overrides WHEN NEW.occurrence_ms = ${Date.parse("2026-11-09T09:00:00Z")} BEGIN SELECT RAISE(ABORT, 'forced override failure'); END;`);
+	const res = await app.route.POST(req(ics([
+		...vevent(["UID:first", "DTSTART:20261101T090000Z", "SUMMARY:First"]),
+		...vevent(["UID:two", "DTSTART:20261102T090000Z", "DTEND:20261102T100000Z", "SUMMARY:Series", "RRULE:FREQ=WEEKLY"]),
+		...vevent(["UID:two", "RECURRENCE-ID:20261109T090000Z", "DTSTART:20261109T110000Z", "DTEND:20261109T120000Z", "SUMMARY:Moved"]),
+		...vevent(["UID:three", "DTSTART:20261103T090000Z", "SUMMARY:Third"]),
+	])));
+	assert.equal(res.status, 500);
+	const body = await res.json();
+	assert.equal(body.error, "IMPORT_PARTIAL_FAILURE");
+	assert.equal(body.imported, 1);
+	assert.equal(body.failed, 1);
+	assert.equal(body.unattempted, 1);
+	// The aborted batch left no split state: the first event committed, the failed event left
+	// zero rows — neither its master nor half its override set.
+	assert.deepEqual(eventsOf(sqlite, "user-2").map((event) => event.title), ["First"]);
+	assert.equal(sqlite.prepare("SELECT COUNT(*) AS n FROM calendar_event_overrides o JOIN calendar_events e ON o.event_id = e.id WHERE e.user_id = 'user-2'").get().n, 0);
+});
+
 test("the export feed for a fixed fixture still hashes to its pinned digest", async () => {
 	// Pins F21's download byte-for-byte on this branch: a fixed clock, one TZID series with an
 	// exclusion, an RSVP'd guest, a detached exception and an extra occurrence.

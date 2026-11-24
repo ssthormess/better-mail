@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { and, eq, inArray } from "drizzle-orm";
+import type { BatchItem } from "drizzle-orm/batch";
 import { getDb } from "@/db";
 import { calendarEventOverrides, calendarEvents } from "@/db/schema";
 import { getEnv } from "@/lib/cloudflare";
@@ -58,20 +59,6 @@ export async function POST(request: Request) {
 		for (const row of await db.select().from(calendarEvents).where(and(inArray(calendarEvents.id, chunk), eq(calendarEvents.userId, user.id)))) existingById.set(row.id, row);
 	}
 	const writableIds = new Set(prepared.events.map((event) => event.id));
-	const changed = new Set<string>();
-	let imported = 0;
-	for (const event of prepared.events) {
-		const existing = existingById.get(event.id);
-		if (!existing) {
-			await db.insert(calendarEvents).values(event);
-			imported += 1;
-			continue;
-		}
-		if (masterDiffers(existing, event)) {
-			await db.update(calendarEvents).set({ ...masterFields(event), updatedAt: new Date() }).where(eq(calendarEvents.id, event.id));
-			changed.add(event.id);
-		}
-	}
 	// Overrides upsert on the table's natural key (eventId, occurrenceMs): an occurrence the file
 	// still describes is inserted when missing or updated when its content moved, while overrides
 	// the file no longer mentions — a UI edit, or one a different file added — are left alone.
@@ -82,21 +69,77 @@ export async function POST(request: Request) {
 			existingPairs.set(`${row.eventId}:${row.occurrenceMs}`, row);
 		}
 	}
-	let overridesWritten = 0;
+	const overridesByEvent = new Map<string, ImportOverrideRow[]>();
 	for (const override of prepared.overrides) {
 		if (!writableIds.has(override.eventId)) continue;
-		const existing = existingPairs.get(`${override.eventId}:${override.occurrenceMs}`);
-		if (!existing) {
-			await db.insert(calendarEventOverrides).values(override);
-		} else if (overrideDiffers(existing, override)) {
-			await db.update(calendarEventOverrides).set({ startsAt: override.startsAt, endsAt: override.endsAt, title: override.title, description: override.description, location: override.location, updatedAt: new Date() }).where(eq(calendarEventOverrides.id, existing.id));
-		} else continue;
-		overridesWritten += 1;
-		if (existingById.has(override.eventId)) changed.add(override.eventId);
+		const list = overridesByEvent.get(override.eventId) ?? [];
+		list.push(override);
+		overridesByEvent.set(override.eventId, list);
 	}
-	const unchanged = [...existingById.keys()].filter((id) => !changed.has(id)).length;
+	// Each event's master row plus all of its override rows commit in one batch — an event is the
+	// atomic unit, so a database failure leaves complete events before it and zero rows for the
+	// event that failed, never a master split from its detached occurrences. Whole-file atomicity
+	// is deliberately not used: one bad event should not roll back an entire honest file, and a
+	// batch per event keeps transactions small. A failure reports exactly what was applied.
+	const changed = new Set<string>();
+	let imported = 0;
+	let unchanged = 0;
+	let overridesWritten = 0;
+	let failed: { index: number; event: ImportEventRow; error: unknown } | null = null;
+	for (const [index, event] of prepared.events.entries()) {
+		const existing = existingById.get(event.id);
+		const statements: BatchItem<"sqlite">[] = [];
+		let eventOverrides = 0;
+		if (!existing) {
+			statements.push(db.insert(calendarEvents).values(event));
+		} else if (masterDiffers(existing, event)) {
+			statements.push(db.update(calendarEvents).set({ ...masterFields(event), updatedAt: new Date() }).where(eq(calendarEvents.id, event.id)));
+		}
+		for (const override of overridesByEvent.get(event.id) ?? []) {
+			const prior = existingPairs.get(`${override.eventId}:${override.occurrenceMs}`);
+			if (!prior) {
+				statements.push(db.insert(calendarEventOverrides).values(override));
+			} else if (overrideDiffers(prior, override)) {
+				statements.push(db.update(calendarEventOverrides).set({ startsAt: override.startsAt, endsAt: override.endsAt, title: override.title, description: override.description, location: override.location, updatedAt: new Date() }).where(eq(calendarEventOverrides.id, prior.id)));
+			} else continue;
+			eventOverrides += 1;
+		}
+		if (!statements.length) {
+			if (existing) unchanged += 1;
+			continue;
+		}
+		try {
+			await db.batch(statements as [BatchItem<"sqlite">, ...BatchItem<"sqlite">[]]);
+		} catch (error) {
+			failed = { index, event, error };
+			break;
+		}
+		if (existing) changed.add(event.id);
+		else imported += 1;
+		overridesWritten += eventOverrides;
+	}
 	const errors = [...prepared.errors];
 	if (unchanged) errors.push(`${unchanged} unchanged event(s) already imported; skipped`);
+	if (failed) {
+		const { index, event, error } = failed;
+		const label = `event #${index + 1}${event.title === "(untitled)" ? "" : ` "${event.title.slice(0, 60)}"`}`;
+		const applied = imported + changed.size + unchanged;
+		const unattempted = prepared.events.length - applied - 1;
+		return NextResponse.json(
+			{
+				error: "IMPORT_PARTIAL_FAILURE",
+				detail: `${label} could not be written: ${error instanceof Error ? error.message : "database error"}. The ${applied} event(s) before it stay applied; ${unattempted} were not attempted.`,
+				imported,
+				updated: changed.size,
+				overrides: overridesWritten,
+				skipped: prepared.skipped + unchanged,
+				failed: 1,
+				unattempted,
+				errors,
+			},
+			{ status: 500 },
+		);
+	}
 	return NextResponse.json({ imported, updated: changed.size, overrides: overridesWritten, skipped: prepared.skipped + unchanged, errors });
 }
 
