@@ -120,13 +120,19 @@ export function startSmtpListener(
 				});
 				let delivered = 0;
 				let dropReason: string | null = null;
+				const forward = async (destination: string, extra: Record<string, string>) => {
+					const sent = await mailer.sendRaw(from, destination, prependHeaders(raw, extra));
+					// A completed sendRaw delivered the message even when the local copy
+					// is refused afterwards — count the side effect here, independently
+					// of the verdict intake ends up returning.
+					if (sent) delivered += 1;
+					return sent;
+				};
 				for (const recipient of session.envelope.rcptTo) {
 					const result = await intakeIncomingMail(
 						env,
 						{ from, to: recipient.address, raw: toArrayBuffer(raw), headers, senderIp, verdicts },
-						{
-							forward: async (destination, extra) => mailer.sendRaw(from, destination, prependHeaders(raw, extra)),
-						},
+						{ forward },
 					).catch((error) => {
 						console.error(`SMTP intake failed for ${recipient.address}`, error);
 						return null;
@@ -144,8 +150,9 @@ export function startSmtpListener(
 						dropReason ??= result.reason;
 						continue;
 					}
-					// A queued copy or a completed forward is a real delivery side effect.
-					delivered += 1;
+					// A queued copy is a side effect; a "forward" return already
+					// counted its completed sendRaw in the callback above.
+					if (result.action === "store") delivered += 1;
 				}
 				// ...but when every accepted recipient dropped and nothing was stored,
 				// queued or forwarded anywhere, answering "queued" would lie. DATA is

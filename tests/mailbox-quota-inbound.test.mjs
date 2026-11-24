@@ -412,7 +412,8 @@ test("the SMTP listener only bounces decisions that really store, and only claim
 		`,
 	});
 	const forwarded = [];
-	const server = startSmtpListener(env, { sendRaw: async (_from, to) => { forwarded.push(to); return true; } }, { port: 0, host: "127.0.0.1", maxSize: 65536, hostname: "mx.one.test", tls: null });
+	let forwardSucceeds = true;
+	const server = startSmtpListener(env, { sendRaw: async (_from, to) => { if (forwardSucceeds) forwarded.push(to); return forwardSucceeds; } }, { port: 0, host: "127.0.0.1", maxSize: 65536, hostname: "mx.one.test", tls: null });
 	t.after(async () => new Promise((resolve) => server.close(resolve)));
 	await once(server.server, "listening");
 	const socket = net.connect({ host: "127.0.0.1", port: server.server.address().port });
@@ -449,6 +450,28 @@ test("the SMTP listener only bounces decisions that really store, and only claim
 	assert.match(await reply("DATA\r\n"), /^354/);
 	assert.match(await reply("From: s@x.test\r\nTo: direct@one.test\r\n\r\nhi\r\n.\r\n"), /^250/);
 	assert.deepEqual(forwarded, ["team@elsewhere.test", "dest@somewhere.test"]);
+	// A keep-copy forward that completed its sendRaw delivered the message, even
+	// when the local copy is then refused on quota — the sender must not see a
+	// false failure for mail that went out.
+	sqlite.exec("UPDATE routing_rules SET keep_copy = 1 WHERE id = 'mf'");
+	assert.match(await reply("MAIL FROM:<sender@example.test>\r\n"), /^250/);
+	assert.match(await reply("RCPT TO:<direct@one.test>\r\n"), /^250/);
+	assert.match(await reply("DATA\r\n"), /^354/);
+	assert.match(await reply("From: s@x.test\r\nTo: direct@one.test\r\n\r\nhi\r\n.\r\n"), /^250/, "the completed forward is a delivery side effect");
+	assert.deepEqual(forwarded, ["team@elsewhere.test", "dest@somewhere.test", "dest@somewhere.test"]);
+	assert.equal(objects.size, 0, "the refused copy stored nothing");
+	assert.equal(queued.length, 0);
+	// The same shape with the forward itself failing: nothing delivered anywhere,
+	// so the refused copy is an honest bounce.
+	forwardSucceeds = false;
+	assert.match(await reply("MAIL FROM:<sender@example.test>\r\n"), /^250/);
+	assert.match(await reply("RCPT TO:<direct@one.test>\r\n"), /^250/);
+	assert.match(await reply("DATA\r\n"), /^354/);
+	const failEnd = await reply("From: s@x.test\r\nTo: direct@one.test\r\n\r\nhi\r\n.\r\n");
+	assert.match(failEnd, /^550/, "failed forward + refused copy delivered nothing");
+	assert.match(failEnd, /storage limit/);
+	assert.deepEqual(forwarded, ["team@elsewhere.test", "dest@somewhere.test", "dest@somewhere.test"], "the failed sendRaw completed nothing");
+	forwardSucceeds = true;
 	// A sole accepted recipient that drops at DATA with zero delivery side effects
 	// is a real bounce, not a false "queued".
 	assert.match(await reply("MAIL FROM:<sender@example.test>\r\n"), /^250/);
