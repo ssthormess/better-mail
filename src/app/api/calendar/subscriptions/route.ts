@@ -97,15 +97,19 @@ export async function POST(request: Request) {
 		createdAt: new Date(),
 		updatedAt: new Date(),
 	};
-	let stats;
+	let synced;
 	try {
 		await db.insert(calendarSubscriptions).values(subscription);
-		stats = await syncFeedEvents(env, subscription, prepared);
+		synced = await syncFeedEvents(env, subscription, prepared);
 	} catch (writeError) {
 		// Roll the row back so a half-written subscription does not sit there waiting on the cron.
 		await db.delete(calendarSubscriptions).where(eq(calendarSubscriptions.id, subscription.id)).catch(() => undefined);
 		if (isUniqueConstraintError(writeError)) return NextResponse.json({ error: "Already subscribed to this feed" }, { status: 409 });
 		throw writeError;
 	}
-	return NextResponse.json({ subscription, added: stats.added, skipped: prepared.skipped, errors: prepared.errors });
+	if (synced.failure || synced.unsubscribed) {
+		await db.delete(calendarSubscriptions).where(eq(calendarSubscriptions.id, subscription.id)).catch(() => undefined);
+		return NextResponse.json({ error: "FEED_SYNC_FAILED", detail: `Calendar feed events could not be written${synced.failure ? ` (${synced.failure.outcome})` : ""}` }, { status: 500 });
+	}
+	return NextResponse.json({ subscription, added: synced.stats.added, skipped: prepared.skipped + synced.stats.unchanged, errors: prepared.errors });
 }

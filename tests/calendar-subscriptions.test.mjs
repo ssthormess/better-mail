@@ -15,6 +15,7 @@ const { app, newDatabase } = await loadApp("cal-subs", `
 	export * as itemRoute from "./src/app/api/calendar/subscriptions/[subscriptionId]/route.ts";
 	export { runCalendarSubscriptionRefresh, refreshSubscription, subscriptionIdScheme, subscriptionDue } from "./src/lib/calendar/subscriptions.ts";
 	export { normalizeFeedUrl, fetchCalendarFeed, FeedFetchError } from "./src/lib/calendar/subscription-feed.ts";
+	export { calendarSubscriptions } from "./src/db/schema/index.ts";
 `, { mocks });
 
 const sec = (iso) => Math.floor(Date.parse(iso) / 1000);
@@ -401,3 +402,141 @@ test("the evt_s_ identity folds in the subscription id, so two feeds can carry t
 	assert.equal(secondEvents.length, 1);
 	assert.notEqual(firstEvents[0].id, secondEvents[0].id, "same UID, different feeds, different rows");
 });
+
+test("every fetch hop pins the connection to the addresses the DNS check approved", async (t) => {
+	await setup(t);
+	const resolutions = [];
+	const pins = [];
+	const requests = [];
+	const result = await app.fetchCalendarFeed("https://feeds.example/release.ics", {
+		resolveHost: async (hostname) => {
+			// A hostile resolver that would answer differently on a second lookup: the pinned set
+			// must be exactly what this call returned, because there is no second call to exploit.
+			resolutions.push(hostname);
+			return [PUBLIC_IP];
+		},
+		pinConnection: async (hostname, addresses) => {
+			pins.push({ hostname, addresses });
+			return { cf: { resolveOverride: addresses[0] } };
+		},
+		fetch: async (input, init) => {
+			requests.push({ url: String(input), init });
+			return feedResponse(feedV1);
+		},
+	});
+	assert.equal(result.outcome, "fetched");
+	assert.deepEqual(resolutions, ["feeds.example"], "one resolution per hop");
+	assert.equal(pins.length, 1);
+	assert.deepEqual(pins[0].addresses, [PUBLIC_IP], "the pin is the validated address set");
+	assert.equal(requests[0].init.cf.resolveOverride, PUBLIC_IP, "the request goes to the checked address");
+	assert.equal(new URL(requests[0].url).hostname, "feeds.example", "the URL keeps its hostname for Host/SNI");
+	assert.equal(requests[0].init.redirect, "manual");
+
+	// On this Node runtime the default pin is a per-request undici dispatcher carrying the lookup.
+	const defaultCalls = stubFetch(t, { serve: () => feedResponse(feedV1) });
+	const defaultResult = await app.fetchCalendarFeed("https://feeds.example/release.ics");
+	assert.equal(defaultResult.outcome, "fetched");
+	assert.ok(defaultCalls[0].init.dispatcher, "the default pin supplies a dispatcher");
+	assert.equal(defaultCalls[0].init.cf, undefined);
+
+	// A runtime with no pinning facility must fail closed, not fall back to an unpinned request.
+	const closedCalls = stubFetch(t, { serve: () => feedResponse(feedV1) });
+	await assert.rejects(
+		app.fetchCalendarFeed("https://feeds.example/release.ics", { pinConnection: async () => ({}) }),
+		(error) => error instanceof app.FeedFetchError && error.code === "pinning_unavailable",
+	);
+	assert.equal(closedCalls.length, 0, "nothing was fetched unpinned");
+});
+
+test("a cancelled-only snapshot keeps the stored events and records the anomaly", async (t) => {
+	const { env, sqlite } = await setup(t);
+	let body = feedV1;
+	stubFetch(t, { serve: () => feedResponse(body) });
+	const created = await (await app.route.POST(post({ url: "https://feeds.example/release.ics" }))).json();
+	const subId = created.subscription.id;
+	assert.equal(eventsOf(sqlite, subId).length, 2);
+	// The upstream still answers 200, but every VEVENT is cancelled — a degraded snapshot must
+	// not prune the calendar it owns.
+	body = ics([
+		"X-WR-CALNAME:Release Calendar",
+		...vevent(["UID:evt-a", "STATUS:CANCELLED", "DTSTART:20261201T170000Z", "DTEND:20261201T180000Z", "SUMMARY:Release party"]),
+		...vevent(["UID:evt-b", "STATUS:CANCELLED", "DTSTART:20261202T170000Z", "DTEND:20261202T180000Z", "SUMMARY:Standup", "RRULE:FREQ=DAILY;COUNT=3"]),
+	]);
+	sqlite.prepare("UPDATE calendar_subscriptions SET last_refresh_at = 1 WHERE id = ?").run(subId);
+	await app.runCalendarSubscriptionRefresh(env, new Date("2026-11-24T12:00:00Z"));
+	const sub = sqlite.prepare("SELECT * FROM calendar_subscriptions WHERE id = ?").get(subId);
+	assert.equal(sub.last_refresh_status, 200);
+	assert.match(sub.last_error, /no usable events/i);
+	assert.equal(eventsOf(sqlite, subId).length, 2, "the previous event set survived the anomalous snapshot");
+	assert.equal(sub.event_count, 2);
+	// The run logs the anomaly instead of reporting a healthy sync.
+	const subRow = await dbSelect(env, subId);
+	const outcome = await app.refreshSubscription(env, subRow, { fetch: async () => feedResponse(body), now: new Date("2026-11-24T13:00:00Z") });
+	assert.equal(outcome.outcome, "anomaly");
+	assert.equal(outcome.owned, 2);
+});
+
+test("a second refresh of the same feed loses the claim and writes nothing", async (t) => {
+	const { env, sqlite } = await setup(t);
+	stubFetch(t, { serve: () => feedResponse(feedV1) });
+	const created = await (await app.route.POST(post({ url: "https://feeds.example/release.ics" }))).json();
+	const subId = created.subscription.id;
+	sqlite.prepare("UPDATE calendar_subscriptions SET last_refresh_at = 1 WHERE id = ?").run(subId);
+	const sub = await dbSelect(env, subId);
+	// Two overlapping refreshes read the same row: only the first compare-and-set may proceed.
+	const [first, second] = await Promise.all([
+		app.refreshSubscription(env, sub, { fetch: async () => feedResponse(feedV2), now: new Date("2026-11-24T12:00:00Z") }),
+		app.refreshSubscription(env, sub, { fetch: async () => feedResponse(feedV2), now: new Date("2026-11-24T12:00:00Z") }),
+	]);
+	const outcomes = [first.outcome, second.outcome].sort();
+	assert.deepEqual(outcomes, ["skipped", "synced"], "exactly one refresh claimed the feed");
+	assert.equal(eventsOf(sqlite, subId).length, 2);
+	assert.deepEqual(eventsOf(sqlite, subId).map((event) => event.title).sort(), ["New review", "Release party moved"]);
+});
+
+test("unsubscribing mid-refresh leaves no zombie evt_s_ rows", async (t) => {
+	const { env, sqlite } = await setup(t);
+	stubFetch(t, { serve: () => feedResponse(feedV1) });
+	const created = await (await app.route.POST(post({ url: "https://feeds.example/release.ics" }))).json();
+	const subId = created.subscription.id;
+	sqlite.prepare("UPDATE calendar_subscriptions SET last_refresh_at = 1 WHERE id = ?").run(subId);
+	const sub = await dbSelect(env, subId);
+	// The claim wins, then the row is deleted while the fetch is in flight: the write phase must
+	// see the missing owner and stop, so no evt_s_ row lands under a dead subscription id.
+	const outcome = await app.refreshSubscription(env, sub, {
+		fetch: async () => {
+			sqlite.prepare("DELETE FROM calendar_subscriptions WHERE id = ?").run(subId);
+			return feedResponse(feedV2);
+		},
+		now: new Date("2026-11-24T12:00:00Z"),
+	});
+	assert.equal(outcome.outcome, "unsubscribed");
+	assert.equal(eventsOf(sqlite, subId).length, 0);
+	assert.equal(sqlite.prepare("SELECT COUNT(*) AS n FROM calendar_events WHERE id LIKE 'evt_s_%'").get().n, 0, "no orphaned feed rows remain");
+});
+
+test("a failed event write reports the sync honestly and keeps prior rows", async (t) => {
+	const { env, sqlite } = await setup(t);
+	stubFetch(t, { serve: () => feedResponse(feedV1) });
+	const created = await (await app.route.POST(post({ url: "https://feeds.example/release.ics" }))).json();
+	const subId = created.subscription.id;
+	// Refuse new event inserts mid-refresh: the stats must not credit writes that never landed.
+	sqlite.exec("CREATE TRIGGER block_event_inserts BEFORE INSERT ON calendar_events BEGIN SELECT RAISE(ABORT, 'blocked insert'); END;");
+	sqlite.prepare("UPDATE calendar_subscriptions SET last_refresh_at = 1 WHERE id = ?").run(subId);
+	const sub = await dbSelect(env, subId);
+	const outcome = await app.refreshSubscription(env, sub, { fetch: async () => feedResponse(feedV2), now: new Date("2026-11-24T12:00:00Z") });
+	assert.equal(outcome.outcome, "failed");
+	const row = sqlite.prepare("SELECT * FROM calendar_subscriptions WHERE id = ?").get(subId);
+	assert.match(row.last_error, /failed/i);
+	// evt-a's update already proved, evt-b was honestly pruned, evt-c's insert was refused — the
+	// residue is exactly what the driver proved, and event_count is left at its last proven value.
+	const titles = eventsOf(sqlite, subId).map((event) => event.title).sort();
+	assert.deepEqual(titles, ["Release party moved"]);
+	assert.equal(row.event_count, 2);
+	sqlite.exec("DROP TRIGGER block_event_inserts");
+});
+
+async function dbSelect(env, subId) {
+	const rows = await app.getDb(env).select().from(app.calendarSubscriptions);
+	return rows.find((row) => row.id === subId);
+}
