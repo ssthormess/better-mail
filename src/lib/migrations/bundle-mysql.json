@@ -386,6 +386,47 @@
         "CREATE INDEX `calendar_invite_tombstones_user_idx` ON `calendar_invite_tombstones` (`user_id`);",
         "CREATE INDEX `calendar_occurrence_responses_event_idx` ON `calendar_occurrence_responses` (`event_id`);"
       ]
+    },
+    {
+      "name": "0017_vacation_responder.sql",
+      "statements": [
+        "ALTER TABLE `mailboxes` ADD `auto_reply_start_at` bigint;",
+        "ALTER TABLE `mailboxes` ADD `auto_reply_end_at` bigint;",
+        "ALTER TABLE `mailboxes` ADD `auto_reply_activated_at` bigint;"
+      ]
+    },
+    {
+      "name": "0018_mailing_lists.sql",
+      "statements": [
+        "CREATE TABLE `mailing_lists` (\n\t`id` varchar(191) NOT NULL,\n\t`user_id` varchar(191) NOT NULL,\n\t`domain_id` varchar(191) NOT NULL,\n\t`local_part` varchar(191) NOT NULL,\n\t`name` longtext NOT NULL,\n\t`description` longtext,\n\t`disabled` boolean NOT NULL DEFAULT false,\n\t`created_at` bigint NOT NULL,\n\tCONSTRAINT `mailing_lists_id` PRIMARY KEY(`id`),\n\tCONSTRAINT `mailing_lists_address_idx` UNIQUE(`domain_id`,`local_part`)\n);",
+        "CREATE TABLE `mailing_list_members` (\n\t`id` varchar(191) NOT NULL,\n\t`list_id` varchar(191) NOT NULL,\n\t`email` varchar(320) NOT NULL,\n\t`name` longtext,\n\t`role` varchar(64) NOT NULL DEFAULT 'member',\n\t`created_at` bigint NOT NULL,\n\tCONSTRAINT `mailing_list_members_id` PRIMARY KEY(`id`),\n\tCONSTRAINT `mailing_list_members_list_email_idx` UNIQUE(`list_id`,`email`)\n);",
+        "ALTER TABLE `mailing_lists` ADD CONSTRAINT `mailing_lists_user_id_users_id_fk` FOREIGN KEY (`user_id`) REFERENCES `users`(`id`) ON DELETE cascade ON UPDATE no action;",
+        "ALTER TABLE `mailing_lists` ADD CONSTRAINT `mailing_lists_domain_id_domains_id_fk` FOREIGN KEY (`domain_id`) REFERENCES `domains`(`id`) ON DELETE cascade ON UPDATE no action;",
+        "ALTER TABLE `mailing_list_members` ADD CONSTRAINT `mailing_list_members_list_id_mailing_lists_id_fk` FOREIGN KEY (`list_id`) REFERENCES `mailing_lists`(`id`) ON DELETE cascade ON UPDATE no action;",
+        "CREATE INDEX `mailing_lists_user_idx` ON `mailing_lists` (`user_id`);",
+        "CREATE INDEX `mailing_list_members_list_idx` ON `mailing_list_members` (`list_id`);"
+      ]
+    },
+    {
+      "name": "0019_mailing_lists_posting.sql",
+      "statements": [
+        "ALTER TABLE `mailing_lists` ADD `posting_policy` varchar(64) NOT NULL DEFAULT 'members_only';",
+        "ALTER TABLE `mailing_lists` ADD `moderated` boolean NOT NULL DEFAULT false;",
+        "ALTER TABLE `mailing_list_members` ADD `moderated` boolean NOT NULL DEFAULT false;"
+      ]
+    },
+    {
+      "name": "0020_contact_groups.sql",
+      "statements": [
+        "CREATE TABLE `contact_groups` (\n\t`id` varchar(191) NOT NULL,\n\t`user_id` varchar(191) NOT NULL,\n\t`name` varchar(255) NOT NULL,\n\t`created_at` bigint NOT NULL,\n\tCONSTRAINT `contact_groups_id` PRIMARY KEY(`id`),\n\tCONSTRAINT `contact_groups_user_name_idx` UNIQUE(`user_id`,`name`)\n);",
+        "CREATE TABLE `contact_group_members` (\n\t`id` varchar(191) NOT NULL,\n\t`group_id` varchar(191) NOT NULL,\n\t`contact_id` varchar(191) NOT NULL,\n\t`created_at` bigint NOT NULL,\n\tCONSTRAINT `contact_group_members_id` PRIMARY KEY(`id`),\n\tCONSTRAINT `contact_group_members_group_contact_idx` UNIQUE(`group_id`,`contact_id`)\n);",
+        "ALTER TABLE `contact_groups` ADD CONSTRAINT `contact_groups_user_id_users_id_fk` FOREIGN KEY (`user_id`) REFERENCES `users`(`id`) ON DELETE cascade ON UPDATE no action;",
+        "ALTER TABLE `contact_group_members` ADD CONSTRAINT `contact_group_members_group_id_contact_groups_id_fk` FOREIGN KEY (`group_id`) REFERENCES `contact_groups`(`id`) ON DELETE cascade ON UPDATE no action;",
+        "ALTER TABLE `contact_group_members` ADD CONSTRAINT `contact_group_members_contact_id_contacts_id_fk` FOREIGN KEY (`contact_id`) REFERENCES `contacts`(`id`) ON DELETE cascade ON UPDATE no action;",
+        "CREATE INDEX `contact_groups_user_idx` ON `contact_groups` (`user_id`);",
+        "CREATE INDEX `contact_group_members_group_idx` ON `contact_group_members` (`group_id`);",
+        "CREATE INDEX `contact_group_members_contact_idx` ON `contact_group_members` (`contact_id`);"
+      ]
     }
   ]
 }

@@ -1,9 +1,13 @@
 import { eq, and, asc, desc } from "drizzle-orm";
 import type { AppDatabase } from "@/db";
-import { domains, folders, mailboxAliases, mailboxes, routingRules } from "@/db/schema";
-import { getEmailAddress } from "@/lib/email/address";
+import { domains, folders, mailboxAliases, mailboxes, mailingListMembers, mailingLists, routingRules } from "@/db/schema";
+import { getEmailAddress, normalizeEmailAddress } from "@/lib/email/address";
 import { getMailboxDomainAddresses } from "@/lib/mailboxes/domain-addresses";
-import { normalizeRecipientLocalPart, parseRecipientAddress } from "@/lib/email/recipient-address";
+import {
+	normalizeRecipientFullLocalPart,
+	normalizeRecipientLocalPart,
+	parseRecipientAddress,
+} from "@/lib/email/recipient-address";
 
 export type ResolvedMailbox = {
 	mailboxId: string;
@@ -15,15 +19,37 @@ export type ResolvedMailbox = {
 	displayName: string | null;
 };
 
+export type ResolvedList = {
+	listId: string;
+	userId: string;
+	domainId: string;
+	localPart: string;
+	hostname: string;
+	name: string;
+};
+
 export type RoutingDecision = {
-	action: "store" | "forward" | "reject";
+	action: "store" | "forward" | "reject" | "list";
 	mailbox?: ResolvedMailbox;
+	/** Set when the recipient is a mailing list; the queue fans it out to members. */
+	list?: ResolvedList;
 	forwardTo?: string;
 	/** Forward rules drop the message unless the rule also keeps a copy in the mailbox. */
 	keepCopy?: boolean;
 	rejectReason?: string;
 	/** Set when a domain-scope rule produced this decision, so the caller can record a match. */
 	ruleId?: string;
+	/**
+	 * Set on a list decision when the post is held for review: it is accepted but
+	 * fans out only to the list's owner members, not the full membership. A
+	 * moderated list holds posts from non-owner senders — owners are the
+	 * reviewers, so their posts pass and an owner repost approves — while a
+	 * member-level `moderated` flag holds that member's posts at every role.
+	 * The flag applies only to the directly-addressed list: a list reached as
+	 * a member of another list expands as ordinary members with the flag
+	 * ignored — nested moderation is a deferred slice.
+	 */
+	heldForModeration?: boolean;
 };
 
 export type InboxRuleDestination = {
@@ -50,6 +76,14 @@ export type ResolveInboundOptions = {
 	 * sender, which bulk senders set to a bounce address the user never sees.
 	 */
 	mailboxForwards?: { subject?: string | null; from?: string | null };
+	/**
+	 * Skip posting authorization and moderation on a list claim, returning the
+	 * plain list decision. Internal callers that resolve an address only to learn
+	 * whether it maps to a mailbox (the sender and member lookups inside the
+	 * posting check itself) set this so the checks cannot recurse; real delivery
+	 * decisions never do.
+	 */
+	skipPostingAuth?: boolean;
 };
 
 /**
@@ -58,7 +92,12 @@ export type ResolveInboundOptions = {
  * Domain-scope rules are evaluated in three phases so that a broad catch-all can never
  * shadow a real mailbox:
  *   1. `reject` rules (block lists) — highest precedence, evaluated before delivery.
- *   2. exact mailbox, then multi-domain mailbox aliases.
+ *   2. a literal `local+tag` mailbox or enabled mailing list claims a tagged
+ *      address first; then the `local` base claims — exact mailbox, mailbox
+ *      aliases, an enabled base mailing list. A disabled mailbox, alias or
+ *      list claims nothing. Multi-domain mailbox aliases come after all of
+ *      them. An empty-tag `local+` address is literal-only for lists: the
+ *      `local` base list never claims it.
  *   3. remaining `forward` / `store` rules — the catch-all fallback.
  * Within each phase rules run by descending priority, then oldest first.
  */
@@ -94,19 +133,52 @@ export async function resolveInboundAddress(
 		};
 	}
 
-	// Phase 2 — a real mailbox always wins over a catch-all.
+	// Phase 2 — a real mailbox always wins over a catch-all. Literal `user+tag`
+	// claims come before every `user` base claim below, the same exact-then-base
+	// order the plus-addressing pass (#416) applies to all claimants once it
+	// lands: a `user+tag` mailbox, then a `user+tag` mailing list.
 	const exactMailboxes = await db
 		.select()
 		.from(mailboxes)
 		.where(and(eq(mailboxes.domainId, domain.id), eq(mailboxes.disabled, false)));
+	const taggedMailbox = parsed.fullLocalPart !== parsed.localPart
+		? exactMailboxes.find(
+			(mailbox) => normalizeRecipientFullLocalPart(mailbox.localPart) === parsed.fullLocalPart,
+		)
+		: undefined;
+	// An enabled list stored under the address's literal `+` form — `user+tag`,
+	// or `user+` with an empty tag — claims it before every enabled base claim
+	// underneath: exact tagged list > enabled alias paths > base list. A
+	// non-empty tag still reaches the `user` base list behind the claims below,
+	// but `user+` is literal-only for lists, mirroring the plus-addressing
+	// pass: it never falls back to `user`. On this base the mailbox and alias
+	// claims still strip `+` to base, so `user+` mail lands in the `user`
+	// mailbox when no `user+` claimant exists — lists and mailboxes behave
+	// uniformly once #416 merges.
+	if (!taggedMailbox && parsed.fullLocalPart !== parsed.localPart) {
+		const list = await findEnabledMailingList(db, domain.id, parsed.fullLocalPart);
+		if (list) return listClaimDecision(db, list, domain, fromAddress, options);
+	}
 	const exactMailbox = exactMailboxes.find(
 		(mailbox) => normalizeRecipientLocalPart(mailbox.localPart) === parsed.localPart,
 	);
-	let mailbox = exactMailbox ?? await resolveMailboxAlias(db, domain.id, parsed.localPart);
+	let mailbox = taggedMailbox ?? exactMailbox ?? await resolveMailboxAlias(db, domain.id, parsed.localPart);
 	// A disabled alias keeps owning its address: reject instead of letting a
 	// use-all-domains mailbox or a catch-all rule deliver its mail elsewhere.
 	if (!mailbox && await findDisabledAlias(db, domain.id, parsed.localPart)) {
 		return { action: "reject", rejectReason: "Mailbox unavailable" };
+	}
+	// A mailing list claims the address the same way a mailbox or alias does, so
+	// it wins over the implicit use-all-domains claim and the catch-all rules
+	// below, and a disabled list — like a disabled mailbox — simply does not
+	// match. For a `user+tag` address this is the `user` base fallback behind
+	// the literal lookup above: `user+x` resolves to it only when no `user+x`
+	// list exists. Only a lone empty tag skips this pass — `user+` is
+	// literal-only for lists, but `user++` and `user+x+` carry real tags and
+	// fall back to `user` like any other subaddress.
+	if (!mailbox && (parsed.hasSubaddress || !parsed.fullLocalPart.endsWith("+"))) {
+		const list = await findEnabledMailingList(db, domain.id, parsed.localPart);
+		if (list) return listClaimDecision(db, list, domain, fromAddress, options);
 	}
 	mailbox ??= await resolveMailboxDomainAlias(db, parsed.localPart, parsed.normalizedAddress);
 
@@ -282,6 +354,178 @@ async function findDisabledAlias(db: AppDatabase, domainId: string, localPart: s
 		.from(mailboxAliases)
 		.where(and(eq(mailboxAliases.domainId, domainId), eq(mailboxAliases.enabled, false)));
 	return rows.some((row) => normalizeRecipientLocalPart(row.localPart) === localPart);
+}
+
+// Stored list local parts normalize with the tag kept, so a stored `team+x`
+// claims `team+x` and never the `team` base — the same treatment the
+// plus-addressing pass gives stored mailbox and alias local parts.
+async function findEnabledMailingList(db: AppDatabase, domainId: string, localPart: string) {
+	const rows = await db
+		.select()
+		.from(mailingLists)
+		.where(and(eq(mailingLists.domainId, domainId), eq(mailingLists.disabled, false)));
+	return rows.find((list) => normalizeRecipientFullLocalPart(list.localPart) === localPart) ?? null;
+}
+
+function toResolvedList(
+	list: typeof mailingLists.$inferSelect,
+	domain: typeof domains.$inferSelect,
+): ResolvedList {
+	return {
+		listId: list.id,
+		userId: list.userId,
+		domainId: domain.id,
+		localPart: list.localPart,
+		hostname: domain.hostname,
+		name: list.name,
+	};
+}
+
+/**
+ * A list claim is a posting: the sender's right to post is decided here, before
+ * fan-out, so an unauthorized post gets the same reject decision a domain block
+ * rule produces (an SMTP-level reject where the receiver can still issue one).
+ */
+async function listClaimDecision(
+	db: AppDatabase,
+	list: typeof mailingLists.$inferSelect,
+	domain: typeof domains.$inferSelect,
+	fromAddress: string | null | undefined,
+	options: ResolveInboundOptions,
+): Promise<RoutingDecision> {
+	if (options.skipPostingAuth) return { action: "list", list: toResolvedList(list, domain) };
+	const posting = await checkListPosting(db, list, fromAddress);
+	if (posting === "deny") {
+		return { action: "reject", rejectReason: "Sender is not a member of this mailing list" };
+	}
+	return { action: "list", list: toResolvedList(list, domain), heldForModeration: posting === "hold" };
+}
+
+type ListPostingOutcome = "allow" | "hold" | "deny";
+
+/**
+ * The mailbox an address belongs to, for identity purposes only: the explicit
+ * mailbox and enabled-alias claims a direct delivery applies, with the same
+ * plus-tag semantics (`user+tag` claims a stored `user+tag`, else strips to
+ * `user`, and a `useAllDomains` mailbox claims its own local part). Catch-all
+ * and forward rules, block rules, disabled aliases and mailing lists never
+ * count: posting membership is about which mailbox a sender controls, not
+ * where arbitrary mail to that address lands. A member row at an address with
+ * no hosted identity — an external address, or one only a catch-all would
+ * claim — can still match the sender's literal address but never their
+ * mailbox, so a catch-all cannot fold a stranger onto a member's identity.
+ *
+ * This is an envelope-address contract, not sender authentication: SMTP gives
+ * no cryptographic proof the envelope sender is theirs, so membership keys off
+ * address ownership and a spoofed envelope sender inherits that member's
+ * posting rights — the same trust every SMTP list extends to envelope MAIL
+ * FROM.
+ */
+export async function resolveMailboxIdentity(
+	db: AppDatabase,
+	address: string,
+): Promise<ResolvedMailbox | null> {
+	const parsed = parseRecipientAddress(address);
+	if (!parsed) return null;
+	const [domain] = await db
+		.select()
+		.from(domains)
+		.where(and(eq(domains.hostname, parsed.domain), eq(domains.status, "active")))
+		.limit(1);
+	if (!domain) return null;
+
+	const enabledMailboxes = await db
+		.select()
+		.from(mailboxes)
+		.where(and(eq(mailboxes.domainId, domain.id), eq(mailboxes.disabled, false)));
+	const taggedMailbox = parsed.fullLocalPart !== parsed.localPart
+		? enabledMailboxes.find(
+			(mailbox) => normalizeRecipientFullLocalPart(mailbox.localPart) === parsed.fullLocalPart,
+		)
+		: undefined;
+	const mailbox = taggedMailbox
+		?? enabledMailboxes.find(
+			(mailbox) => normalizeRecipientLocalPart(mailbox.localPart) === parsed.localPart,
+		)
+		?? await resolveMailboxAlias(db, domain.id, parsed.localPart)
+		?? await resolveMailboxDomainAlias(db, parsed.localPart, parsed.normalizedAddress);
+	return mailbox ? toResolvedMailbox(mailbox, domain.id, domain.hostname) : null;
+}
+
+/**
+ * Who may post to a list. Membership is established two ways, matching the
+ * sender-suppression semantics in the delivery engine: the envelope sender's
+ * address literally appears as a member email, or its mailbox identity matches
+ * a member row's mailbox identity — a member subscribed under one address can
+ * post from any other address or alias of that mailbox, plus-tags included.
+ *
+ * A `members_only` list denies a sender matching neither path, including an
+ * empty or unparseable envelope sender. `anyone` posts freely — the member scan
+ * still runs there only when a moderated flag exists, because a moderated
+ * member's posts are held under every policy. A list-level `moderated` flag
+ * holds posts from non-owner senders; owners are exempt because they are the
+ * reviewers — an owner approving a held post does so by reposting to the list.
+ * A member-level `moderated` flag is honored at every role, so a moderated
+ * owner's repost is re-held for the remaining owners: approval by repost
+ * needs at least one unmoderated owner. A list that moderates every owner
+ * row still delivers its reviewer copies but has no built-in approval path —
+ * every repost re-holds, so the hold clears only when an operator acts on a
+ * delivered copy or unflags a row. When several member rows map to the
+ * sender's mailbox, any moderated one holds the post and any owner one
+ * exempts the list flag.
+ *
+ * Only rows that can still change the outcome are resolved: once membership
+ * and every flag that matters are settled, the rest of the member list is
+ * never touched, and an open list with no moderation anywhere resolves
+ * nothing at all.
+ */
+async function checkListPosting(
+	db: AppDatabase,
+	list: typeof mailingLists.$inferSelect,
+	envelopeFrom: string | null | undefined,
+): Promise<ListPostingOutcome> {
+	const membersOnly = list.postingPolicy === "members_only";
+	const members = await db
+		.select({ email: mailingListMembers.email, role: mailingListMembers.role, moderated: mailingListMembers.moderated })
+		.from(mailingListMembers)
+		.where(eq(mailingListMembers.listId, list.id));
+
+	const sender = normalizeEmailAddress(envelopeFrom ?? "");
+	const matched = new Set(members.filter((member) => normalizeEmailAddress(member.email) === sender));
+	const tally = () => {
+		const hits = [...matched];
+		return {
+			memberFound: hits.length > 0,
+			ownerFound: hits.some((member) => member.role === "owner"),
+			memberModerated: hits.some((member) => member.moderated),
+		};
+	};
+	let { memberFound, ownerFound, memberModerated } = tally();
+
+	// Resolution can still change the outcome while an unmatched row could
+	// grant membership (members_only), impose a member-level hold, or lift a
+	// list-level hold by matching an owner.
+	const stillUseful = (member: (typeof members)[number]) =>
+		!matched.has(member) && (
+			(membersOnly && !memberFound)
+			|| (member.moderated && !memberModerated)
+			|| (list.moderated && member.role === "owner" && !ownerFound)
+		);
+	if (sender && members.some(stillUseful)) {
+		const senderMailbox = await resolveMailboxIdentity(db, sender);
+		if (senderMailbox) {
+			for (const member of members) {
+				if (!stillUseful(member)) continue;
+				const identity = await resolveMailboxIdentity(db, member.email);
+				if (identity?.mailboxId !== senderMailbox.mailboxId) continue;
+				matched.add(member);
+				({ memberFound, ownerFound, memberModerated } = tally());
+			}
+		}
+	}
+
+	if (membersOnly && !memberFound) return "deny";
+	return memberModerated || (list.moderated && !ownerFound) ? "hold" : "allow";
 }
 
 async function resolveMailboxDomainAlias(

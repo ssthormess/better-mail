@@ -3,6 +3,7 @@ import { SMTPServer } from "smtp-server";
 import type { SMTPServerSession } from "smtp-server";
 import { intakeIncomingMail } from "@/lib/email/intake";
 import { inboundAttachmentLimitReasonFromRaw } from "@/lib/email/inbound-attachments";
+import { INBOUND_QUOTA_REJECT_REASON, mailboxInboundQuotaExceeded } from "@/lib/email/mailbox-quota";
 import { recordRuleMatch, resolveInboundAddress } from "@/lib/email/routing";
 import { isPublicIpv4 } from "@/lib/spam/domain-utils";
 import { getDb } from "@/db";
@@ -63,7 +64,8 @@ export function startSmtpListener(
 				return;
 			}
 			const from = session.envelope.mailFrom ? session.envelope.mailFrom.address : "";
-			recipientRejectReason(env, from, address.address).then(
+			const declaredSize = Number((session.envelope.mailFrom?.args as { SIZE?: string } | undefined)?.SIZE);
+			recipientRejectReason(env, from, address.address, Number.isFinite(declaredSize) && declaredSize > 0 ? declaredSize : 0).then(
 				(reason) => callback(reason ? Object.assign(new Error(reason), { responseCode: 550 }) : undefined),
 				(error) => {
 					console.error("SMTP recipient lookup failed", error);
@@ -116,15 +118,11 @@ export function startSmtpListener(
 					sender: from,
 					mta: options.hostname,
 				});
-				let rejectReason: string | null = null;
 				for (const recipient of session.envelope.rcptTo) {
 					const result = await intakeIncomingMail(
 						env,
 						{ from, to: recipient.address, raw: toArrayBuffer(raw), headers, senderIp, verdicts },
 						{
-							reject: (reason) => {
-								rejectReason = reason;
-							},
 							forward: async (destination, extra) => mailer.sendRaw(from, destination, prependHeaders(raw, extra)),
 						},
 					).catch((error) => {
@@ -135,10 +133,13 @@ export function startSmtpListener(
 						callback(Object.assign(new Error("Temporary failure, try again later"), { responseCode: 451 }));
 						return;
 					}
-				}
-				if (rejectReason) {
-					callback(Object.assign(new Error(rejectReason), { responseCode: 550 }));
-					return;
+					// Every recipient here was already accepted at RCPT TO, so a reject
+					// result (a mailbox over its storage cap, or a block rule created
+					// mid-transaction) drops that recipient only. A transaction-wide
+					// 550 would falsely report failure for recipients already stored.
+					if (result.action === "reject") {
+						console.warn(`SMTP recipient ${recipient.address} dropped at DATA: ${result.reason}`);
+					}
 				}
 				callback();
 			});
@@ -155,17 +156,25 @@ export function startSmtpListener(
  * Why a recipient is refused at RCPT TO, or null to accept it. Unknown domains are refused so
  * nothing is buffered for mail we would drop anyway. Reject rules only look at the envelope, so
  * they are applied here too: DATA has one reply for every recipient, and a 550 there would tell
- * the sender that recipients we already stored never got the message.
+ * the sender that recipients we already stored never got the message. The mailbox storage cap
+ * is the same kind of per-recipient verdict: usage already over it (plus the declared SIZE when
+ * the client sent one) refuses the recipient here. When only the real size tips the mailbox
+ * over, the recipient was already accepted and intake drops that copy instead.
  */
-async function recipientRejectReason(env: CloudflareEnv, from: string, to: string): Promise<string | null> {
+async function recipientRejectReason(env: CloudflareEnv, from: string, to: string, declaredSize: number): Promise<string | null> {
 	const db = getDb(env);
 	const hostname = to.slice(to.lastIndexOf("@") + 1).toLowerCase();
 	const [domain] = await db.select({ id: domains.id }).from(domains).where(eq(domains.hostname, hostname)).limit(1);
 	if (!domain) return "Relay access denied";
 	const decision = await resolveInboundAddress(db, to, from);
-	if (decision?.action !== "reject") return null;
-	if (decision.ruleId) await recordRuleMatch(db, decision.ruleId).catch(() => undefined);
-	return decision.rejectReason ?? "Message rejected by routing rule";
+	if (decision?.action === "reject") {
+		if (decision.ruleId) await recordRuleMatch(db, decision.ruleId).catch(() => undefined);
+		return decision.rejectReason ?? "Message rejected by routing rule";
+	}
+	if (decision?.mailbox && await mailboxInboundQuotaExceeded(env, db, decision.mailbox.mailboxId, declaredSize)) {
+		return INBOUND_QUOTA_REJECT_REASON;
+	}
+	return null;
 }
 
 /** Header map in the shape the Worker handler provides: lower-cased names, folded lines joined. */

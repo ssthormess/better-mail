@@ -351,8 +351,73 @@ export const updateMailboxSchema = z.object({
 	autoReplyEnabled: z.boolean().optional(),
 	autoReplySubject: z.string().trim().max(200).optional(),
 	autoReplyBody: z.string().max(10_000).optional(),
+	autoReplyStartAt: z.string().datetime().nullable().optional(),
+	autoReplyEndAt: z.string().datetime().nullable().optional(),
 	useAllDomains: z.boolean().optional(),
 });
+
+// List, member and group names surface in mail headers and display contexts,
+// so they take the same control/format-character refusal as alias labels.
+const safeDisplayNameSchema = z.string().trim().min(1).max(100).regex(/^[^\p{Cc}\p{Cf}]*$/u);
+
+export const mailingListSchema = z.object({
+	domainId: z.string().min(1),
+	localPart: z.string().min(1).max(64).regex(/^[a-zA-Z0-9._%+-]+$/),
+	name: safeDisplayNameSchema,
+	description: z.string().trim().max(1000).optional(),
+	postingPolicy: z.enum(["members_only", "anyone"]).optional(),
+	moderated: z.boolean().optional(),
+})
+	// A local part made only of dots or a +tag normalizes to nothing: inbound
+	// routing could never match it, so the list address would be unreachable.
+	.refine((value) => normalizeRecipientLocalPart(value.localPart).length > 0, {
+		message: "List address needs at least one letter or digit outside dots and +tags",
+	});
+
+export const updateMailingListSchema = z.object({
+	name: safeDisplayNameSchema.optional(),
+	description: z.string().trim().max(1000).nullable().optional(),
+	postingPolicy: z.enum(["members_only", "anyone"]).optional(),
+	moderated: z.boolean().optional(),
+	disabled: z.boolean().optional(),
+});
+
+export const mailingListMemberSchema = z.object({
+	email: z.string().trim().toLowerCase().email(),
+	name: z.string().trim().max(100).regex(/^[^\p{Cc}\p{Cf}]*$/u).optional(),
+	role: z.enum(["owner", "member"]).optional(),
+	moderated: z.boolean().optional(),
+});
+
+export const updateMailingListMemberSchema = z.object({
+	memberId: z.string().min(1),
+	name: z.string().trim().max(100).regex(/^[^\p{Cc}\p{Cf}]*$/u).nullable().optional(),
+	role: z.enum(["owner", "member"]).optional(),
+	moderated: z.boolean().optional(),
+});
+
+// Groups organize the mailbox owner's address book, so every call carries the
+// mailbox whose book it manages — the contacts API resolves its owner the same way.
+export const contactGroupSchema = z.object({
+	mailboxId: z.string().min(1),
+	name: safeDisplayNameSchema,
+});
+
+export const updateContactGroupSchema = z.object({
+	mailboxId: z.string().min(1),
+	name: safeDisplayNameSchema.optional(),
+});
+
+/** Members are named two ways so callers need no lookup of their own: a contact id, or its address. */
+export const contactGroupMemberSchema = z
+	.object({
+		mailboxId: z.string().min(1),
+		contactId: z.string().min(1).optional(),
+		email: z.string().trim().toLowerCase().email().optional(),
+	})
+	.refine((value) => !!value.contactId !== !!value.email, {
+		message: "Exactly one of contactId or email is required",
+	});
 
 export const folderSchema = z.object({
 	mailboxId: z.string().min(1),

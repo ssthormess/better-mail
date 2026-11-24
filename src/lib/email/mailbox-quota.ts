@@ -56,19 +56,32 @@ export async function checkMailboxQuota(env: CloudflareEnv, db: AppDatabase, mai
 export const INBOUND_QUOTA_REJECT_REASON = "Message rejected: the recipient mailbox is over its storage limit.";
 
 /**
+ * What a stored inbound message adds to mailbox usage — the same accounting
+ * basis as `estimateOutgoingBytes` and `getMailboxUsage`: the (already bounded)
+ * text/html bodies at UTF-8 octet length plus attachment content bytes. Called
+ * after MIME parsing, because raw size and stored size diverge in both
+ * directions: MIME headers and transfer encodings inflate the raw blob, while
+ * an 8-bit or ISO-8859 body can decode to *more* UTF-8 octets than the raw size.
+ */
+export function estimateInboundStoredBytes(parsed: { text?: string | null; html?: string | null; attachments?: AttachmentContent[] }): number {
+	return estimateOutgoingBytes(parsed);
+}
+
+/**
  * True when storing `incomingBytes` more would put the mailbox over
  * MAILBOX_STORAGE_LIMIT_BYTES. Same boundary as `checkMailboxQuota`: landing
  * exactly on the limit is allowed, and an unset or unreadable limit is unlimited.
  *
- * `incomingBytes` is raw MIME size at every call site (`rawSize` before the queue,
- * the stored object's size after it), while `getMailboxUsage` counts parsed bodies
- * and attachments only — the raw blob is its documented gap. The estimate is
- * therefore conservative by the size of the MIME envelope.
+ * `incomingBytes` is whichever basis the call site can see: raw MIME size at the
+ * pre-queue gates (a best-effort estimate only — see `estimateInboundStoredBytes`)
+ * and the real parsed size in the queue consumer, which is the decisive check.
+ * Raw blobs stay out of `getMailboxUsage` either way (its documented gap).
  *
  * No owner notice is emitted on a reject or drop: the realtime union only carries
- * new-message and agent-draft payloads, a type the client does not render, and
- * wiring one would fire an unthrottled push per dropped message. The SMTP bounce
- * is the sender's notice where a bounce exists; the owner sees the usage card.
+ * new-message and agent-draft payloads, so there is no generic notice type to
+ * send without client work — and a wired one would fire an unthrottled push per
+ * dropped message. The SMTP bounce is the sender's notice where a bounce exists;
+ * the owner sees the usage card.
  */
 export async function mailboxInboundQuotaExceeded(env: CloudflareEnv, db: AppDatabase, mailboxId: string, incomingBytes: number): Promise<boolean> {
 	const limit = getMailboxStorageLimit(env);

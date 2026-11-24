@@ -5,9 +5,9 @@ import { withStorage } from "./src/lib/storage";
 import vinextHandler from "vinext/server/fetch-handler";
 import {
 	processInboundMessage,
-	storeRawToR2,
 	type InboundQueueMessage,
 } from "./src/lib/email/inbound";
+import { inboundStagingKey } from "./src/lib/email/inbound-id";
 import { processOutboundQueue, type OutboundQueueMessage } from "./src/lib/email/send";
 import {
 	isImportJobMessage,
@@ -123,7 +123,15 @@ export default {
 					await forwardMessage(env, message, forwardingDestination);
 				}
 			}
-			const rawR2Key = await storeRawToR2(env, message.from, message.to, raw);
+			// Same staging as the intake path: the raw lands under a private
+			// per-event key and the consumer derives the content-hash key the
+			// stored message references. A shared canonical key here would let a
+			// reject/no-route cleanup delete an object another delivery owns.
+			const rawR2Key = inboundStagingKey();
+			await env.BUCKET.put(rawR2Key, raw, {
+				httpMetadata: { contentType: "message/rfc822" },
+				customMetadata: { from: message.from, to: message.to },
+			});
 			const payload: InboundQueueMessage = {
 				from: message.from,
 				to: message.to,

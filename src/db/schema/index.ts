@@ -122,6 +122,12 @@ export const mailboxes = sqliteTable(
 		autoReplyEnabled: bool("auto_reply_enabled").notNull().default(false),
 		autoReplySubject: text("auto_reply_subject").notNull().default("Out of office"),
 		autoReplyBody: text("auto_reply_body").notNull().default(""),
+		autoReplyStartAt: timestamp("auto_reply_start_at"),
+		autoReplyEndAt: timestamp("auto_reply_end_at"),
+		// Set when the responder is turned on; per-sender throttle rows older
+		// than this no longer count, so toggling it off and back on resets who
+		// has been replied to.
+		autoReplyActivatedAt: timestamp("auto_reply_activated_at"),
 		avatarKey: text("avatar_key"),
 		type: text("type", { enum: ["personal", "shared"] }).notNull().default("personal"),
 		useAllDomains: bool("use_all_domains").notNull().default(true),
@@ -1436,6 +1442,101 @@ export const importJobs = sqliteTable("import_jobs", {
 	finishedAt: timestamp("finished_at"),
 }, (t) => [index("import_jobs_user_idx").on(t.userId, t.createdAt), index("import_jobs_status_idx").on(t.status, t.updatedAt)]);
 
+/**
+ * A mailing list receives mail at localPart@domain and fans it out to every
+ * member. The address columns mirror `mailboxes` so inbound resolution looks
+ * a list up the same way it finds a mailbox.
+ */
+export const mailingLists = sqliteTable(
+	"mailing_lists",
+	{
+		id: text("id").primaryKey(),
+		userId: text("user_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "cascade" }),
+		domainId: text("domain_id")
+			.notNull()
+			.references(() => domains.id, { onDelete: "cascade" }),
+		localPart: text("local_part").notNull(),
+		name: text("name").notNull(),
+		description: text("description"),
+		postingPolicy: text("posting_policy", { enum: ["members_only", "anyone"] })
+			.notNull()
+			.default("members_only"),
+		moderated: bool("moderated").notNull().default(false),
+		disabled: bool("disabled").notNull().default(false),
+		createdAt: timestamp("created_at")
+			.notNull()
+			.$defaultFn(() => new Date()),
+	},
+	(t) => [uniqueIndex("mailing_lists_address_idx").on(t.domainId, t.localPart), index("mailing_lists_user_idx").on(t.userId)],
+);
+
+export const mailingListMembers = sqliteTable(
+	"mailing_list_members",
+	{
+		id: text("id").primaryKey(),
+		listId: text("list_id")
+			.notNull()
+			.references(() => mailingLists.id, { onDelete: "cascade" }),
+		email: text("email").notNull(),
+		name: text("name"),
+		role: text("role", { enum: ["owner", "member"] }).notNull().default("member"),
+		moderated: bool("moderated").notNull().default(false),
+		createdAt: timestamp("created_at")
+			.notNull()
+			.$defaultFn(() => new Date()),
+	},
+	(t) => [
+		uniqueIndex("mailing_list_members_list_email_idx").on(t.listId, t.email),
+		index("mailing_list_members_list_idx").on(t.listId),
+	],
+);
+
+/**
+ * A contact group labels a set of contacts in the owner's address book — the
+ * same book `/api/contacts` scopes by the mailbox's owning user. Groups are
+ * user-facing organization only; deleting one never deletes its contacts.
+ */
+export const contactGroups = sqliteTable(
+	"contact_groups",
+	{
+		id: text("id").primaryKey(),
+		userId: text("user_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "cascade" }),
+		name: text("name").notNull(),
+		createdAt: timestamp("created_at")
+			.notNull()
+			.$defaultFn(() => new Date()),
+	},
+	(t) => [
+		uniqueIndex("contact_groups_user_name_idx").on(t.userId, t.name),
+		index("contact_groups_user_idx").on(t.userId),
+	],
+);
+
+export const contactGroupMembers = sqliteTable(
+	"contact_group_members",
+	{
+		id: text("id").primaryKey(),
+		groupId: text("group_id")
+			.notNull()
+			.references(() => contactGroups.id, { onDelete: "cascade" }),
+		contactId: text("contact_id")
+			.notNull()
+			.references(() => contacts.id, { onDelete: "cascade" }),
+		createdAt: timestamp("created_at")
+			.notNull()
+			.$defaultFn(() => new Date()),
+	},
+	(t) => [
+		uniqueIndex("contact_group_members_group_contact_idx").on(t.groupId, t.contactId),
+		index("contact_group_members_group_idx").on(t.groupId),
+		index("contact_group_members_contact_idx").on(t.contactId),
+	],
+);
+
 export const schema = {
 	users,
 	domains,
@@ -1481,4 +1582,8 @@ export const schema = {
 	agentSendApprovals,
 	mcpKeyMailboxes,
 	importJobs,
+	mailingLists,
+	mailingListMembers,
+	contactGroups,
+	contactGroupMembers,
 };

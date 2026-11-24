@@ -7,6 +7,7 @@ import { ListRow } from "@/components/ui/list";
 import { Tooltip } from "@/components/ui/tooltip";
 import { formatUserDate } from "@/lib/time/utils";
 import { ContactAvatar } from "./contact-avatar";
+import { ContactGroupsAction } from "./contact-groups-action";
 import type { ContactRowProps } from "./contacts-page-types";
 import { CONTACT_COLUMNS } from "./contacts-page-utils";
 
@@ -51,6 +52,7 @@ export function ContactRow({ mailboxId, contact, onEmail, onEdit, onDelete }: Co
 						<MailSend01 className="h-4 w-4" />
 					</Button>
 				</Tooltip>
+				{mailboxId && <ContactGroupsAction mailboxId={mailboxId} contact={contact} />}
 				<Tooltip label={t("contacts.edit")}>
 					<Button
 						type="button"

@@ -417,6 +417,51 @@
         "CREATE UNIQUE INDEX \"calendar_occurrence_responses_event_occurrence_guest_idx\" ON \"calendar_occurrence_responses\" USING btree (\"event_id\",\"occurrence_ms\",\"guest\");",
         "CREATE INDEX \"calendar_occurrence_responses_event_idx\" ON \"calendar_occurrence_responses\" USING btree (\"event_id\");"
       ]
+    },
+    {
+      "name": "0017_vacation_responder.sql",
+      "statements": [
+        "ALTER TABLE \"mailboxes\" ADD COLUMN \"auto_reply_start_at\" bigint;",
+        "ALTER TABLE \"mailboxes\" ADD COLUMN \"auto_reply_end_at\" bigint;",
+        "ALTER TABLE \"mailboxes\" ADD COLUMN \"auto_reply_activated_at\" bigint;"
+      ]
+    },
+    {
+      "name": "0018_mailing_lists.sql",
+      "statements": [
+        "CREATE TABLE \"mailing_lists\" (\n\t\"id\" text PRIMARY KEY NOT NULL,\n\t\"user_id\" text NOT NULL,\n\t\"domain_id\" text NOT NULL,\n\t\"local_part\" text NOT NULL,\n\t\"name\" text NOT NULL,\n\t\"description\" text,\n\t\"disabled\" boolean DEFAULT false NOT NULL,\n\t\"created_at\" bigint NOT NULL\n);",
+        "CREATE TABLE \"mailing_list_members\" (\n\t\"id\" text PRIMARY KEY NOT NULL,\n\t\"list_id\" text NOT NULL,\n\t\"email\" text NOT NULL,\n\t\"name\" text,\n\t\"role\" text DEFAULT 'member' NOT NULL,\n\t\"created_at\" bigint NOT NULL\n);",
+        "ALTER TABLE \"mailing_lists\" ADD CONSTRAINT \"mailing_lists_user_id_users_id_fk\" FOREIGN KEY (\"user_id\") REFERENCES \"public\".\"users\"(\"id\") ON DELETE cascade ON UPDATE no action;",
+        "ALTER TABLE \"mailing_lists\" ADD CONSTRAINT \"mailing_lists_domain_id_domains_id_fk\" FOREIGN KEY (\"domain_id\") REFERENCES \"public\".\"domains\"(\"id\") ON DELETE cascade ON UPDATE no action;",
+        "ALTER TABLE \"mailing_list_members\" ADD CONSTRAINT \"mailing_list_members_list_id_mailing_lists_id_fk\" FOREIGN KEY (\"list_id\") REFERENCES \"public\".\"mailing_lists\"(\"id\") ON DELETE cascade ON UPDATE no action;",
+        "CREATE UNIQUE INDEX \"mailing_lists_address_idx\" ON \"mailing_lists\" USING btree (\"domain_id\",\"local_part\");",
+        "CREATE INDEX \"mailing_lists_user_idx\" ON \"mailing_lists\" USING btree (\"user_id\");",
+        "CREATE UNIQUE INDEX \"mailing_list_members_list_email_idx\" ON \"mailing_list_members\" USING btree (\"list_id\",\"email\");",
+        "CREATE INDEX \"mailing_list_members_list_idx\" ON \"mailing_list_members\" USING btree (\"list_id\");"
+      ]
+    },
+    {
+      "name": "0019_mailing_lists_posting.sql",
+      "statements": [
+        "ALTER TABLE \"mailing_lists\" ADD COLUMN \"posting_policy\" text DEFAULT 'members_only' NOT NULL;",
+        "ALTER TABLE \"mailing_lists\" ADD COLUMN \"moderated\" boolean DEFAULT false NOT NULL;",
+        "ALTER TABLE \"mailing_list_members\" ADD COLUMN \"moderated\" boolean DEFAULT false NOT NULL;"
+      ]
+    },
+    {
+      "name": "0020_contact_groups.sql",
+      "statements": [
+        "CREATE TABLE \"contact_groups\" (\n\t\"id\" text PRIMARY KEY NOT NULL,\n\t\"user_id\" text NOT NULL,\n\t\"name\" text NOT NULL,\n\t\"created_at\" bigint NOT NULL\n);",
+        "CREATE TABLE \"contact_group_members\" (\n\t\"id\" text PRIMARY KEY NOT NULL,\n\t\"group_id\" text NOT NULL,\n\t\"contact_id\" text NOT NULL,\n\t\"created_at\" bigint NOT NULL\n);",
+        "ALTER TABLE \"contact_groups\" ADD CONSTRAINT \"contact_groups_user_id_users_id_fk\" FOREIGN KEY (\"user_id\") REFERENCES \"public\".\"users\"(\"id\") ON DELETE cascade ON UPDATE no action;",
+        "ALTER TABLE \"contact_group_members\" ADD CONSTRAINT \"contact_group_members_group_id_contact_groups_id_fk\" FOREIGN KEY (\"group_id\") REFERENCES \"public\".\"contact_groups\"(\"id\") ON DELETE cascade ON UPDATE no action;",
+        "ALTER TABLE \"contact_group_members\" ADD CONSTRAINT \"contact_group_members_contact_id_contacts_id_fk\" FOREIGN KEY (\"contact_id\") REFERENCES \"public\".\"contacts\"(\"id\") ON DELETE cascade ON UPDATE no action;",
+        "CREATE UNIQUE INDEX \"contact_groups_user_name_idx\" ON \"contact_groups\" USING btree (\"user_id\",\"name\");",
+        "CREATE INDEX \"contact_groups_user_idx\" ON \"contact_groups\" USING btree (\"user_id\");",
+        "CREATE UNIQUE INDEX \"contact_group_members_group_contact_idx\" ON \"contact_group_members\" USING btree (\"group_id\",\"contact_id\");",
+        "CREATE INDEX \"contact_group_members_group_idx\" ON \"contact_group_members\" USING btree (\"group_id\");",
+        "CREATE INDEX \"contact_group_members_contact_idx\" ON \"contact_group_members\" USING btree (\"contact_id\");"
+      ]
     }
   ]
 }

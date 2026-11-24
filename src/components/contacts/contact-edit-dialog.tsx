@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import type { FormEvent } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { useLanguage } from "@/components/language-provider";
 import { Button } from "@/components/ui/button";
 import {
@@ -16,6 +17,7 @@ import { Label } from "@/components/ui/label";
 import { parseAddress } from "@/lib/utils";
 import { ContactAvatarForm } from "./contact-avatar-form";
 import type { ContactEditDialogProps, ContactListItem } from "./contacts-page-types";
+import { refetchContactGroups } from "./contact-groups-utils";
 import { createContact, renameContact } from "./contacts-page-utils";
 
 /** Create or rename a contact. Editing also allows changing the photo; creating collects email and name. */
@@ -60,6 +62,7 @@ function ContactEditForm({
 	onSaved: ContactEditDialogProps["onSaved"];
 }) {
 	const { t } = useLanguage();
+	const queryClient = useQueryClient();
 	const editing = contact !== null;
 	const [email, setEmail] = useState(contact?.email ?? "");
 	const [displayName, setDisplayName] = useState(contact?.displayName ?? "");
@@ -83,6 +86,9 @@ function ContactEditForm({
 			const saved = editing
 				? await renameContact(mailboxId, contact.email, name)
 				: await createContact(mailboxId, { address: email.trim(), displayName: name || undefined });
+			// Group member slices embed the contact's name/address — refresh the
+			// shared contact-groups book so they don't show the old value.
+			refetchContactGroups(queryClient);
 			onSaved(saved);
 			onOpenChange(false);
 		} catch (saveError) {
@@ -102,6 +108,7 @@ function ContactEditForm({
 					hasAvatar={hasAvatar}
 					onAvatarChange={(next) => {
 						setHasAvatar(next);
+						refetchContactGroups(queryClient);
 						onSaved({ ...contact, hasAvatar: next });
 					}}
 				/>
