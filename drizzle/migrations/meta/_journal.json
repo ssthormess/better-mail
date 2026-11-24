@@ -596,6 +596,13 @@
       "when": 1795369865790,
       "tag": "0093_vacation_responder",
       "breakpoints": true
+    },
+    {
+      "idx": 86,
+      "version": "6",
+      "when": 1795526239870,
+      "tag": "0094_calendar_subscriptions",
+      "breakpoints": true
     }
   ]
 }

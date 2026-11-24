@@ -425,6 +425,19 @@
         "ALTER TABLE \"mailboxes\" ADD COLUMN \"auto_reply_end_at\" bigint;",
         "ALTER TABLE \"mailboxes\" ADD COLUMN \"auto_reply_activated_at\" bigint;"
       ]
+    },
+    {
+      "name": "0018_calendar_subscriptions.sql",
+      "statements": [
+        "CREATE TABLE \"calendar_subscriptions\" (\n\t\"id\" text PRIMARY KEY NOT NULL,\n\t\"user_id\" text NOT NULL,\n\t\"feed_url\" text NOT NULL,\n\t\"title\" text DEFAULT '' NOT NULL,\n\t\"etag\" text,\n\t\"last_modified\" text,\n\t\"refresh_interval_sec\" bigint DEFAULT 3600 NOT NULL,\n\t\"last_refresh_at\" bigint,\n\t\"last_refresh_status\" bigint,\n\t\"last_error\" text,\n\t\"event_count\" bigint DEFAULT 0 NOT NULL,\n\t\"created_at\" bigint NOT NULL,\n\t\"updated_at\" bigint NOT NULL\n);",
+        "ALTER TABLE \"calendar_events\" ADD COLUMN \"subscription_id\" text;",
+        "ALTER TABLE \"calendar_subscriptions\" ADD CONSTRAINT \"calendar_subscriptions_user_id_users_id_fk\" FOREIGN KEY (\"user_id\") REFERENCES \"public\".\"users\"(\"id\") ON DELETE cascade ON UPDATE no action;",
+        "ALTER TABLE \"calendar_events\" ADD CONSTRAINT \"calendar_events_subscription_id_calendar_subscriptions_id_fk\" FOREIGN KEY (\"subscription_id\") REFERENCES \"public\".\"calendar_subscriptions\"(\"id\") ON DELETE cascade ON UPDATE no action;",
+        "CREATE UNIQUE INDEX \"calendar_subscriptions_user_url_idx\" ON \"calendar_subscriptions\" USING btree (\"user_id\",\"feed_url\");",
+        "CREATE INDEX \"calendar_subscriptions_user_idx\" ON \"calendar_subscriptions\" USING btree (\"user_id\");",
+        "CREATE INDEX \"calendar_subscriptions_refresh_idx\" ON \"calendar_subscriptions\" USING btree (\"last_refresh_at\");",
+        "CREATE INDEX \"calendar_events_subscription_idx\" ON \"calendar_events\" USING btree (\"subscription_id\");"
+      ]
     }
   ]
 }

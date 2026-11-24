@@ -127,6 +127,13 @@
       "when": 1795369865790,
       "tag": "0017_vacation_responder",
       "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1795526239870,
+      "tag": "0018_calendar_subscriptions",
+      "breakpoints": true
     }
   ]
 }

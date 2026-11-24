@@ -70,6 +70,7 @@ const LONG_KEYS: Record<string, number> = {
 	raw_r2_key: 512,
 	r2_key: 512,
 	endpoint: 512,
+	feed_url: 512,
 	email: 320,
 	recipient: 320,
 	name: 255,

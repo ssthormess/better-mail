@@ -874,6 +874,17 @@
         "ALTER TABLE `mailboxes` ADD `auto_reply_end_at` integer;",
         "ALTER TABLE `mailboxes` ADD `auto_reply_activated_at` integer;"
       ]
+    },
+    {
+      "name": "0094_calendar_subscriptions.sql",
+      "statements": [
+        "CREATE TABLE `calendar_subscriptions` (\n\t`id` text PRIMARY KEY NOT NULL,\n\t`user_id` text NOT NULL,\n\t`feed_url` text NOT NULL,\n\t`title` text DEFAULT '' NOT NULL,\n\t`etag` text,\n\t`last_modified` text,\n\t`refresh_interval_sec` integer DEFAULT 3600 NOT NULL,\n\t`last_refresh_at` integer,\n\t`last_refresh_status` integer,\n\t`last_error` text,\n\t`event_count` integer DEFAULT 0 NOT NULL,\n\t`created_at` integer NOT NULL,\n\t`updated_at` integer NOT NULL,\n\tFOREIGN KEY (`user_id`) REFERENCES `users`(`id`) ON UPDATE no action ON DELETE cascade\n);",
+        "ALTER TABLE `calendar_events` ADD `subscription_id` text REFERENCES `calendar_subscriptions`(`id`) ON DELETE cascade;",
+        "CREATE UNIQUE INDEX `calendar_subscriptions_user_url_idx` ON `calendar_subscriptions` (`user_id`,`feed_url`);",
+        "CREATE INDEX `calendar_subscriptions_user_idx` ON `calendar_subscriptions` (`user_id`);",
+        "CREATE INDEX `calendar_subscriptions_refresh_idx` ON `calendar_subscriptions` (`last_refresh_at`);",
+        "CREATE INDEX `calendar_events_subscription_idx` ON `calendar_events` (`subscription_id`);"
+      ]
     }
   ]
 }

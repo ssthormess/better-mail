@@ -670,12 +670,48 @@ export const emailTemplates = sqliteTable(
 	(t) => [index("email_templates_user_idx").on(t.userId)],
 );
 
+/**
+ * An external calendar feed this user subscribed to (webcal/https). Rows in calendar_events
+ * created from the feed carry its id in subscription_id, so unsubscribing cascades them away.
+ * The feed is the source of truth for those rows: each refresh rewrites them and prunes events
+ * whose UID left the feed.
+ */
+export const calendarSubscriptions = sqliteTable(
+	"calendar_subscriptions",
+	{
+		id: text("id").primaryKey(),
+		userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+		/** Canonical https URL the feed is fetched from (webcal:// input is stored converted). */
+		feedUrl: text("feed_url").notNull(),
+		/** X-WR-CALNAME on the last fetch, or the name the user set. */
+		title: text("title").notNull().default(""),
+		etag: text("etag"),
+		lastModified: text("last_modified"),
+		/** Seconds between refreshes; the five-minute cron fetches feeds whose interval has elapsed. */
+		refreshIntervalSec: integer("refresh_interval_sec").notNull().default(3600),
+		lastRefreshAt: timestamp("last_refresh_at"),
+		/** HTTP status of the last fetch attempt (304 counts as success). */
+		lastRefreshStatus: integer("last_refresh_status"),
+		lastError: text("last_error"),
+		eventCount: integer("event_count").notNull().default(0),
+		createdAt: timestamp("created_at").notNull().$defaultFn(() => new Date()),
+		updatedAt: timestamp("updated_at").notNull().$defaultFn(() => new Date()),
+	},
+	(t) => [
+		uniqueIndex("calendar_subscriptions_user_url_idx").on(t.userId, t.feedUrl),
+		index("calendar_subscriptions_user_idx").on(t.userId),
+		index("calendar_subscriptions_refresh_idx").on(t.lastRefreshAt),
+	],
+);
+
 export const calendarEvents = sqliteTable(
 	"calendar_events",
 	{
 		id: text("id").primaryKey(),
 		userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
 		mailboxId: text("mailbox_id").references(() => mailboxes.id, { onDelete: "set null" }),
+		/** The feed that owns this event; null on user-created, imported and invited events. Deleting the subscription removes its events. */
+		subscriptionId: text("subscription_id").references(() => calendarSubscriptions.id, { onDelete: "cascade" }),
 		title: text("title").notNull(),
 		description: text("description").notNull().default(""),
 		location: text("location").notNull().default(""),
@@ -716,6 +752,7 @@ export const calendarEvents = sqliteTable(
 	(t) => [
 		index("calendar_events_user_starts_idx").on(t.userId, t.startsAt),
 		index("calendar_events_mailbox_idx").on(t.mailboxId),
+		index("calendar_events_subscription_idx").on(t.subscriptionId),
 	],
 );
 
@@ -1460,6 +1497,7 @@ export const schema = {
 	sharedAttachmentLinks,
 	outboundJobs,
 	emailTemplates,
+	calendarSubscriptions,
 	calendarEvents,
 	calendarEventOverrides,
 	calendarInviteTombstones,
