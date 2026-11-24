@@ -45,9 +45,10 @@ export type RoutingDecision = {
 	 * moderated list holds posts from non-owner senders — owners are the
 	 * reviewers, so their posts pass and an owner repost approves — while a
 	 * member-level `moderated` flag holds that member's posts at every role.
-	 * The flag applies only to the directly-addressed list: a list reached as
-	 * a member of another list expands as ordinary members with the flag
-	 * ignored — nested moderation is a deferred slice.
+	 * On the directly-addressed list it makes the whole delivery held; on a
+	 * list reached as a member of another list it makes that branch a held
+	 * edge — the nested list gets its own reviewer set instead of expanding
+	 * as ordinary members.
 	 */
 	heldForModeration?: boolean;
 };

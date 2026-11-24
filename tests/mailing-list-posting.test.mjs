@@ -8,9 +8,10 @@ import { build } from "esbuild";
 // F08: posting rules on top of the F07 fan-out engine. A list claim checks the
 // envelope sender against the list's posting policy before delivery: members
 // post, non-members on a members_only list get the same reject decision a
-// block rule produces, and a moderated post is held for owner review.
-// Moderation applies only to the directly-addressed list — a nested list
-// always expands as ordinary members, its own moderation flags ignored.
+// block rule produces, and a moderated post is held for owner review. The
+// same posting check runs per nested branch: a member row that names a list
+// which would hold the post is a held edge, so nested moderation fans out to
+// that branch's reviewers rather than its membership.
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const directory = mkdtempSync(join(root, "node_modules", "mailflare-list-posting-"));
@@ -234,7 +235,7 @@ test("a moderated list holds a non-owner's post for owner review", async (t) => 
 	assert.deepEqual(mailByMailbox(database).map((row) => row.mailboxId), ["bobbox"]);
 });
 
-test("a nested list's own moderation flags do not hold the post", async (t) => {
+test("a nested list's own moderated flag holds the post for its reviewers", async (t) => {
 	t.mock.method(console, "info", () => {});
 	for (const parentModerated of [1, 0]) {
 		const { env, database, queued } = await setup(t);
@@ -253,15 +254,15 @@ test("a nested list's own moderation flags do not hold the post", async (t) => {
 			members: [{ email: "ann@one.test", role: "owner" }, "bob@one.test"],
 		});
 
-		// Whether or not all holds the post itself, eng is only ever a member
-		// row here: a nested list expands as ordinary members and its own
-		// moderated flag is ignored — propagated holds are a deferred slice.
+		// Whether or not all holds the post itself, eng holds the stranger's
+		// post on its branch: the nested delivery is a reviewer copy to eng's
+		// owner, not an ordinary fan-out to its membership — bob never sees it.
 		await intake(env, "all@one.test", "stranger@elsewhere.test");
 		await processInboundMessage(env, queued[0]);
 
 		assert.deepEqual(
-			new Set(mailByMailbox(database).map((row) => row.mailboxId)),
-			new Set(["annbox", "bobbox"]),
+			mailByMailbox(database).map((row) => row.mailboxId),
+			["annbox"],
 			`parentModerated=${parentModerated} changed the nested delivery`,
 		);
 	}
@@ -557,10 +558,9 @@ test("a held root whose owner list cycles back still delivers its reviewer", asy
 	});
 
 	// The addressed alpha holds the post: its restricted scan finds owner
-	// ann and owner-list beta. beta expands as ordinary members — its own
-	// moderated flag is ignored while nested — and its only member is
-	// alpha, mid-compute, so the cycle guard contributes nothing. The
-	// reviewer set is ann alone: no retention, no fallback.
+	// ann and owner-list beta, which is itself a held root. beta's only
+	// member is alpha, so the fold settles both holds on the same reviewer
+	// set — ann alone: no retention, no fallback.
 	await intake(env, "alpha@one.test", "stranger@elsewhere.test");
 	await processInboundMessage(env, queued[0]);
 
