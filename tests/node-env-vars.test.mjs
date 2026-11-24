@@ -19,6 +19,7 @@ const forwarded = {
 	SPAMHAUS_DQS_KEY: "dqs",
 	ABUSECH_AUTH_KEY: "abuse",
 	SPAM_DOMAIN_AGE_CHECK: "1",
+	MAILBOX_STORAGE_LIMIT_BYTES: "1073741824",
 	APNS_KEY_ID: "kid",
 	APNS_TEAM_ID: "team",
 	APNS_PRIVATE_KEY: "pem",

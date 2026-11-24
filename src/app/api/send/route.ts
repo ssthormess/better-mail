@@ -5,7 +5,7 @@ import { sendEmailSchema } from "@/lib/validators";
 import { sendEmail } from "@/lib/email/send";
 import { isPastSchedule, parseSendRequest } from "./utils";
 import { RequestBodyTooLargeError } from "@/lib/http/errors";
-import { getSendErrorStatus } from "./error-utils";
+import { getSendErrorBody, getSendErrorStatus } from "./error-utils";
 import { getDb } from "@/db";
 import { agentDraftMetadata, messages } from "@/db/schema";
 import { eq } from "drizzle-orm";
@@ -54,7 +54,7 @@ export async function POST(request: Request) {
 		});
 		return NextResponse.json(result);
 	} catch (err) {
-		const message = err instanceof Error ? err.message : "Send failed";
-		return NextResponse.json({ error: message }, { status: getSendErrorStatus(message) });
+		const body = getSendErrorBody(err);
+		return NextResponse.json(body, { status: getSendErrorStatus(body.error) });
 	}
 }

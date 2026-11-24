@@ -6,7 +6,7 @@ import { sendEmail } from "@/lib/email/send";
 import { decodeBase64Content } from "@/lib/email/attachments";
 import { readJsonBody } from "@/lib/http/request";
 import { RequestBodyTooLargeError } from "@/lib/http/errors";
-import { getSendErrorStatus } from "@/app/api/send/error-utils";
+import { getSendErrorBody, getSendErrorStatus } from "@/app/api/send/error-utils";
 
 export async function POST(request: Request) {
 	const env = getEnv();
@@ -45,7 +45,7 @@ export async function POST(request: Request) {
 		});
 		return NextResponse.json(result);
 	} catch (err) {
-		const message = err instanceof Error ? err.message : "Send failed";
-		return NextResponse.json({ error: message }, { status: getSendErrorStatus(message) });
+		const body = getSendErrorBody(err);
+		return NextResponse.json(body, { status: getSendErrorStatus(body.error) });
 	}
 }

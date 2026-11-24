@@ -158,6 +158,7 @@ and the DNS page shows what to set by hand.
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` | unset | Amazon SES credentials, used when none are saved in the app |
 | `INBOUND_WEBHOOK_SECRET` | unset | Enables `/api/inbound` for the relay Worker |
 | `INBOUND_REQUIRE_SIGNED_HEADERS` | unset | Set to `1` once the relay Worker is updated: refuses relays that do not sign the header map with a timestamp (older relays stay accepted without it, and their requests can be replayed) |
+| `MAILBOX_STORAGE_LIMIT_BYTES` | unset | Per-mailbox storage cap in bytes. A send that would push a mailbox over it is refused with 413; unset or non-positive means unlimited. Counts stored bodies and attachments, the same basis as the mailbox usage endpoint. |
 | `TURNSTILE_SECRET_KEY` | unset | Bot protection on login and reset forms (`NEXT_PUBLIC_TURNSTILE_SITE_KEY` at build time) |
 | `VAPID_PUBLIC_KEY` | unset | Public Web Push application-server key |
 | `VAPID_PRIVATE_KEY` | unset | Secret Web Push application-server key |

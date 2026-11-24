@@ -46,6 +46,8 @@ interface CloudflareEnv {
 	ABUSECH_AUTH_KEY?: string;
 	/** "off" disables the RDAP domain-age check in spam analysis. */
 	SPAM_DOMAIN_AGE_CHECK?: string;
+	/** Per-mailbox storage cap in bytes; a send that would exceed it is refused. Unset or non-positive means unlimited. */
+	MAILBOX_STORAGE_LIMIT_BYTES?: string;
 	AGENT_RATE_LIMIT?: RateLimit;
 	/**
 	 * Backblaze B2 storage. When all four are set, B2 replaces the R2 binding for raw mail, attachments, Drive,

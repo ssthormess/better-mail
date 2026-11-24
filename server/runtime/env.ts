@@ -102,6 +102,7 @@ export function createNodeRuntime(): NodeRuntime {
 		SPAMHAUS_DQS_KEY: optional("SPAMHAUS_DQS_KEY"),
 		ABUSECH_AUTH_KEY: optional("ABUSECH_AUTH_KEY"),
 		SPAM_DOMAIN_AGE_CHECK: optional("SPAM_DOMAIN_AGE_CHECK"),
+		MAILBOX_STORAGE_LIMIT_BYTES: optional("MAILBOX_STORAGE_LIMIT_BYTES"),
 		APNS_KEY_ID: optional("APNS_KEY_ID"),
 		APNS_TEAM_ID: optional("APNS_TEAM_ID"),
 		APNS_PRIVATE_KEY: optional("APNS_PRIVATE_KEY"),

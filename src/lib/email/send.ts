@@ -19,6 +19,7 @@ import { setFollowUp } from "@/lib/follow-ups/service";
 import { buildTrackingPixelUrl, injectTrackingPixel, resolveTrackingOrigin } from "@/lib/tracking/open-tracking-utils";
 import { getComposePreferences } from "@/lib/compose/preferences";
 import { getMailboxDomainAddresses } from "@/lib/mailboxes/domain-addresses";
+import { checkMailboxQuota, estimateOutgoingBytes } from "@/lib/email/mailbox-quota";
 
 export type SendEmailInput = {
 	userId: string;
@@ -103,6 +104,8 @@ export async function sendEmail(
 	if (to.length + cc.length + bcc.length > MAX_RECIPIENTS) {
 		throw new Error(`A message can have at most ${MAX_RECIPIENTS} recipients`);
 	}
+	// The last gate before anything is written: usage + this send must fit the storage cap.
+	await checkMailboxQuota(env, db, sender.mailboxId, estimateOutgoingBytes({ text: input.text, html: input.html, attachments }));
 	await upsertContactsFromAddresses(env, input.userId, [...to, ...cc, ...bcc], "outbound");
 
 	const inReplyTo = normalizeMessageId(input.inReplyTo);

@@ -1,6 +1,9 @@
+import { MailboxStorageQuotaError } from "@/lib/email/mailbox-quota";
+
 export function getSendErrorStatus(message: string): number {
 	if (message === "Mailbox is required") return 400;
 	if (message.startsWith("Attachments exceed") || message.startsWith("Subject exceeds") || message.startsWith("Headers exceed") || message.startsWith("Message exceeds Cloudflare") || message.startsWith("A message can include at most") || message.includes("exceeds the 25 MB attachment limit")) return 400;
+	if (message.startsWith("Mailbox storage quota exceeded")) return 413;
 	if (
 		message === "Mailbox not found" ||
 		message === "Sender account not found" ||
@@ -10,4 +13,10 @@ export function getSendErrorStatus(message: string): number {
 		return 403;
 	}
 	return 500;
+}
+
+/** { error, code? } for the send routes; `code` lets a client recognise the refusal without matching prose. */
+export function getSendErrorBody(err: unknown): { error: string; code?: string } {
+	const error = err instanceof Error ? err.message : "Send failed";
+	return err instanceof MailboxStorageQuotaError ? { error, code: err.code } : { error };
 }
