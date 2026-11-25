@@ -78,8 +78,8 @@ before(async () => {
 after(() => server?.close());
 
 /** A client that keeps everything it has read, so a response can be awaited before the next command is sent. */
-function openClient() {
-	const socket = connect(port, "127.0.0.1");
+function openClient(targetPort = port) {
+	const socket = connect(targetPort, "127.0.0.1");
 	let received = "";
 	const pending = [];
 	const flush = () => {
@@ -190,13 +190,146 @@ test("APPEND accepts a non-synchronizing literal and keeps command order", async
 	await client.closed;
 });
 
-test("a literal over the reader's cap is refused without buffering it", async () => {
+test("a literal over APPENDLIMIT is refused with a tagged NO and the session survives", async () => {
 	const client = openClient();
 	await client.waitFor("* OK Mailflare IMAP4rev1 server ready\r\n");
 	const before = appends.length;
-	client.send("C1 APPEND INBOX {2000000}\r\n");
-	const answer = await client.waitFor("* BAD Literal too large\r\n");
-	assert.equal(answer, "* BAD Literal too large\r\n");
-	await client.closed;
+	// 11 MiB is over the advertised limit. `{n}` (synchronizing) means the server answers instead of asking for the
+	// bytes (RFC 3501 §4.3), so nothing has to be drained and the connection keeps its place in the protocol.
+	client.send(`C1 APPEND INBOX {${11 * 1024 * 1024}}\r\n`);
+	assert.equal(await client.waitFor("C1 NO Literal too large\r\n"), "C1 NO Literal too large\r\n");
+	client.send("C2 NOOP\r\n");
+	assert.equal(await client.waitFor("C2 OK NOOP completed\r\n"), "C2 OK NOOP completed\r\n");
 	assert.equal(appends.length, before);
+	client.socket.destroy();
+	await client.closed;
+});
+
+test("a refused LITERAL+ payload is drained, so the command after it still frames", async () => {
+	const client = openClient();
+	await client.waitFor("* OK Mailflare IMAP4rev1 server ready\r\n");
+	const before = appends.length;
+	const payload = Buffer.alloc(11 * 1024 * 1024, 0x41);
+	// LITERAL+ never waits for a continuation, so the refused payload is already on the wire and has to be
+	// consumed before the next command line can be found; the answer to that next command must be clean.
+	client.send(Buffer.concat([
+		Buffer.from(`D1 APPEND INBOX {${payload.length}+}\r\n`, "utf8"),
+		payload,
+		Buffer.from("\r\nD2 NOOP\r\n", "utf8"),
+	]));
+	assert.equal(await client.waitFor("D1 NO Literal too large\r\n"), "D1 NO Literal too large\r\n");
+	assert.equal(await client.waitFor("D2 OK NOOP completed\r\n"), "D2 OK NOOP completed\r\n");
+	assert.equal(appends.length, before);
+	client.socket.destroy();
+	await client.closed;
+});
+
+test("a refused literal with no command tag answers an untagged BAD", async () => {
+	const client = openClient();
+	await client.waitFor("* OK Mailflare IMAP4rev1 server ready\r\n");
+	const before = appends.length;
+	// There is no tag to answer, so there is no tagged response to send; the connection stays up either way.
+	client.send(`{${11 * 1024 * 1024}}\r\n`);
+	assert.equal(await client.waitFor("* BAD Literal too large\r\n"), "* BAD Literal too large\r\n");
+	client.send("E1 NOOP\r\n");
+	assert.equal(await client.waitFor("E1 OK NOOP completed\r\n"), "E1 OK NOOP completed\r\n");
+	assert.equal(appends.length, before);
+	client.socket.destroy();
+	await client.closed;
+});
+
+test("a 2.2 MiB APPEND is stored now that the limit is APPENDLIMIT", async () => {
+	const client = openClient();
+	await client.waitFor("* OK Mailflare IMAP4rev1 server ready\r\n");
+	client.send("F1 LOGIN alice secret\r\n");
+	await client.waitFor("F1 OK LOGIN completed\r\n");
+	// The size the gate used to trip the old 1 MiB reader cap: a real message with a modest attachment.
+	const message = Buffer.concat([
+		Buffer.from([
+			"From: Kevin <kevin@example.com>",
+			"To: Iris <iris@example.org>",
+			"Subject: With attachment",
+			"Message-ID: <big-1@example.com>",
+			"Date: Tue, 2 Feb 2021 10:00:00 +0000",
+			"MIME-Version: 1.0",
+			'Content-Type: multipart/mixed; boundary="b1"',
+			"",
+			"--b1",
+			'Content-Type: text/plain; charset="utf-8"',
+			"",
+			"Body",
+			"",
+			"--b1",
+			'Content-Type: application/octet-stream; name="blob.bin"',
+			"Content-Transfer-Encoding: binary",
+			"",
+			"",
+		].join("\r\n"), "utf8"),
+		Buffer.alloc(2_306_867, 0x62),
+		Buffer.from("\r\n--b1--\r\n", "utf8"),
+	]);
+	const before = appends.length;
+	client.send(`F2 APPEND INBOX {${message.length}}\r\n`);
+	await client.waitFor("+ Ready for literal data\r\n");
+	client.send(message);
+	client.send("\r\n");
+	assert.equal(await client.waitFor("F2 OK APPEND completed\r\n"), "F2 OK APPEND completed\r\n");
+	const stored = appends.slice(before);
+	assert.equal(stored.length, 1);
+	assert.equal(Buffer.from(stored[0].raw).length, message.length);
+	assert.deepEqual(Buffer.from(stored[0].raw), message);
+	client.socket.destroy();
+	await client.closed;
+});
+
+test("CAPABILITY advertises the APPEND limit before a client sends anything", async () => {
+	const client = openClient();
+	await client.waitFor("* OK Mailflare IMAP4rev1 server ready\r\n");
+	client.send("G1 CAPABILITY\r\n");
+	const answer = await client.waitFor("G1 OK CAPABILITY completed\r\n");
+	// RFC 7889: the numeric APPENDLIMIT in CAPABILITY is the limit for every mailbox, so a client can size the
+	// message before it opens a literal. 10485760 is LIMITS.maxSizeUpload, the same number JMAP uploads allow.
+	assert.match(answer, /^\* CAPABILITY IMAP4rev1 MOVE ID APPENDLIMIT=10485760\r\nG1 OK CAPABILITY completed\r\n$/);
+	client.socket.destroy();
+	await client.closed;
+});
+
+test("the buffered-literal budget bounds the listener, and its refusal keeps the session", async (t) => {
+	// A listener with a deliberately small budget, so one stalled literal exhausts it without moving 64 MiB.
+	const budgeted = startImapListener({}, { port: 0, tls: null, bufferedLiteralBytes: 3 * 1024 * 1024 });
+	t.after(() => budgeted.close());
+	await new Promise((resolve) => budgeted.once("listening", resolve));
+	const budgetPort = budgeted.address().port;
+	const size = 2 * 1024 * 1024;
+
+	// The first connection claims 2 MiB and never sends them, so its reservation stays held.
+	const holder = openClient(budgetPort);
+	await holder.waitFor("* OK Mailflare IMAP4rev1 server ready\r\n");
+	holder.send(`H1 APPEND INBOX {${size}}\r\n`);
+	await holder.waitFor("+ Ready for literal data\r\n");
+
+	// 2 MiB + 2 MiB is over the 3 MiB budget: the second literal is refused through the same path an oversized
+	// one is, and the connection keeps working.
+	const blocked = openClient(budgetPort);
+	await blocked.waitFor("* OK Mailflare IMAP4rev1 server ready\r\n");
+	blocked.send(`H2 APPEND INBOX {${size}}\r\n`);
+	assert.equal(await blocked.waitFor("H2 NO Literal too large\r\n"), "H2 NO Literal too large\r\n");
+	blocked.send("H3 NOOP\r\n");
+	assert.equal(await blocked.waitFor("H3 OK NOOP completed\r\n"), "H3 OK NOOP completed\r\n");
+
+	// Finishing that literal gives its bytes back. The command itself answers BAD because this connection never
+	// logged in, which is all the test needs: a reservation is released when its command is answered.
+	holder.send(Buffer.alloc(size, 0x68));
+	holder.send("\r\n");
+	await holder.waitFor("H1 BAD Authenticate first\r\n");
+
+	const after = openClient(budgetPort);
+	await after.waitFor("* OK Mailflare IMAP4rev1 server ready\r\n");
+	after.send(`H4 APPEND INBOX {${size}}\r\n`);
+	assert.equal(await after.waitFor("+ Ready for literal data\r\n"), "+ Ready for literal data\r\n");
+
+	for (const client of [holder, blocked, after]) {
+		client.socket.destroy();
+		await client.closed;
+	}
 });

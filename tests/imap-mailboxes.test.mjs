@@ -644,7 +644,8 @@ test("APPEND refuses what it cannot store, before the backend is asked", async (
 	assert.equal((await runLiteral("H APPEND \u0026", LITERAL, client)).response, "H BAD APPEND mailbox name must be modified UTF-7\r\n");
 	// The protocol cap is the same one JMAP uploads use, so APPEND cannot store what no other path would accept.
 	const oversize = { ...literalCommand("I APPEND INBOX", LITERAL), literal: new ArrayBuffer(11 * 1024 * 1024) };
-	assert.match((await dispatchImapCommand(session, oversize, client)).response, /^I NO Message is larger than \d+ bytes\r\n$/);
+	// The same limit one layer down: the socket refuses it before it buffers, and so does the protocol.
+	assert.match((await dispatchImapCommand(session, oversize, client)).response, /^I NO Literal too large\r\n$/);
 	assert.deepEqual(calls.append, []);
 });
 
@@ -702,8 +703,8 @@ test("MOVE answers NO for what the mailbox model cannot represent", async () => 
 test("the write slice is APPEND and MOVE only", async () => {
 	const { client } = messageWriteBackend();
 	const inbox = await runOn(client, "A SELECT INBOX");
-	// Capability is how a client knows MOVE is there (RFC 6851 §3.1).
-	assert.match((await run("A CAPABILITY")).response, /^\* CAPABILITY IMAP4rev1 MOVE ID\r\n/);
+	// Capability is how a client knows MOVE is there (RFC 6851 §3.1) and how big an APPEND it may send (RFC 7889).
+	assert.match((await run("A CAPABILITY")).response, /^\* CAPABILITY IMAP4rev1 MOVE ID APPENDLIMIT=10485760\r\n/);
 	for (const line of ["B STORE 1 +FLAGS (\\Seen)", "C UID STORE 1 +FLAGS (\\Seen)", "D COPY 1 Receipts", "E UID COPY 1 Receipts", "F EXPUNGE", "G UID EXPUNGE 1"]) {
 		assert.equal((await runOn(client, line, inbox)).response, `${line.split(" ")[0]} NO Not implemented yet\r\n`, line);
 	}

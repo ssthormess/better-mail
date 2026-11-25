@@ -133,6 +133,15 @@ export const IMAP_DELIMITER = "/";
  */
 export const IMAP_FLAGS = ["\\Seen", "\\Flagged", "\\Draft", "\\Deleted"] as const;
 
+/**
+ * RFC 7889 APPENDLIMIT: the largest message APPEND will store, and the largest literal the socket layer will
+ * buffer. One number for the whole bridge, advertised in CAPABILITY so a client learns it before it sends, and
+ * the same one JMAP's upload limit uses — a message this server accepts over one protocol it accepts over the
+ * other. Both layers check it: the socket refuses before it buffers (see MAX_LITERAL_BYTES in `imap.ts`), and
+ * this module refuses again, which is what a caller that does not go through the socket gets.
+ */
+export const IMAP_APPEND_LIMIT = LIMITS.maxSizeUpload;
+
 /** Parse an IMAP command line. Quoted strings support backslash escapes; literals are supplied by the socket layer as quoted values. */
 export function quoteImapLiteral(value: string): string {
 	return `"${value.replace(/["\\\\]/g, (char) => `\\${char}`)}"`;
@@ -184,7 +193,7 @@ export async function dispatchImapCommand(
 ): Promise<ImapAction> {
 	const session = asImapSession(sessionInput);
 	const { tag, verb, args } = command;
-	if (verb === "CAPABILITY") return { response: `* CAPABILITY IMAP4rev1 MOVE ID\r\n${tag} OK CAPABILITY completed\r\n` };
+	if (verb === "CAPABILITY") return { response: `* CAPABILITY IMAP4rev1 MOVE ID APPENDLIMIT=${IMAP_APPEND_LIMIT}\r\n${tag} OK CAPABILITY completed\r\n` };
 	if (verb === "NOOP") return { response: `${tag} OK NOOP completed\r\n` };
 	if (verb === "LOGOUT") return { response: `* BYE Logging out\r\n${tag} OK LOGOUT completed\r\n`, state: "logged-out", selected: null };
 	if (verb === "ID") return { response: `* ID (\"name\" \"Mailflare\")\r\n${tag} OK ID completed\r\n` };
@@ -518,9 +527,9 @@ async function appendCommand(tag: string, command: ImapCommand, backend?: ImapMa
 	if (name === null) return { response: `${tag} BAD APPEND mailbox name must be modified UTF-7\r\n` };
 	const raw = command.literal;
 	if (!raw || raw.byteLength === 0) return { response: `${tag} BAD APPEND needs a message literal\r\n` };
-	// The socket layer already refuses a literal over its own buffer cap; this is the protocol-level cap,
-	// the same one JMAP uploads use, so a client cannot store a message no other protocol would accept.
-	if (raw.byteLength > LIMITS.maxSizeUpload) return { response: `${tag} NO Message is larger than ${LIMITS.maxSizeUpload} bytes\r\n` };
+	// The socket layer refuses a literal this large before it buffers it; this is the same limit one layer down,
+	// so the answer does not depend on which transport the command arrived through.
+	if (raw.byteLength > IMAP_APPEND_LIMIT) return { response: `${tag} NO Literal too large\r\n` };
 	if (!backend) return mailboxUnavailable(tag);
 	const entry = resolveImapMailbox(await backend.list(), name);
 	// RFC 3501 §6.3.11: a name that is not there yet is what TRYCREATE is for.
