@@ -9,7 +9,7 @@ import { useLanguage } from "@/components/language-provider";
 import { authFetch } from "@/lib/auth/client";
 import { fetchCachedMessageDetail } from "@/lib/messages/detail-cache";
 import { getUserTimeZone } from "@/lib/time/utils";
-import { useSelectedMailbox } from "@/components/mailbox-provider";
+import { useActiveMailbox } from "@/components/use-active-mailbox";
 import { useCompose } from "@/components/compose/compose-context";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
@@ -25,7 +25,8 @@ import { Select } from "@/components/ui/select";
 
 export function AgentPanel({ open, fullSize, onClose, onToggleFullSize }: AgentPanelProps) {
 	const { t } = useLanguage();
-	const { selectedMailbox } = useSelectedMailbox();
+	// The assistant works one mailbox at a time; in unified mode that is the primary.
+	const selectedMailbox = useActiveMailbox();
 	const pathname = usePathname();
 	const { openDraftComposer } = useCompose();
 	const [view, setView] = useState<AgentPanelView>("chat");

@@ -196,6 +196,7 @@ await build({
 			import { createRoot } from "react-dom/client";
 			import { act } from "react";
 			import { MailboxSelector } from "@/components/mailbox-selector";
+			import { useActiveMailbox } from "@/components/use-active-mailbox";
 			export { act };
 			const user = { id: "user-1", email: "maya@example.com", name: "Maya Chen", role: "user", hasAvatar: false, calendarEnabled: false, driveEnabled: false };
 			export async function mountSelector(state) {
@@ -207,6 +208,23 @@ await build({
 				const reactRoot = createRoot(container);
 				await act(async () => { reactRoot.render(createElement(MailboxSelector, { initialUser: user })); });
 				return { container, async unmount() { await act(async () => reactRoot.unmount()); } };
+			}
+			// What per-mailbox screens (compose, the assistant, settings) send as their mailbox.
+			function ActiveMailboxProbe() {
+				const mailbox = useActiveMailbox();
+				return createElement("span", { "data-active-mailbox": mailbox?.id ?? "none" });
+			}
+			export async function activeMailboxFor(state) {
+				globalThis.__selectorMailboxes = state;
+				document.body.replaceChildren();
+				const container = document.createElement("div");
+				document.body.appendChild(container);
+				const reactRoot = createRoot(container);
+				await act(async () => { reactRoot.render(createElement(ActiveMailboxProbe)); });
+				const id = container.querySelector("[data-active-mailbox]").getAttribute("data-active-mailbox");
+				await act(async () => reactRoot.unmount());
+				container.remove();
+				return id;
 			}
 		`,
 		resolveDir: root,
@@ -299,6 +317,19 @@ test("unified mode shows All mailboxes as the current selection", async (t) => {
 		[...app.container.querySelectorAll("button")].filter((button) => button.textContent.includes("account.allMailboxes")).length,
 		0,
 	);
+});
+
+test("per-mailbox screens resolve the primary while the list shows every mailbox", async () => {
+	// This is the mailbox compose, the assistant and the settings forms act on.
+	const withAll = (selectedMailbox) => selectorState({ mailboxes: unifiedMailboxes, selectedMailbox }).state;
+	assert.equal(await selector.activeMailboxFor(withAll(null)), "primary", "unified mode falls back to the primary");
+	assert.equal(await selector.activeMailboxFor(withAll(unifiedMailboxes[1])), "shared", "a real selection wins");
+	assert.equal(
+		await selector.activeMailboxFor(selectorState({ mailboxes: [unifiedMailboxes[1], mailbox("billing")], selectedMailbox: null }).state),
+		"shared",
+		"without a primary, the first accessible mailbox is the fallback",
+	);
+	assert.equal(await selector.activeMailboxFor(selectorState({ mailboxes: [], selectedMailbox: null }).state), "none");
 });
 
 test("the row badge draws nothing without a mailbox and a name with one", () => {
