@@ -13,6 +13,8 @@ import { encodeMailboxRef } from "@/lib/jmap/ids";
 import type { MailboxRef, SystemRole } from "@/lib/jmap/types";
 import { getMailboxAccessLevel, listAccessibleMailboxes } from "@/lib/mailboxes/access";
 import { planImapMailboxEntries } from "./imap-mailboxes";
+import { buildImapSearchConditions } from "./imap-search-sql";
+import type { ImapSearchCriteria } from "./imap-search";
 import type {
 	ImapAppendRequest,
 	ImapAppendResult,
@@ -129,6 +131,43 @@ async function mailboxMessages(db: AppDatabase, auth: ApiAuthResult, entry: Imap
 	}));
 }
 
+/** The selected mailbox's message ids in sequence order: the numbering UIDs and `* SEARCH` numbers come from. */
+async function mailboxMessageIds(db: AppDatabase, auth: ApiAuthResult, entry: ImapMailboxEntry): Promise<string[]> {
+	const conditions = mailboxConditions(auth, entry);
+	if (!conditions) return [];
+	const rows = await db
+		.select({ id: messages.id })
+		.from(messages)
+		.where(and(...conditions))
+		.orderBy(asc(messages.createdAt), asc(messages.id));
+	return rows.map((row) => row.id);
+}
+
+/**
+ * SEARCH. The criteria tree becomes a column predicate (`buildImapSearchConditions`), so the mailbox's rows that
+ * match are found by the database rather than by walking every message; the positional criteria (a sequence set,
+ * `UID`) resolve through the same ordered id list that numbers the mailbox, which is why one query can answer
+ * the whole tree. The numbers are then the positions of the matching rows in that order — the same numbers FETCH
+ * echoes as UIDs.
+ */
+async function searchMessages(
+	db: AppDatabase,
+	auth: ApiAuthResult,
+	entry: ImapMailboxEntry,
+	criteria: ImapSearchCriteria,
+): Promise<number[]> {
+	const conditions = mailboxConditions(auth, entry);
+	if (!conditions) return [];
+	const ids = await mailboxMessageIds(db, auth, entry);
+	if (ids.length === 0) return [];
+	const rows = await db
+		.select({ id: messages.id })
+		.from(messages)
+		.where(and(...conditions, buildImapSearchConditions(criteria, ids)));
+	const matched = new Set(rows.map((row) => row.id));
+	return ids.flatMap((id, index) => (matched.has(id) ? [index + 1] : []));
+}
+
 /** Resolve a selection back to its catalogue entry: the ref is unique per mailbox name. */
 function entryForSelected(catalogue: ImapMailboxEntry[], selected: ImapSelectedMailbox): ImapMailboxEntry | null {
 	return catalogue.find((entry) => entry.selectable && entry.ref === selected.ref) ?? null;
@@ -168,6 +207,10 @@ export function imapMailboxBackend(db: AppDatabase, auth: ApiAuthResult, env: Cl
 		messages: async (selected) => {
 			const entry = entryForSelected(await list(), selected);
 			return entry ? mailboxMessages(db, auth, entry) : [];
+		},
+		search: async (selected, criteria) => {
+			const entry = entryForSelected(await list(), selected);
+			return entry ? searchMessages(db, auth, entry, criteria) : [];
 		},
 		createFolder: (target) => createFolderRow(db, auth, target),
 		deleteFolder: (target) => deleteFolderRow(db, auth, target),

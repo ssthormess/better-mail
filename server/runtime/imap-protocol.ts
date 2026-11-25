@@ -1,5 +1,6 @@
 import type { SystemRole } from "@/lib/jmap/types";
 import { LIMITS } from "@/lib/jmap/constants";
+import { IMAP_SEARCH_CHARSETS, parseImapSearchQuery, type ImapSearchCriteria } from "./imap-search";
 import { resolveImapFolderTarget, type ImapFolderTargetResolution } from "./imap-mailboxes";
 
 /**
@@ -103,6 +104,11 @@ export type ImapMailboxBackend = {
 	counts(entry: ImapMailboxEntry): Promise<ImapMailboxCounts>;
 	/** Every message of the selected mailbox in sequence order, so index + 1 is the UID. */
 	messages(selected: ImapSelectedMailbox): Promise<ImapMessageEntry[]>;
+	/**
+	 * SEARCH: the sequence numbers that match, in ascending order — which are also their UIDs, because this bridge
+	 * numbers messages by position. The criteria tree is resolved against the selected mailbox only.
+	 */
+	search(selected: ImapSelectedMailbox, criteria: ImapSearchCriteria): Promise<number[]>;
 	/** CREATE: a new folder row. `denied` unless the account can manage the mailbox. */
 	createFolder(target: ImapFolderTarget): Promise<ImapFolderWriteResult>;
 	/** DELETE: removes the row; its messages unfile through the `set null` foreign key. */
@@ -218,6 +224,7 @@ export async function dispatchImapCommand(
 	if (verb === "APPEND") return appendCommand(tag, command, backend);
 	if (verb === "MOVE") return moveCommand(tag, false, args, session, backend);
 	if (verb === "FETCH") return fetchCommand(tag, false, args, session, backend);
+	if (verb === "SEARCH") return searchCommand(tag, false, args, session, backend);
 	if (verb === "UID") return uidCommand(tag, args, session, backend);
 	if (verb === "UNSELECT" || verb === "CLOSE") {
 		if (args.length > 0) return { response: `${tag} BAD ${verb} takes no arguments\r\n` };
@@ -653,16 +660,49 @@ export function parseImapDateTime(value: string): Date | null {
 
 /**
  * UID commands share FETCH's sequence model: UIDs are positional, so `UID FETCH` is
- * FETCH with the UID echoed back and `UID MOVE` is MOVE over the same numbers. Every other UID
- * subcommand (STORE, COPY, SEARCH, EXPUNGE) is a later slice and answers the same honest NO as
+ * FETCH with the UID echoed back, `UID MOVE` is MOVE over the same numbers and `UID SEARCH` is SEARCH.
+ * Every other UID subcommand (STORE, COPY, EXPUNGE) is a later slice and answers the same honest NO as
  * any unimplemented verb.
  */
 async function uidCommand(tag: string, args: string[], session: ImapSession, backend?: ImapMailboxBackend): Promise<ImapAction> {
 	const subcommand = args[0]?.toUpperCase();
 	if (!subcommand) return { response: `${tag} BAD UID needs a subcommand\r\n` };
 	if (subcommand === "MOVE") return moveCommand(tag, true, args.slice(1), session, backend);
+	if (subcommand === "SEARCH") return searchCommand(tag, true, args.slice(1), session, backend);
 	if (subcommand !== "FETCH") return { response: `${tag} NO Not implemented yet\r\n` };
 	return fetchCommand(tag, true, args.slice(1), session, backend);
+}
+
+/**
+ * SEARCH and UID SEARCH (RFC 3501 §6.4.4) over the selected mailbox. This bridge numbers messages by position,
+ * so a sequence number and a UID are the same number here and the two commands differ only in their label; the
+ * set a client searched for and the ids it gets back are in the same arrival order FETCH addresses.
+ *
+ * The criteria grammar (which keys exist, which are refused, and what each maps to) lives in `imap-search.ts`;
+ * this function only turns its verdict into the three possible replies: a BAD naming the offending criterion, a
+ * NO for a charset this server cannot honour, and the untagged `* SEARCH` list (empty is legal) plus the tagged OK.
+ */
+async function searchCommand(
+	tag: string,
+	uid: boolean,
+	args: string[],
+	session: ImapSession,
+	backend?: ImapMailboxBackend,
+): Promise<ImapAction> {
+	const label = uid ? "UID SEARCH" : "SEARCH";
+	// SEARCH is only legal in selected state, like FETCH: this is a protocol error rather than UNSELECT's NO.
+	if (!session.selected) return { response: `${tag} BAD No mailbox selected\r\n` };
+	const query = parseImapSearchQuery(args);
+	if (query.kind === "error") return { response: `${tag} BAD ${label} ${query.message}\r\n` };
+	// RFC 3501 §6.4.4: a charset the server does not support is a tagged NO (not a BAD), and BADCHARSET says
+	// which ones it does. The criteria themselves are already decoded, so only these two can be honoured.
+	if (query.kind === "charset") {
+		return { response: `${tag} NO [BADCHARSET (${IMAP_SEARCH_CHARSETS.join(" ")})] Unsupported charset ${query.charset}\r\n` };
+	}
+	if (!backend) return mailboxUnavailable(tag);
+	const numbers = await backend.search(session.selected, query.criteria);
+	// RFC 3501 §7.2.5: an empty result is `* SEARCH` with no numbers at all, which is not the same as no reply.
+	return { response: `* SEARCH${numbers.length > 0 ? ` ${numbers.join(" ")}` : ""}\r\n${tag} OK ${label} completed\r\n` };
 }
 
 /**
