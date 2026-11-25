@@ -27,7 +27,6 @@ const primaryOnlyPrefixes = [
   "/spam-filter",
   "/backups",
   "/branding",
-  "/licenses",
   "/activity",
   "/audit-logs",
   "/general",
