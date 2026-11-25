@@ -68,14 +68,16 @@ function FeedsPanel({ onChanged }: { onChanged?: () => void }) {
 	// so it is reconciled with the recorded results instead of applied raw.
 	const writeSeq = useRef(0);
 	const writesInFlight = useRef(0);
-	// Completed mutations an in-flight GET may not know about: rows written by add()/save() and
-	// ids removed by remove(). Entries accumulate for the dialog's lifetime — they are tiny and a
-	// clean (non-overlapping) snapshot resets them.
-	const pendingWrites = useRef<{ upserted: Map<string, CalendarSubscription>; deleted: Set<string> }>({ upserted: new Map(), deleted: new Set() });
+	// Stamps each write at completion; a GET dispatched after stamp N already saw that write on
+	// the server, so its journal entry is redundant — only stamps newer than a GET's dispatch
+	// can describe writes the snapshot missed.
+	const writesDone = useRef(0);
+	const pendingWrites = useRef<{ upserted: Map<string, { row: CalendarSubscription; doneAt: number }>; deleted: Map<string, number> }>({ upserted: new Map(), deleted: new Map() });
 
 	useEffect(() => {
 		let active = true;
 		const seqAtStart = writeSeq.current;
+		const doneAtStart = writesDone.current;
 		void authFetch("/api/calendar/subscriptions")
 			.then(async (response) => {
 				const body = await response.json().catch(() => ({})) as { subscriptions?: CalendarSubscription[] };
@@ -87,22 +89,26 @@ function FeedsPanel({ onChanged }: { onChanged?: () => void }) {
 				if (!active) return;
 				const list = body.subscriptions;
 				const { upserted, deleted } = pendingWrites.current;
+				// Drop entries for writes completed before this GET was dispatched — the snapshot
+				// already reflects them, and merging their older copies would mask newer fields
+				// the server changed since (health, event counts). Only writes settled mid-flight
+				// still need the journal.
+				for (const [id, entry] of upserted) if (entry.doneAt <= doneAtStart) upserted.delete(id);
+				for (const [id, doneAt] of deleted) if (doneAt <= doneAtStart) deleted.delete(id);
 				// A snapshot is only clean when no write overlapped this GET at all: none started
-				// during its flight (seq unchanged), none still in flight, none already journaled
+				// during its flight (seq unchanged), none still in flight, none settled mid-flight
 				// (a write that began before the GET but landed after its snapshot was taken).
 				if (writeSeq.current !== seqAtStart || writesInFlight.current > 0 || upserted.size > 0 || deleted.size > 0) {
-					// Merge the recorded mutation results over the stale snapshot — the journal
-					// stays until a later load resolves clean, so repeated retries can't lose it.
+					// Merge the surviving mid-flight writes over the stale snapshot — their journal
+					// entries stay until a later load resolves clean, so retries can't lose them.
 					setSubscriptions(
 						list
 							.filter((item) => !deleted.has(item.id))
-							.map((item) => upserted.get(item.id) ?? item)
-							.concat([...upserted.values()].filter((item) => !list.some((row) => row.id === item.id))),
+							.map((item) => upserted.get(item.id)?.row ?? item)
+							.concat([...upserted.values()].map((entry) => entry.row).filter((item) => !list.some((row) => row.id === item.id))),
 					);
 					return;
 				}
-				pendingWrites.current.upserted.clear();
-				pendingWrites.current.deleted.clear();
 				setSubscriptions(list);
 			})
 			.catch((error: unknown) => {
@@ -128,7 +134,7 @@ function FeedsPanel({ onChanged }: { onChanged?: () => void }) {
 			const failure = await readFeedResponse(response);
 			if (failure) throw failure;
 			const result = await response.json() as SubscriptionCreateResult;
-			pendingWrites.current.upserted.set(result.subscription.id, result.subscription);
+			pendingWrites.current.upserted.set(result.subscription.id, { row: result.subscription, doneAt: ++writesDone.current });
 			pendingWrites.current.deleted.delete(result.subscription.id);
 			setSubscriptions((current) => [...(current ?? []).filter((item) => item.id !== result.subscription.id), result.subscription]);
 			onChanged?.();
@@ -151,7 +157,7 @@ function FeedsPanel({ onChanged }: { onChanged?: () => void }) {
 			const failure = await readFeedResponse(response);
 			if (failure) throw failure;
 			const { subscription } = await response.json() as { subscription: CalendarSubscription };
-			pendingWrites.current.upserted.set(subscription.id, subscription);
+			pendingWrites.current.upserted.set(subscription.id, { row: subscription, doneAt: ++writesDone.current });
 			setSubscriptions((current) => current?.map((item) => item.id === id ? subscription : item) ?? null);
 			setEditingId(null);
 			return subscription;
@@ -170,7 +176,7 @@ function FeedsPanel({ onChanged }: { onChanged?: () => void }) {
 			const response = await authFetch(`/api/calendar/subscriptions/${subscription.id}`, { method: "DELETE" });
 			if (!response.ok) throw new Error();
 			pendingWrites.current.upserted.delete(subscription.id);
-			pendingWrites.current.deleted.add(subscription.id);
+			pendingWrites.current.deleted.set(subscription.id, ++writesDone.current);
 			setSubscriptions((current) => current?.filter((item) => item.id !== subscription.id) ?? null);
 			onChanged?.();
 		} catch {

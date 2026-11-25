@@ -18,9 +18,12 @@ export async function PATCH(request: Request) {
 	const db = getDb(env);
 	// Legacy series have no recorded timezone. Freeze their current recurrence
 	// before changing the account preference, so future instants do not move.
+	// Feed-owned rows are skipped: their NULL is the feed's own UTC marker from
+	// the ICS importer, and only a refresh may rewrite them.
 	await db.update(calendarEvents).set({ timeZone: getRequestTimeZone(request, user.timeZone) }).where(and(
 		eq(calendarEvents.userId, user.id),
 		isNull(calendarEvents.timeZone),
+		isNull(calendarEvents.subscriptionId),
 		ne(calendarEvents.repeat, "none"),
 	));
 	await db.update(users).set({ timeZone: input.timeZone }).where(eq(users.id, user.id));
