@@ -26,10 +26,30 @@ export type ImapMailboxEntry = {
 };
 export type ImapMailboxCounts = { messages: number; unseen: number };
 
+/**
+ * One message as FETCH reports it: the flag columns plus its provisional positional
+ * UID. Sequence number and UID are both the 1-based position in the selected
+ * mailbox, ordered by arrival, so `uid` is what the backend assigned the row.
+ */
+export type ImapMessageEntry = {
+	uid: number;
+	/** `messages.read` — directed mail has no read toggle, hence `outbound` below. */
+	read: boolean;
+	starred: boolean;
+	/** `messages.trashed_at` is set: the row sits in Trash or Spam. */
+	trashed: boolean;
+	/** `messages.status = 'draft'` — the same marker JMAP uses for the `$draft` keyword. */
+	draft: boolean;
+	/** `messages.direction = 'outbound'` — always seen, matching the UNSEEN counter. */
+	outbound: boolean;
+};
+
 /** What the dispatcher needs from the database. Kept behind an interface so the protocol stays pure and testable. */
 export type ImapMailboxBackend = {
 	list(): Promise<ImapMailboxEntry[]>;
 	counts(entry: ImapMailboxEntry): Promise<ImapMailboxCounts>;
+	/** Every message of the selected mailbox in sequence order, so index + 1 is the UID. */
+	messages(selected: ImapSelectedMailbox): Promise<ImapMessageEntry[]>;
 };
 
 export type ImapAction = {
@@ -41,6 +61,14 @@ export type ImapAction = {
 
 /** The one hierarchy delimiter Mailflare's IMAP names use. */
 export const IMAP_DELIMITER = "/";
+
+/**
+ * The flags the bridge reports, in the order SELECT advertises them. `\Answered` is
+ * deliberately absent: Mailflare stores no answered/replied state, so advertising it
+ * would claim a flag that is always absent and — with no STORE yet — can never be set.
+ * `\Recent` is absent for the same reason, which is why SELECT answers `0 RECENT`.
+ */
+export const IMAP_FLAGS = ["\\Seen", "\\Flagged", "\\Draft", "\\Deleted"] as const;
 
 /** Parse an IMAP command line. Quoted strings support backslash escapes; literals are supplied by the socket layer as quoted values. */
 export function quoteImapLiteral(value: string): string {
@@ -108,6 +136,8 @@ export async function dispatchImapCommand(
 	if (verb === "LIST" || verb === "LSUB") return listCommand(tag, verb, args, backend);
 	if (verb === "SELECT" || verb === "EXAMINE") return selectCommand(tag, verb, args, backend);
 	if (verb === "STATUS") return statusCommand(tag, args, backend);
+	if (verb === "FETCH") return fetchCommand(tag, false, args, session, backend);
+	if (verb === "UID") return uidCommand(tag, args, session, backend);
 	if (verb === "UNSELECT" || verb === "CLOSE") {
 		if (args.length > 0) return { response: `${tag} BAD ${verb} takes no arguments\r\n` };
 		if (!session.selected) return { response: `${tag} NO No mailbox selected\r\n` };
@@ -142,17 +172,18 @@ async function selectCommand(
 	backend?: ImapMailboxBackend,
 ): Promise<ImapAction> {
 	if (args.length !== 1) return { response: `${tag} BAD ${verb} needs one mailbox name\r\n` };
-	if (!backend) return mailboxUnavailable(tag);
+	if (!backend) return { ...mailboxUnavailable(tag), state: "authenticated", selected: null };
 	const entry = resolveImapMailbox(await backend.list(), args[0]);
 	// Nonexistent and inaccessible names answer the same "no", so a session cannot probe for mailboxes it may not read.
-	if (!entry) return { response: `${tag} NO No such mailbox\r\n` };
+	// RFC 3501 §6.3.2: a SELECT/EXAMINE that fails to open the mailbox must not leave an older selection in place.
+	if (!entry) return { response: `${tag} NO No such mailbox\r\n`, state: "authenticated", selected: null };
 	const counts = await backend.counts(entry);
 	// The bridge is read-only in this slice: APPEND/STORE arrive later, so both SELECT and EXAMINE answer READ-ONLY.
 	const selected: ImapSelectedMailbox = { name: entry.name, ref: entry.ref, uidValidity: imapUidValidity(entry.ref), readOnly: true };
 	const lines = [
 		`* ${counts.messages} EXISTS`,
 		`* 0 RECENT`,
-		`* FLAGS (\\Answered \\Flagged \\Draft \\Seen \\Deleted)`,
+		`* FLAGS (${IMAP_FLAGS.join(" ")})`,
 		`* OK [UIDVALIDITY ${selected.uidValidity}] UIDs valid`,
 		`* OK [UIDNEXT ${counts.messages + 1}] Predicted next UID`,
 		`* OK [PERMANENTFLAGS ()] Read-only mailbox`,
@@ -180,6 +211,112 @@ async function statusCommand(tag: string, args: string[], backend?: ImapMailboxB
 	}
 	if (values.length === 0) return { response: `${tag} BAD STATUS supports MESSAGES RECENT UIDNEXT UIDVALIDITY UNSEEN\r\n` };
 	return { response: `* STATUS ${formatImapName(entry.name)} (${values.join(" ")})\r\n${tag} OK STATUS completed\r\n` };
+}
+
+/**
+ * UID commands share FETCH's sequence model: UIDs are positional, so `UID FETCH` is
+ * FETCH with the UID echoed back. Every other UID subcommand (STORE, COPY, SEARCH,
+ * EXPUNGE) is a later slice and answers the same honest NO as any unimplemented verb.
+ */
+async function uidCommand(tag: string, args: string[], session: ImapSession, backend?: ImapMailboxBackend): Promise<ImapAction> {
+	const subcommand = args[0]?.toUpperCase();
+	if (!subcommand) return { response: `${tag} BAD UID needs a subcommand\r\n` };
+	if (subcommand !== "FETCH") return { response: `${tag} NO Not implemented yet\r\n` };
+	return fetchCommand(tag, true, args.slice(1), session, backend);
+}
+
+/**
+ * FETCH and UID FETCH over the selected mailbox. Only FLAGS and UID are served: the
+ * bridge has no message bodies to hand out yet, so ENVELOPE/BODY/RFC822 answer BAD
+ * instead of inventing an answer.
+ */
+async function fetchCommand(
+	tag: string,
+	uid: boolean,
+	args: string[],
+	session: ImapSession,
+	backend?: ImapMailboxBackend,
+): Promise<ImapAction> {
+	const label = uid ? "UID FETCH" : "FETCH";
+	// FETCH is only legal in selected state, so this is a protocol error (BAD) rather than UNSELECT's NO.
+	if (!session.selected) return { response: `${tag} BAD No mailbox selected\r\n` };
+	if (args.length < 2) return { response: `${tag} BAD ${label} needs a sequence set and data items\r\n` };
+	const items = parseImapFetchItems(args.slice(1));
+	if (!items) return { response: `${tag} BAD ${label} data items must be a parenthesized list\r\n` };
+	if (items.some((item) => item !== "FLAGS" && item !== "UID")) {
+		return { response: `${tag} BAD ${label} supports FLAGS and UID only\r\n` };
+	}
+	if (!backend) return mailboxUnavailable(tag);
+	const messages = await backend.messages(session.selected);
+	if (messages.length === 0) return { response: `${tag} BAD Mailbox is empty\r\n` };
+	const sequenceNumbers = parseImapSequenceSet(args[0], messages.length);
+	if (!sequenceNumbers) return { response: `${tag} BAD ${label} sequence set is malformed or out of range\r\n` };
+	// RFC 3501 §6.4.8: a UID FETCH reports the UID whether or not the client asked for it.
+	const wanted = [...new Set(uid ? [...items, "UID"] : items)];
+	const lines = sequenceNumbers.map((sequence) => {
+		const message = messages[sequence - 1];
+		const parts = wanted.map((item) => (item === "UID" ? `UID ${message.uid}` : `FLAGS (${imapMessageFlags(message).join(" ")})`));
+		return `* ${sequence} FETCH (${parts.join(" ")})`;
+	});
+	return { response: `${lines.join("\r\n")}\r\n${tag} OK ${label} completed\r\n` };
+}
+
+/** Flags for one message, in the order SELECT advertises them. */
+export function imapMessageFlags(message: ImapMessageEntry): string[] {
+	const flags: string[] = [];
+	// Outbound mail is seen: it has no `read` toggle and the UNSEEN counter only counts inbound rows.
+	if (message.read || message.outbound) flags.push("\\Seen");
+	if (message.starred) flags.push("\\Flagged");
+	if (message.draft) flags.push("\\Draft");
+	if (message.trashed) flags.push("\\Deleted");
+	return flags;
+}
+
+/**
+ * `(FLAGS UID)` arrives as `["(FLAGS", "UID)"]` because the command line is split on
+ * spaces. A bare `FLAGS` or `FLAGS UID` is accepted too, as RFC 3501 allows.
+ */
+export function parseImapFetchItems(args: string[]): string[] | null {
+	const joined = args.join(" ").trim();
+	if (!joined) return null;
+	const parenthesized = /^\(([^()]*)\)$/.exec(joined);
+	if (!parenthesized) {
+		if (/[()]/.test(joined)) return null;
+		const bare = joined.split(/\s+/).filter(Boolean).map((item) => item.toUpperCase());
+		return bare.length > 0 ? bare : null;
+	}
+	const items = parenthesized[1].split(/\s+/).filter(Boolean).map((item) => item.toUpperCase());
+	return items.length > 0 ? items : null;
+}
+
+/**
+ * An IMAP sequence set: `n`, `n:m`, `n:*`, `*`, comma-separated, in either direction
+ * (`5:3` is `3:5`, per RFC 3501's seq-range). `last` is the mailbox's message count,
+ * which is also its highest UID. Anything outside `1..last` is refused rather than
+ * silently ignored: with positional UIDs an out-of-range number means the client's
+ * view of the mailbox is stale.
+ */
+export function parseImapSequenceSet(value: string, last: number): number[] | null {
+	if (last < 1) return null;
+	const wanted = new Set<number>();
+	for (const part of value.split(",")) {
+		if (!part) return null;
+		const [left, right, extra] = part.split(":");
+		if (extra !== undefined) return null;
+		const from = imapSequencePoint(left, last);
+		const to = right === undefined ? from : imapSequencePoint(right, last);
+		if (from === null || to === null) return null;
+		for (let number = Math.min(from, to); number <= Math.max(from, to); number++) wanted.add(number);
+	}
+	return [...wanted].sort((left, right) => left - right);
+}
+
+function imapSequencePoint(token: string, last: number): number | null {
+	if (token === "*") return last;
+	if (!/^\d+$/.test(token)) return null;
+	const value = Number(token);
+	if (!Number.isSafeInteger(value) || value < 1 || value > last) return null;
+	return value;
 }
 
 function mailboxUnavailable(tag: string): ImapAction {

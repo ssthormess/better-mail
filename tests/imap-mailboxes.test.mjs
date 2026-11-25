@@ -14,6 +14,10 @@ await build({
 	parseImapCommand,
 	dispatchImapCommand,
 	parseImapStatusItems,
+	parseImapFetchItems,
+	parseImapSequenceSet,
+	imapMessageFlags,
+	IMAP_FLAGS,
 	matchImapPattern,
 	selectImapListEntries,
 	resolveImapMailbox,
@@ -37,6 +41,10 @@ const {
 	parseImapCommand,
 	dispatchImapCommand,
 	parseImapStatusItems,
+	parseImapFetchItems,
+	parseImapSequenceSet,
+	imapMessageFlags,
+	IMAP_FLAGS,
 	matchImapPattern,
 	selectImapListEntries,
 	resolveImapMailbox,
@@ -62,9 +70,20 @@ const countsByRef = new Map([
 	["mbx1~sent", { messages: 7, unseen: 0 }],
 	["mbx2~inbox", { messages: 2, unseen: 2 }],
 ]);
+/**
+ * Rows as the backend hands them over: one per flag column, so the mapping is pinned to
+ * `read`/`starred`/`trashed_at`/`status='draft'`/`direction` rather than to a flag string.
+ */
+const message = (uid, overrides = {}) => ({ uid, read: false, starred: false, trashed: false, draft: false, outbound: false, ...overrides });
+const messagesByRef = new Map([
+	["mbx1~inbox", [message(1), message(2, { read: true, starred: true }), message(3, { trashed: true })]],
+	["mbx1~drafts", [message(1, { draft: true, outbound: true })]],
+	["mbx1~sent", [message(1, { outbound: true }), message(2, { outbound: true, starred: true })]],
+]);
 const backend = {
 	list: async () => entries,
 	counts: async (entry) => countsByRef.get(entry.ref) ?? { messages: 0, unseen: 0 },
+	messages: async (selected) => messagesByRef.get(selected.ref) ?? [],
 };
 const session = { state: "authenticated", selected: null };
 const run = (line, state = session) => dispatchImapCommand(state, parseImapCommand(line), backend);
@@ -129,7 +148,7 @@ test("LIST replies with attributes, the delimiter and the matching names", async
 
 test("SELECT resolves role, folder and namespaced names and answers the read-only block", async () => {
 	const response = (await run("A SELECT INBOX")).response;
-	assert.match(response, /^\* 3 EXISTS\r\n\* 0 RECENT\r\n\* FLAGS \(\\Answered \\Flagged \\Draft \\Seen \\Deleted\)\r\n/);
+	assert.match(response, /^\* 3 EXISTS\r\n\* 0 RECENT\r\n\* FLAGS \(\\Seen \\Flagged \\Draft \\Deleted\)\r\n/);
 	assert.match(response, /\* OK \[UIDVALIDITY \d+\] /);
 	assert.match(response, /\* OK \[UIDNEXT 4\] /);
 	assert.match(response, /\* OK \[PERMANENTFLAGS \(\)\] /);
@@ -152,6 +171,120 @@ test("SELECT refuses names it cannot address without leaking why", async () => {
 	assert.equal((await run("A SELECT Nope")).response, "A NO No such mailbox\r\n");
 	assert.equal((await run('A SELECT "sales@example.test"')).response, "A NO No such mailbox\r\n");
 	assert.equal((await run("A SELECT")).response, "A BAD SELECT needs one mailbox name\r\n");
+});
+
+test("a failed SELECT or EXAMINE drops the previous selection", async () => {
+	const opened = await run("A SELECT INBOX");
+	assert.equal(opened.state, "selected");
+	for (const line of ["B SELECT Nope", "B EXAMINE Nope", 'B SELECT "sales@example.test"']) {
+		const failed = await run(line, opened);
+		assert.match(failed.response, /^B NO No such mailbox\r\n$/);
+		assert.equal(failed.state, "authenticated");
+		assert.equal(failed.selected, null);
+	}
+	// RFC 3501 §6.3.2 covers a mailbox that fails to open; a syntax BAD leaves the session alone.
+	const syntax = await run("B SELECT", opened);
+	assert.match(syntax.response, /^B BAD /);
+	assert.equal(syntax.state, undefined);
+	assert.equal(syntax.selected, undefined);
+});
+
+test("SELECT and FETCH advertise only the flags the bridge can report", async () => {
+	assert.deepEqual([...IMAP_FLAGS], ["\\Seen", "\\Flagged", "\\Draft", "\\Deleted"]);
+	// No \\Answered (nothing stores replied state) and no \\Recent (there is no RECENT tracking).
+	assert.equal(IMAP_FLAGS.includes("\\Answered"), false);
+	const advertisement = (await run("A SELECT INBOX")).response.split("\r\n").find((line) => line.startsWith("* FLAGS"));
+	const advertised = advertisement.slice(advertisement.indexOf("(") + 1, -1).split(" ");
+	const produced = new Set();
+	for (const read of [false, true]) for (const starred of [false, true]) for (const trashed of [false, true]) for (const draft of [false, true]) for (const outbound of [false, true]) {
+		for (const flag of imapMessageFlags({ read, starred, trashed, draft, outbound })) produced.add(flag);
+	}
+	assert.deepEqual([...produced].sort(), [...advertised].sort());
+});
+
+test("FETCH reports the flags each column holds", async () => {
+	const inbox = await run("A SELECT INBOX");
+	assert.equal((await run("B FETCH 1 FLAGS", inbox)).response, "* 1 FETCH (FLAGS ())\r\nB OK FETCH completed\r\n");
+	// read + starred are the Seen and Flagged columns.
+	assert.equal((await run("B FETCH 2 (FLAGS UID)", inbox)).response, "* 2 FETCH (FLAGS (\\Seen \\Flagged) UID 2)\r\nB OK FETCH completed\r\n");
+	// trashed_at is Deleted; trashed mail stays listable because there is no EXPUNGE.
+	assert.equal((await run("B FETCH 3 FLAGS", inbox)).response, "* 3 FETCH (FLAGS (\\Deleted))\r\nB OK FETCH completed\r\n");
+	// status = 'draft' is the draft marker, and outbound mail is always seen.
+	const drafts = await run("B SELECT Drafts", inbox);
+	assert.equal(drafts.selected.ref, "mbx1~drafts");
+	assert.equal((await run("B FETCH 1 (UID FLAGS)", drafts)).response, "* 1 FETCH (UID 1 FLAGS (\\Seen \\Draft))\r\nB OK FETCH completed\r\n");
+	const sent = await run("B SELECT Sent", inbox);
+	assert.equal((await run("B FETCH 2 FLAGS", sent)).response, "* 2 FETCH (FLAGS (\\Seen \\Flagged))\r\nB OK FETCH completed\r\n");
+});
+
+test("FETCH walks the sequence set and UID FETCH always answers a UID", async () => {
+	const inbox = await run("A SELECT INBOX");
+	const all = (await run("B FETCH 1:* (UID FLAGS)", inbox)).response.split("\r\n");
+	assert.deepEqual(all.slice(0, 3), [
+		"* 1 FETCH (UID 1 FLAGS ())",
+		"* 2 FETCH (UID 2 FLAGS (\\Seen \\Flagged))",
+		"* 3 FETCH (UID 3 FLAGS (\\Deleted))",
+	]);
+	assert.equal(all[3], "B OK FETCH completed");
+	// `*` is the last message and a reversed range still means both ends.
+	assert.equal((await run("B FETCH * UID", inbox)).response, "* 3 FETCH (UID 3)\r\nB OK FETCH completed\r\n");
+	assert.equal((await run("B FETCH 3:1 UID", inbox)).response.split("\r\n").slice(0, 3).join("|"), "* 1 FETCH (UID 1)|* 2 FETCH (UID 2)|* 3 FETCH (UID 3)");
+	assert.equal((await run("B FETCH 1,3 FLAGS", inbox)).response.split("\r\n").slice(0, 2).join("|"), "* 1 FETCH (FLAGS ())|* 3 FETCH (FLAGS (\\Deleted))");
+	// RFC 3501 §6.4.8: UID FETCH reports the UID even when the client asked for FLAGS only.
+	assert.equal((await run("B UID FETCH 2 FLAGS", inbox)).response, "* 2 FETCH (FLAGS (\\Seen \\Flagged) UID 2)\r\nB OK UID FETCH completed\r\n");
+	assert.equal((await run("B UID FETCH 2 (FLAGS UID)", inbox)).response, "* 2 FETCH (FLAGS (\\Seen \\Flagged) UID 2)\r\nB OK UID FETCH completed\r\n");
+	// Sequence number and UID are the same positional number, so `UID FETCH 2:*` matches like `2:*`.
+	assert.equal((await run("B UID FETCH 2:* UID", inbox)).response.split("\r\n").slice(0, 2).join("|"), "* 2 FETCH (UID 2)|* 3 FETCH (UID 3)");
+});
+
+test("FETCH refuses what it cannot answer instead of inventing data", async () => {
+	const inbox = await run("A SELECT INBOX");
+	for (const line of ["B FETCH 4 FLAGS", "B FETCH 0 FLAGS", "B FETCH 1:4 FLAGS", "B FETCH 1:0 FLAGS", "B FETCH 1:2:3 FLAGS", "B FETCH abc FLAGS", "B FETCH ,, FLAGS"]) {
+		assert.match((await run(line, inbox)).response, /^B BAD FETCH sequence set is malformed or out of range\r\n$/);
+	}
+	// Only FLAGS and UID exist here: no ENVELOPE/BODY/all-macro answers, no writes.
+	for (const line of ["B FETCH 1 ALL", "B FETCH 1 ENVELOPE", "B FETCH 1 (FLAGS BODY[])", "B FETCH 1 (FLAGS UID"]) {
+		assert.match((await run(line, inbox)).response, /^B BAD FETCH /);
+	}
+	assert.match((await run("B FETCH", inbox)).response, /^B BAD FETCH needs a sequence set and data items\r\n$/);
+	assert.match((await run("B FETCH 1", inbox)).response, /^B BAD FETCH needs a sequence set and data items\r\n$/);
+	assert.match((await run("B UID STORE 1 +FLAGS (\\Seen)", inbox)).response, /^B NO Not implemented yet\r\n$/);
+	assert.match((await run("B UID EXPUNGE", inbox)).response, /^B NO Not implemented yet\r\n$/);
+	assert.match((await run("B UID", inbox)).response, /^B BAD UID needs a subcommand\r\n$/);
+	// An empty mailbox has no last message, so even `*` cannot name one.
+	const empty = await run('B SELECT "My Folder"', inbox);
+	assert.equal((await run("B FETCH 1:* FLAGS", empty)).response, "B BAD Mailbox is empty\r\n");
+});
+
+test("FETCH needs a selected mailbox, not just an authenticated session", async () => {
+	for (const line of ["B FETCH 1 FLAGS", "B UID FETCH 1 FLAGS"]) {
+		assert.equal((await run(line, session)).response, "B BAD No mailbox selected\r\n");
+	}
+	const opened = await run("A SELECT INBOX");
+	const closed = await run("B UNSELECT", opened);
+	assert.equal(closed.state, "authenticated");
+	assert.equal((await run("B FETCH 1 FLAGS", closed)).response, "B BAD No mailbox selected\r\n");
+});
+
+test("sequence sets and fetch item lists parse the way the replies above rely on", async () => {
+	assert.deepEqual(parseImapSequenceSet("1", 3), [1]);
+	assert.deepEqual(parseImapSequenceSet("*", 3), [3]);
+	assert.deepEqual(parseImapSequenceSet("1:2", 3), [1, 2]);
+	assert.deepEqual(parseImapSequenceSet("2:*", 3), [2, 3]);
+	assert.deepEqual(parseImapSequenceSet("*:2", 3), [2, 3]);
+	assert.deepEqual(parseImapSequenceSet("3:1", 3), [1, 2, 3]);
+	assert.deepEqual(parseImapSequenceSet("1,3", 3), [1, 3]);
+	assert.deepEqual(parseImapSequenceSet("2,2:3,1", 3), [1, 2, 3]);
+	for (const value of ["", ",", "1,", ",1", "0", "4", "1:4", "2:1:3", "1:*:2", "*1", "-", "1:0"]) assert.equal(parseImapSequenceSet(value, 3), null, value);
+	assert.equal(parseImapSequenceSet("1", 0), null);
+	assert.deepEqual(parseImapFetchItems(["(FLAGS", "UID)"]), ["FLAGS", "UID"]);
+	assert.deepEqual(parseImapFetchItems(["(FLAGS)"]), ["FLAGS"]);
+	assert.deepEqual(parseImapFetchItems(["FLAGS"]), ["FLAGS"]);
+	assert.deepEqual(parseImapFetchItems(["flags", "uid"]), ["FLAGS", "UID"]);
+	assert.equal(parseImapFetchItems([]), null);
+	assert.equal(parseImapFetchItems(["()"]), null);
+	assert.equal(parseImapFetchItems(["(FLAGS", "UID"]), null);
+	assert.equal(parseImapFetchItems(["((FLAGS))"]), null);
 });
 
 test("the parser hands the mailbox verbs the arguments they expect", () => {

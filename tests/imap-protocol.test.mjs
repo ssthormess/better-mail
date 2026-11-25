@@ -27,7 +27,10 @@ test("dispatches supported commands and sends valid unimplemented commands an ho
 	assert.match((await dispatchImapCommand("not-authenticated", parseImapCommand("A NOOP"))).response, /A OK NOOP/);
 	assert.match((await dispatchImapCommand("not-authenticated", parseImapCommand("A ID NIL"))).response, /Mailflare/);
 	assert.match((await dispatchImapCommand("not-authenticated", parseImapCommand("A SELECT INBOX"))).response, /A BAD/);
-	assert.match((await dispatchImapCommand("authenticated", parseImapCommand("A FETCH 1 ALL"))).response, /A NO Not implemented yet/);
+	// FETCH is a selected-state verb, and writes are still a later slice.
+	assert.match((await dispatchImapCommand("authenticated", parseImapCommand("A FETCH 1 FLAGS"))).response, /A BAD No mailbox selected/);
+	assert.match((await dispatchImapCommand("authenticated", parseImapCommand("A UID FETCH 1 FLAGS"))).response, /A BAD No mailbox selected/);
+	assert.match((await dispatchImapCommand("authenticated", parseImapCommand("A STORE 1 +FLAGS (\\Seen)"))).response, /A NO Not implemented yet/);
 	// The mailbox verbs need a database, so without a backend they answer NO instead of guessing.
 	assert.match((await dispatchImapCommand("authenticated", parseImapCommand("A SELECT INBOX"))).response, /A NO Mailbox data unavailable/);
 	assert.match((await dispatchImapCommand("authenticated", parseImapCommand('A LIST "" "*"'))).response, /A NO Mailbox data unavailable/);
