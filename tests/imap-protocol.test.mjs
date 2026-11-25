@@ -22,19 +22,22 @@ test("parses tagged commands and quoted arguments with escaped quotes", () => {
 	assert.equal(parseImapCommand(`A1 LOGIN user ${quoteImapLiteral('pass with "quote')}`).args[1], 'pass with "quote');
 });
 
-test("dispatches supported commands and sends valid unimplemented commands an honest NO", () => {
-	assert.match(dispatchImapCommand("not-authenticated", parseImapCommand("A CAPABILITY")).response, /IMAP4rev1/);
-	assert.match(dispatchImapCommand("not-authenticated", parseImapCommand("A NOOP")).response, /A OK NOOP/);
-	assert.match(dispatchImapCommand("not-authenticated", parseImapCommand("A ID NIL")).response, /Mailflare/);
-	assert.match(dispatchImapCommand("not-authenticated", parseImapCommand("A SELECT INBOX")).response, /A BAD/);
-	assert.match(dispatchImapCommand("authenticated", parseImapCommand("A SELECT INBOX")).response, /A NO Not implemented yet/);
-	assert.equal(dispatchImapCommand("not-authenticated", parseImapCommand("A LOGIN user pass")).login.password, "pass");
-	assert.equal(dispatchImapCommand("not-authenticated", parseImapCommand("A LOGIN user")).response, "A BAD LOGIN requires username and password\r\n");
-	assert.match(dispatchImapCommand("not-authenticated", parseImapCommand("A LOGOUT")).response, /A OK LOGOUT/);
+test("dispatches supported commands and sends valid unimplemented commands an honest NO", async () => {
+	assert.match((await dispatchImapCommand("not-authenticated", parseImapCommand("A CAPABILITY"))).response, /IMAP4rev1/);
+	assert.match((await dispatchImapCommand("not-authenticated", parseImapCommand("A NOOP"))).response, /A OK NOOP/);
+	assert.match((await dispatchImapCommand("not-authenticated", parseImapCommand("A ID NIL"))).response, /Mailflare/);
+	assert.match((await dispatchImapCommand("not-authenticated", parseImapCommand("A SELECT INBOX"))).response, /A BAD/);
+	assert.match((await dispatchImapCommand("authenticated", parseImapCommand("A FETCH 1 ALL"))).response, /A NO Not implemented yet/);
+	// The mailbox verbs need a database, so without a backend they answer NO instead of guessing.
+	assert.match((await dispatchImapCommand("authenticated", parseImapCommand("A SELECT INBOX"))).response, /A NO Mailbox data unavailable/);
+	assert.match((await dispatchImapCommand("authenticated", parseImapCommand('A LIST "" "*"'))).response, /A NO Mailbox data unavailable/);
+	assert.equal((await dispatchImapCommand("not-authenticated", parseImapCommand("A LOGIN user pass"))).login.password, "pass");
+	assert.equal((await dispatchImapCommand("not-authenticated", parseImapCommand("A LOGIN user"))).response, "A BAD LOGIN requires username and password\r\n");
+	assert.match((await dispatchImapCommand("not-authenticated", parseImapCommand("A LOGOUT"))).response, /A OK LOGOUT/);
 });
 
-test("LOGIN transitions state only after successful app-password authentication", () => {
+test("LOGIN transitions state only after successful app-password authentication", async () => {
 	assert.deepEqual(loginResult("A", true), { response: "A OK LOGIN completed\r\n", state: "authenticated" });
 	assert.deepEqual(loginResult("A", false), { response: "A NO Authentication failed\r\n" });
-	assert.match(dispatchImapCommand("authenticated", parseImapCommand("B LOGIN user pass")).response, /B BAD/);
+	assert.match((await dispatchImapCommand("authenticated", parseImapCommand("B LOGIN user pass"))).response, /B BAD/);
 });
