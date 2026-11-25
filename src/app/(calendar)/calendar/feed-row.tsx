@@ -22,6 +22,7 @@ export function FeedRow({ subscription, pending, onEdit, onDelete }: FeedRowProp
 	return (
 		<div className="flex items-start gap-3 rounded-xl border border-neutral-200 bg-white px-4 py-3">
 			<HealthIcon aria-hidden="true" className={clsx("mt-0.5 h-4 w-4 shrink-0", healthClass)} />
+			<span className="sr-only">{t(`calendar.feeds.status.${health}`)}</span>
 			<div className="min-w-0 flex-1">
 				<p className="truncate text-sm font-medium text-neutral-900">{subscription.title}</p>
 				<p className="truncate text-xs text-neutral-500" title={subscription.feedUrl}>{feedUrlLabel(subscription.feedUrl)}</p>

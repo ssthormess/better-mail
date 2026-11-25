@@ -21,9 +21,17 @@ function FeedsListSkeleton() {
 	);
 }
 
-export function FeedsList({ subscriptions, loadError, editingId, pendingId, onRetry, onEdit, onCancelEdit, onSave, onDelete }: FeedsListProps) {
+export function FeedsList({ subscriptions, loadError, denied, editingId, pendingId, onRetry, onEdit, onCancelEdit, onSave, onDelete }: FeedsListProps) {
 	const { t } = useLanguage();
 
+	if (denied) {
+		return (
+			<p role="alert" className="flex items-center gap-2 text-sm text-red-600">
+				{t("calendar.feeds.unavailable")}
+				<button type="button" className="underline underline-offset-2" onClick={onRetry}>{t("undo.retry")}</button>
+			</p>
+		);
+	}
 	if (loadError) {
 		return (
 			<p role="alert" className="flex items-center gap-2 text-sm text-red-600">

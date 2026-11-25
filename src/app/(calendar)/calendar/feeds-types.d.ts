@@ -38,6 +38,8 @@ export type CalendarFeedsDialogProps = {
 	onOpenChange: (open: boolean) => void;
 	/** Runs after a feed is added or removed — its events landed or left with it. */
 	onChanged?: () => void;
+	/** Where focus lands when the dialog closes — the menu item that opened it is unmounted by then. */
+	returnFocusRef?: { current: HTMLButtonElement | null };
 };
 
 export type FeedsAddFormProps = {
@@ -48,6 +50,8 @@ export type FeedsListProps = {
 	/** null while the first load is in flight. */
 	subscriptions: CalendarSubscription[] | null;
 	loadError: boolean;
+	/** The account was denied the feature — the list request answered 403. */
+	denied: boolean;
 	editingId: string | null;
 	pendingId: string | null;
 	onRetry: () => void;

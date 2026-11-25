@@ -7,6 +7,7 @@ import { purgeExpiredAuthRows } from "@/lib/auth/purge";
 import { runJmapChangeRetention } from "@/lib/jmap/changes";
 import { runFollowUpReminders } from "@/lib/follow-ups/service";
 import { runCalendarReminders } from "@/lib/calendar/reminders";
+import { runCalendarSubscriptionRefresh } from "@/lib/calendar/subscriptions";
 import { sweepImportJobs } from "@/lib/import/jobs";
 import { sweepOrphanedRawMail } from "@/lib/email/raw-sweeper";
 import { pruneExpiredMessageActionUndoClaims } from "@/lib/messages/actions/claims";
@@ -22,6 +23,8 @@ export function startScheduler(env: CloudflareEnv) {
 		const now = new Date();
 		runFollowUpReminders(env, now).catch((error) => console.error("Follow-up reminders failed", error));
 		runCalendarReminders(env, now).catch((error) => console.error("Calendar reminders failed", error));
+		// Same job the five-minute cron runs on Workers; each feed's own interval keeps the effective cadence identical.
+		runCalendarSubscriptionRefresh(env, now).catch((error) => console.error("Calendar subscription refresh failed", error));
 		const day = now.toISOString().slice(0, 10);
 		if (now.getUTCHours() !== 2 || lastRunDay === day) return;
 		lastRunDay = day;

@@ -71,6 +71,8 @@ export default function CalendarPage() {
   const [monthPickerOpen, setMonthPickerOpen] = useState(false);
   const [subscribeOpen, setSubscribeOpen] = useState(false);
   const [feedsOpen, setFeedsOpen] = useState(false);
+  // The feeds dialog restores focus here on close — the menu item that opened it unmounts.
+  const optionsButtonRef = useRef<HTMLButtonElement>(null);
   const [pickerMonth, setPickerMonth] = useState(() => new Date());
   const monthPickerRef = useRef<HTMLDivElement | null>(null);
   const monthPickerPopupRef = useRef<HTMLDivElement | null>(null);
@@ -535,7 +537,7 @@ export default function CalendarPage() {
               <Button disabled={pendingAction !== null} onClick={() => openNewEvent()} className={clsx("h-10 rounded-l-full rounded-r-none bg-blue-600 pl-4 pr-3 text-white hover:bg-blue-500")}><Plus className="h-5 w-5" />{t("calendar.newEvent")}</Button>
               <DropdownMenu.Root>
                 <DropdownMenu.Trigger asChild>
-                  <button type="button" aria-label={t("calendar.options")} className="flex h-10 w-9 items-center justify-center rounded-l-none rounded-r-full border-l border-white/40 bg-blue-600 text-white hover:bg-blue-500"><ChevronDown className="h-5 w-5" /></button>
+                  <button ref={optionsButtonRef} type="button" aria-label={t("calendar.options")} className="flex h-10 w-9 items-center justify-center rounded-l-none rounded-r-full border-l border-white/40 bg-blue-600 text-white hover:bg-blue-500"><ChevronDown className="h-5 w-5" /></button>
                 </DropdownMenu.Trigger>
                 <DropdownMenu.Portal>
                   <DropdownMenu.Content align="end" sideOffset={4} className="z-[130] min-w-48 rounded-xl border border-neutral-200 bg-white p-1 text-sm shadow-xl">
@@ -623,7 +625,7 @@ export default function CalendarPage() {
       </section>
 
       <CalendarSubscribeDialog open={subscribeOpen} onOpenChange={setSubscribeOpen} />
-      <CalendarFeedsDialog open={feedsOpen} onOpenChange={setFeedsOpen} onChanged={() => setEventsVersion((version) => version + 1)} />
+      <CalendarFeedsDialog open={feedsOpen} onOpenChange={setFeedsOpen} onChanged={() => setEventsVersion((version) => version + 1)} returnFocusRef={optionsButtonRef} />
       <InviteResponseDialog event={pendingInvite} onClose={() => setPendingInvite(null)} onAnswered={() => setEventsVersion((version) => version + 1)} />
 
       {adding && createPortal(

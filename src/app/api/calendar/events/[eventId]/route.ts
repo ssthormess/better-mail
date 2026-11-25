@@ -33,6 +33,8 @@ export async function PATCH(request: Request, { params }: CalendarEventRoutePara
 	const db = getDb(env);
 	const [existing] = await db.select().from(calendarEvents).where(and(eq(calendarEvents.id, occurrence?.seriesId ?? eventId), eq(calendarEvents.userId, user.id))).limit(1);
 	if (!existing) return NextResponse.json({ error: "Event not found" }, { status: 404 });
+	// Feed-owned rows mirror the subscribed feed — a local edit would be overwritten by the next refresh.
+	if (existing.subscriptionId) return NextResponse.json({ error: "Subscribed calendar events are read-only" }, { status: 409 });
 	// An invitation received by mail is never re-announced to its guests from here.
 	const isInboundInvite = existing.responseStatus != null || existing.inviteMessageId != null;
 	const timeZone = input.timeZone ? normalizeTimeZone(input.timeZone) : existing.timeZone ?? getRequestTimeZone(request, user.timeZone);
@@ -141,6 +143,8 @@ export async function DELETE(request: Request, { params }: CalendarEventRoutePar
 	const db = getDb(env);
 	const [existing] = await db.select().from(calendarEvents).where(and(eq(calendarEvents.id, occurrence?.seriesId ?? eventId), eq(calendarEvents.userId, user.id))).limit(1);
 	if (!existing) return NextResponse.json({ error: "Event not found" }, { status: 404 });
+	// Feed-owned rows mirror the subscribed feed — deleting one here would be restored or re-pruned by the next refresh.
+	if (existing.subscriptionId) return NextResponse.json({ error: "Subscribed calendar events are read-only" }, { status: 409 });
 	if (occurrence && (existing.repeat === "none" || occurrence.startsAt < existing.startsAt || (existing.repeatUntil && occurrence.startsAt >= existing.repeatUntil))) return NextResponse.json({ error: "Occurrence not found" }, { status: 404 });
 	// An invitation received by mail is never announced to its guests from here; cancelling one only removes the row.
 	const isInboundInvite = existing.responseStatus != null || existing.inviteMessageId != null;

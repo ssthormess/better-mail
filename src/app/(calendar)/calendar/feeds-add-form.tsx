@@ -3,6 +3,7 @@
 import { useState } from "react";
 import type { FormEvent } from "react";
 import toast from "react-hot-toast";
+import { AlertTriangle } from "@/components/icons";
 import { useLanguage } from "@/components/language-provider";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -27,7 +28,20 @@ export function FeedsAddForm({ onAdd }: FeedsAddFormProps) {
 			setUrl("");
 			setTitle("");
 			toast.success(t("calendar.feeds.added", { title: result.subscription.title }));
-			if (result.errors.length) toast.error(t("calendar.feeds.someSkipped", { count: result.errors.length }));
+			if (result.skipped > 0) toast.error(t("calendar.feeds.someSkipped", { count: result.skipped }));
+			// `errors` are import notes, not skips — a merged duplicate or an imported detached
+			// occurrence reports one even when every event landed. Show them as a warning, not a count.
+			if (result.errors.length) {
+				toast(() => (
+					<span className="flex items-start gap-2">
+						<AlertTriangle aria-hidden="true" className="mt-0.5 h-4 w-4 shrink-0 text-amber-500" />
+						<span className="text-sm">
+							<span className="block font-medium">{t("calendar.feeds.importNotes")}</span>
+							{result.errors.map((note, index) => <span key={index} className="block">{note}</span>)}
+						</span>
+					</span>
+				), { duration: 8000 });
+			}
 		} catch (addError) {
 			setError(feedErrorMessage(addError, t, t("calendar.feeds.addFailed")));
 		} finally {
