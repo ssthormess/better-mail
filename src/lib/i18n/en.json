@@ -1946,6 +1946,8 @@
 	"calendar.feeds.status.pending": "Status: not checked yet.",
 	"calendar.feeds.importNotes": "Import notes:",
 	"calendar.feeds.unavailable": "Feed subscriptions are not available for this account.",
+	"calendar.feeds.eventDetails": "Event details",
+	"calendar.feeds.eventReadOnly": "Synced from a feed subscription — this event is read-only.",
 	"booking.hostListFailed": "Could not load the user list.",
 	"booking.loadFailed": "Could not load bookings.",
 	"booking.saveFailed": "Could not save booking event.",

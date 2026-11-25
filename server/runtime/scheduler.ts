@@ -23,7 +23,9 @@ export function startScheduler(env: CloudflareEnv) {
 		const now = new Date();
 		runFollowUpReminders(env, now).catch((error) => console.error("Follow-up reminders failed", error));
 		runCalendarReminders(env, now).catch((error) => console.error("Calendar reminders failed", error));
-		// Same job the five-minute cron runs on Workers; each feed's own interval keeps the effective cadence identical.
+		// Same refresh job the five-minute cron runs on Workers, checked here on the one-minute
+		// tick: per-feed refreshIntervalSec still gates when a sync is due, but due times
+		// quantize to this runtime's tick grid rather than the hosted five-minute one.
 		runCalendarSubscriptionRefresh(env, now).catch((error) => console.error("Calendar subscription refresh failed", error));
 		const day = now.toISOString().slice(0, 10);
 		if (now.getUTCHours() !== 2 || lastRunDay === day) return;

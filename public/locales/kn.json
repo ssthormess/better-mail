@@ -1901,6 +1901,8 @@
 	"calendar.feeds.status.pending": "ಸ್ಥಿತಿ: ಇನ್ನೂ ಪರಿಶೀಲಿಸಲಾಗಿಲ್ಲ.",
 	"calendar.feeds.importNotes": "ಆಮದು ಟಿಪ್ಪಣಿಗಳು:",
 	"calendar.feeds.unavailable": "ಈ ಖಾತೆಗೆ ಫೀಡ್ ಚಂದಾದಾರಿಕೆಗಳು ಲಭ್ಯವಿಲ್ಲ.",
+	"calendar.feeds.eventDetails": "ಈವೆಂಟ್ ವಿವರಗಳು",
+	"calendar.feeds.eventReadOnly": "ಫೀಡ್ ಚಂದಾದಾರಿಕೆಯಿಂದ ಸಿಂಕ್ ಮಾಡಲಾಗಿದೆ — ಈ ಈವೆಂಟ್ ಓದುವ-ಮಾತ್ರ.",
 	"booking.hostListFailed": "ಬಳಕೆದಾರ ಪಟ್ಟಿಯನ್ನು ಲೋಡ್ ಮಾಡಲು ಸಾಧ್ಯವಾಗಲಿಲ್ಲ.",
 	"booking.loadFailed": "ಬುಕಿಂಗ್‌ಗಳನ್ನು ಲೋಡ್ ಮಾಡಲು ಸಾಧ್ಯವಾಗಲಿಲ್ಲ.",
 	"booking.saveFailed": "ಬುಕಿಂಗ್ ಈವೆಂಟ್ ಉಳಿಸಲು ಸಾಧ್ಯವಾಗಲಿಲ್ಲ.",

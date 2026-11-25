@@ -32,16 +32,16 @@ export function FeedsList({ subscriptions, loadError, denied, editingId, pending
 			</p>
 		);
 	}
-	if (loadError) {
-		return (
-			<p role="alert" className="flex items-center gap-2 text-sm text-red-600">
-				{t("calendar.feeds.loadFailed")}
-				<button type="button" className="underline underline-offset-2" onClick={onRetry}>{t("undo.retry")}</button>
-			</p>
-		);
-	}
+	const errorNotice = loadError ? (
+		<p role="alert" className="flex items-center gap-2 text-sm text-red-600">
+			{t("calendar.feeds.loadFailed")}
+			<button type="button" className="underline underline-offset-2" onClick={onRetry}>{t("undo.retry")}</button>
+		</p>
+	) : null;
 	if (subscriptions === null) return <FeedsListSkeleton />;
 	if (!subscriptions.length) {
+		// Nothing loaded yet: the failed fetch takes over the whole area.
+		if (errorNotice) return errorNotice;
 		return (
 			<div className="rounded-2xl border border-dashed border-neutral-300 px-6 py-8 text-center">
 				<Globe2 className="mx-auto mb-2 h-7 w-7 text-neutral-400" />
@@ -50,8 +50,10 @@ export function FeedsList({ subscriptions, loadError, denied, editingId, pending
 			</div>
 		);
 	}
+	// A failed refresh keeps the rows it could not replace, with the retry beside them.
 	return (
 		<div className="space-y-2">
+			{errorNotice}
 			{subscriptions.map((subscription) => editingId === subscription.id ? (
 				<FeedEditRow key={subscription.id} subscription={subscription} pending={pendingId === subscription.id}
 					onSave={(patch) => onSave(subscription.id, patch)} onCancel={onCancelEdit} />

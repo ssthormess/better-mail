@@ -1848,6 +1848,8 @@
 	"calendar.feeds.status.pending": "Durum: henüz kontrol edilmedi.",
 	"calendar.feeds.importNotes": "İçe aktarma notları:",
 	"calendar.feeds.unavailable": "Akış abonelikleri bu hesap için kullanılamıyor.",
+	"calendar.feeds.eventDetails": "Etkinlik ayrıntıları",
+	"calendar.feeds.eventReadOnly": "Bir akış aboneliğinden eşitlendi — bu etkinlik salt okunur.",
 	"booking.hostListFailed": "Kullanıcı listesi yüklenemedi.",
 	"booking.loadFailed": "Randevular yüklenemedi.",
 	"booking.saveFailed": "Randevu etkinliği kaydedilemedi.",

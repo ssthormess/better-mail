@@ -1901,6 +1901,8 @@
 	"calendar.feeds.status.pending": "സ്ഥിതി: ഇതുവരെ പരിശോധിച്ചിട്ടില്ല.",
 	"calendar.feeds.importNotes": "ഇംപോർട്ട് കുറിപ്പുകൾ:",
 	"calendar.feeds.unavailable": "ഈ അക്കൗണ്ടിൽ ഫീഡ് സബ്‌സ്‌ക്രിപ്‌ഷനുകൾ ലഭ്യമല്ല.",
+	"calendar.feeds.eventDetails": "ഇവന്റിന്റെ വിശദാംശങ്ങൾ",
+	"calendar.feeds.eventReadOnly": "ഫീഡ് സബ്‌സ്‌ക്രിപ്‌ഷനിൽ നിന്ന് സമന്വയിച്ചത് — ഈ ഇവന്റ് വായന-മാത്രം.",
 	"booking.hostListFailed": "ഉപയോക്തൃ പട്ടിക ലോഡ് ചെയ്യാൻ കഴിഞ്ഞില്ല.",
 	"booking.loadFailed": "ബുക്കിംഗുകൾ ലോഡ് ചെയ്യാൻ കഴിഞ്ഞില്ല.",
 	"booking.saveFailed": "ബുക്കിംഗ് ഇവന്റ് സംരക്ഷിക്കാൻ കഴിഞ്ഞില്ല.",

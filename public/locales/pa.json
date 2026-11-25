@@ -1901,6 +1901,8 @@
 	"calendar.feeds.status.pending": "ਸਥਿਤੀ: ਹਾਲੇ ਜਾਂਚਿਆ ਨਹੀਂ.",
 	"calendar.feeds.importNotes": "ਇੰਪੋਰਟ ਨੋਟ:",
 	"calendar.feeds.unavailable": "ਇਸ ਖਾਤੇ ਲਈ ਫ਼ੀਡ ਸਬਸਕ੍ਰਿਪਸ਼ਨਾਂ ਉਪਲਬਧ ਨਹੀਂ ਹਨ।",
+	"calendar.feeds.eventDetails": "ਸਮਾਗਮ ਦੇ ਵੇਰਵੇ",
+	"calendar.feeds.eventReadOnly": "ਫੀਡ ਗਾਹਕੀ ਤੋਂ ਸਿੰਕ ਕੀਤਾ ਗਿਆ — ਇਹ ਸਮਾਗਮ ਸਿਰਫ਼-ਪੜ੍ਹਨ ਯੋਗ ਹੈ।",
 	"booking.hostListFailed": "ਵਰਤੋਂਕਾਰ ਸੂਚੀ ਲੋਡ ਨਹੀਂ ਕੀਤੀ ਜਾ ਸਕੀ।",
 	"booking.loadFailed": "ਬੁਕਿੰਗਾਂ ਲੋਡ ਨਹੀਂ ਕੀਤੀਆਂ ਜਾ ਸਕੀਆਂ।",
 	"booking.saveFailed": "ਬੁਕਿੰਗ ਸਮਾਗਮ ਸੁਰੱਖਿਅਤ ਨਹੀਂ ਕੀਤਾ ਜਾ ਸਕਿਆ।",

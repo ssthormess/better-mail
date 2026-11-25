@@ -1945,6 +1945,8 @@
 	"calendar.feeds.status.pending": "الحالة: لم تُفحص بعد.",
 	"calendar.feeds.importNotes": "ملاحظات الاستيراد:",
 	"calendar.feeds.unavailable": "اشتراكات الخلاصات غير متاحة لهذا الحساب.",
+	"calendar.feeds.eventDetails": "تفاصيل الحدث",
+	"calendar.feeds.eventReadOnly": "تمت مزامنته من اشتراك خلاصة — هذا الحدث للقراءة فقط.",
 	"booking.hostListFailed": "تعذّر تحميل قائمة المستخدمين.",
 	"booking.loadFailed": "تعذّر تحميل الحجوزات.",
 	"booking.saveFailed": "تعذّر حفظ حدث الحجز.",

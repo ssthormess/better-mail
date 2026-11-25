@@ -1901,6 +1901,8 @@
 	"calendar.feeds.status.pending": "තත්ත්වය: තවම පරීක්ෂා කර නැත.",
 	"calendar.feeds.importNotes": "ආයාත සටහන්:",
 	"calendar.feeds.unavailable": "මෙම ගිණුමට සංග්‍රහ දායකත්ව නොලැබේ.",
+	"calendar.feeds.eventDetails": "සිදුවීමේ විස්තර",
+	"calendar.feeds.eventReadOnly": "සංග්‍රහ දායකත්වයකින් සම්මේෂණය කර ඇත — මෙම සිදුවීම කියවීමට පමණි.",
 	"booking.hostListFailed": "පරිශීලක ලැයිස්තුව පූරණය කළ නොහැකි විය.",
 	"booking.loadFailed": "වෙන් කිරීම් පූරණය කළ නොහැකි විය.",
 	"booking.saveFailed": "වෙන් කිරීමේ සිදුවීම සුරැකිය නොහැකි විය.",

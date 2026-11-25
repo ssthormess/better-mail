@@ -1912,6 +1912,8 @@
 	"calendar.feeds.status.pending": "Estado: ainda não verificado.",
 	"calendar.feeds.importNotes": "Notas de importação:",
 	"calendar.feeds.unavailable": "As subscrições de feeds não estão disponíveis para esta conta.",
+	"calendar.feeds.eventDetails": "Detalhes do evento",
+	"calendar.feeds.eventReadOnly": "Sincronizado a partir de uma subscrição de feed — este evento é só de leitura.",
 	"booking.hostListFailed": "Não foi possível carregar a lista de utilizadores.",
 	"booking.loadFailed": "Não foi possível carregar os agendamentos.",
 	"booking.saveFailed": "Não foi possível guardar o evento de agendamento.",

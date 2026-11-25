@@ -1901,6 +1901,8 @@
 	"calendar.feeds.status.pending": "நிலை: இன்னும் சரிபார்க்கப்படவில்லை.",
 	"calendar.feeds.importNotes": "இறக்குமதி குறிப்புகள்:",
 	"calendar.feeds.unavailable": "இந்தக் கணக்கிற்கு ஊட்டு சந்தாக்கள் கிடைக்காது.",
+	"calendar.feeds.eventDetails": "நிகழ்வு விவரங்கள்",
+	"calendar.feeds.eventReadOnly": "ஃபீட் சந்தாவிலிருந்து ஒத்திசைக்கப்பட்டது — இந்த நிகழ்வு வாசிப்புக்கு மட்டும்.",
 	"booking.hostListFailed": "பயனர் பட்டியலை ஏற்ற இயலவில்லை.",
 	"booking.loadFailed": "முன்பதிவுகளை ஏற்ற இயலவில்லை.",
 	"booking.saveFailed": "முன்பதிவு நிகழ்வைச் சேமிக்க இயலவில்லை.",

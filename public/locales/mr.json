@@ -1899,6 +1899,8 @@
 	"calendar.feeds.status.pending": "स्थिती: अजून तपासले नाही.",
 	"calendar.feeds.importNotes": "आयात टिपा:",
 	"calendar.feeds.unavailable": "या खात्यासाठी फीड सबस्क्रिप्शन उपलब्ध नाहीत.",
+	"calendar.feeds.eventDetails": "इव्हेंटचा तपशील",
+	"calendar.feeds.eventReadOnly": "फीड सबस्क्रिप्शनमधून सिंक केलेले — हा इव्हेंट फक्त-वाचनीय आहे.",
 	"booking.hostListFailed": "वापरकर्ता यादी लोड करता आली नाही.",
 	"booking.loadFailed": "बुकिंग लोड करता आल्या नाहीत.",
 	"booking.saveFailed": "बुकिंग इव्हेंट जतन करता आला नाही.",

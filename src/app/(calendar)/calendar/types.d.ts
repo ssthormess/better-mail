@@ -27,6 +27,8 @@ export type CalendarEvent = {
   inviteMessageId?: string | null;
   /** JSON map of guest address to accepted, tentative or declined. */
   attendeeResponses?: string | null;
+  /** Set on events synced from a feed subscription: the feed owns them, so they are read-only. */
+  subscriptionId?: string | null;
 };
 
 export type CalendarView = "month" | "week" | "day";

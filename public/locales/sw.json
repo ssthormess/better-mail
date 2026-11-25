@@ -1901,6 +1901,8 @@
 	"calendar.feeds.status.pending": "Hali: bado haijaangaliwa.",
 	"calendar.feeds.importNotes": "Maelezo ya uingizaji:",
 	"calendar.feeds.unavailable": "Usajili wa feed haupatikani kwa akaunti hii.",
+	"calendar.feeds.eventDetails": "Maelezo ya tukio",
+	"calendar.feeds.eventReadOnly": "Imesawazishwa kutoka kwa usajili wa feed — tukio hili ni la kusoma tu.",
 	"booking.hostListFailed": "Imeshindwa kupakia orodha ya watumiaji.",
 	"booking.loadFailed": "Imeshindwa kupakia miadi.",
 	"booking.saveFailed": "Imeshindwa kuhifadhi tukio la miadi.",

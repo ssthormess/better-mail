@@ -1901,6 +1901,8 @@
 	"calendar.feeds.status.pending": "Status: nog niet gecontroleerd.",
 	"calendar.feeds.importNotes": "Importnotities:",
 	"calendar.feeds.unavailable": "Feed-abonnementen zijn niet beschikbaar voor dit account.",
+	"calendar.feeds.eventDetails": "Afspraakdetails",
+	"calendar.feeds.eventReadOnly": "Gesynchroniseerd vanuit een feed-abonnement — deze afspraak is alleen-lezen.",
 	"booking.hostListFailed": "Gebruikerslijst laden mislukt.",
 	"booking.loadFailed": "Boekingen laden mislukt.",
 	"booking.saveFailed": "Boekingsafspraak opslaan mislukt.",

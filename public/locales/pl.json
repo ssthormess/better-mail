@@ -1923,6 +1923,8 @@
 	"calendar.feeds.status.pending": "Stan: jeszcze nie sprawdzono.",
 	"calendar.feeds.importNotes": "Notatki z importu:",
 	"calendar.feeds.unavailable": "Subskrypcje kanałów nie są dostępne dla tego konta.",
+	"calendar.feeds.eventDetails": "Szczegóły wydarzenia",
+	"calendar.feeds.eventReadOnly": "Zsynchronizowane z subskrypcji kanału — to wydarzenie jest tylko do odczytu.",
 	"booking.hostListFailed": "Nie można załadować listy użytkowników.",
 	"booking.loadFailed": "Nie można załadować rezerwacji.",
 	"booking.saveFailed": "Nie można zapisać wydarzenia rezerwacji.",

@@ -1901,6 +1901,8 @@
 	"calendar.feeds.status.pending": "وضعیت: هنوز بررسی نشده.",
 	"calendar.feeds.importNotes": "یادداشت‌های واردات:",
 	"calendar.feeds.unavailable": "اشتراک‌های خوراک برای این حساب در دسترس نیستند.",
+	"calendar.feeds.eventDetails": "جزئیات رویداد",
+	"calendar.feeds.eventReadOnly": "از یک اشتراک فید همگام‌سازی شده است — این رویداد فقط‌خواندنی است.",
 	"booking.hostListFailed": "بارگذاری فهرست کاربران ممکن نشد.",
 	"booking.loadFailed": "بارگذاری رزروها ممکن نشد.",
 	"booking.saveFailed": "ذخیره رویداد رزرو ممکن نشد.",

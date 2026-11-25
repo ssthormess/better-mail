@@ -1901,6 +1901,8 @@
 	"calendar.feeds.status.pending": "સ્થિતિ: હજુ તપાસ્યું નથી.",
 	"calendar.feeds.importNotes": "આયાત નોંધો:",
 	"calendar.feeds.unavailable": "આ એકાઉન્ટ માટે ફીડ સબ્સ્ક્રિપ્શન્સ ઉપલબ્ધ નથી.",
+	"calendar.feeds.eventDetails": "ઇવેન્ટની વિગતો",
+	"calendar.feeds.eventReadOnly": "ફીડ સબ્સ્ક્રિપ્શનમાંથી સિંક થયેલ — આ ઇવેન્ટ ફક્ત-વાંચનીય છે.",
 	"booking.hostListFailed": "વપરાશકર્તા સૂચિ લોડ કરી શકાઈ નથી.",
 	"booking.loadFailed": "બુકિંગ લોડ કરી શકાયા નથી.",
 	"booking.saveFailed": "બુકિંગ ઇવેન્ટ સાચવી શકાઈ નથી.",

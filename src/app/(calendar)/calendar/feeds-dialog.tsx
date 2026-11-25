@@ -63,13 +63,14 @@ function FeedsPanel({ onChanged }: { onChanged?: () => void }) {
 	const [reloadKey, setReloadKey] = useState(0);
 	const [editingId, setEditingId] = useState<string | null>(null);
 	const [pendingId, setPendingId] = useState<string | null>(null);
-	// Bumped when a mutation starts. A list GET issued earlier can resolve with a snapshot that
-	// predates the write — applying it raw would clobber the mutation's local update, so a stale
-	// response is reconciled with the recorded write results instead.
+	// Bumped when a mutation starts. A list GET whose flight overlaps any write — started earlier,
+	// still in flight, or already journaled — can resolve with a snapshot that predates the write,
+	// so it is reconciled with the recorded results instead of applied raw.
 	const writeSeq = useRef(0);
-	// Completed mutations the in-flight GET may not know about: rows written by add()/save() and
+	const writesInFlight = useRef(0);
+	// Completed mutations an in-flight GET may not know about: rows written by add()/save() and
 	// ids removed by remove(). Entries accumulate for the dialog's lifetime — they are tiny and a
-	// clean (non-stale) snapshot resets them.
+	// clean (non-overlapping) snapshot resets them.
 	const pendingWrites = useRef<{ upserted: Map<string, CalendarSubscription>; deleted: Set<string> }>({ upserted: new Map(), deleted: new Set() });
 
 	useEffect(() => {
@@ -85,10 +86,13 @@ function FeedsPanel({ onChanged }: { onChanged?: () => void }) {
 				}
 				if (!active) return;
 				const list = body.subscriptions;
-				if (writeSeq.current !== seqAtStart) {
-					// The snapshot predates a write that landed mid-flight — merge the recorded
-					// mutation results over it instead of clobbering them with the older list.
-					const { upserted, deleted } = pendingWrites.current;
+				const { upserted, deleted } = pendingWrites.current;
+				// A snapshot is only clean when no write overlapped this GET at all: none started
+				// during its flight (seq unchanged), none still in flight, none already journaled
+				// (a write that began before the GET but landed after its snapshot was taken).
+				if (writeSeq.current !== seqAtStart || writesInFlight.current > 0 || upserted.size > 0 || deleted.size > 0) {
+					// Merge the recorded mutation results over the stale snapshot — the journal
+					// stays until a later load resolves clean, so repeated retries can't lose it.
 					setSubscriptions(
 						list
 							.filter((item) => !deleted.has(item.id))
@@ -104,7 +108,9 @@ function FeedsPanel({ onChanged }: { onChanged?: () => void }) {
 			.catch((error: unknown) => {
 				if (!active) return;
 				if ((error as { status?: number }).status === 403) setDenied(true);
-				setSubscriptions([]);
+				// Keep whatever rows are already known — a failed retry must not hide data the
+				// user just wrote; only an empty list falls back to the bare error block.
+				setSubscriptions((current) => current ?? []);
 				setLoadError(true);
 			});
 		return () => { active = false; };
@@ -112,23 +118,29 @@ function FeedsPanel({ onChanged }: { onChanged?: () => void }) {
 
 	async function add(input: SubscriptionCreateInput): Promise<SubscriptionCreateResult> {
 		writeSeq.current += 1;
-		const response = await authFetch("/api/calendar/subscriptions", {
-			method: "POST",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify(input),
-		});
-		const failure = await readFeedResponse(response);
-		if (failure) throw failure;
-		const result = await response.json() as SubscriptionCreateResult;
-		pendingWrites.current.upserted.set(result.subscription.id, result.subscription);
-		pendingWrites.current.deleted.delete(result.subscription.id);
-		setSubscriptions((current) => [...(current ?? []).filter((item) => item.id !== result.subscription.id), result.subscription]);
-		onChanged?.();
-		return result;
+		writesInFlight.current += 1;
+		try {
+			const response = await authFetch("/api/calendar/subscriptions", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify(input),
+			});
+			const failure = await readFeedResponse(response);
+			if (failure) throw failure;
+			const result = await response.json() as SubscriptionCreateResult;
+			pendingWrites.current.upserted.set(result.subscription.id, result.subscription);
+			pendingWrites.current.deleted.delete(result.subscription.id);
+			setSubscriptions((current) => [...(current ?? []).filter((item) => item.id !== result.subscription.id), result.subscription]);
+			onChanged?.();
+			return result;
+		} finally {
+			writesInFlight.current -= 1;
+		}
 	}
 
 	async function save(id: string, patch: SubscriptionPatchInput): Promise<CalendarSubscription> {
 		writeSeq.current += 1;
+		writesInFlight.current += 1;
 		setPendingId(id);
 		try {
 			const response = await authFetch(`/api/calendar/subscriptions/${id}`, {
@@ -144,6 +156,7 @@ function FeedsPanel({ onChanged }: { onChanged?: () => void }) {
 			setEditingId(null);
 			return subscription;
 		} finally {
+			writesInFlight.current -= 1;
 			setPendingId(null);
 		}
 	}
@@ -151,6 +164,7 @@ function FeedsPanel({ onChanged }: { onChanged?: () => void }) {
 	async function remove(subscription: CalendarSubscription) {
 		if (!await confirmDestructive(t("calendar.feeds.deleteConfirm", { title: subscription.title }))) return;
 		writeSeq.current += 1;
+		writesInFlight.current += 1;
 		setPendingId(subscription.id);
 		try {
 			const response = await authFetch(`/api/calendar/subscriptions/${subscription.id}`, { method: "DELETE" });
@@ -162,6 +176,7 @@ function FeedsPanel({ onChanged }: { onChanged?: () => void }) {
 		} catch {
 			toast.error(t("calendar.feeds.deleteFailed"));
 		} finally {
+			writesInFlight.current -= 1;
 			setPendingId(null);
 		}
 	}
@@ -171,7 +186,7 @@ function FeedsPanel({ onChanged }: { onChanged?: () => void }) {
 			{!denied && <FeedsAddForm onAdd={add} />}
 			<div className="mt-5 border-t border-neutral-200 pt-4">
 				<FeedsList subscriptions={subscriptions} loadError={loadError} denied={denied} editingId={editingId} pendingId={pendingId}
-					onRetry={() => { setLoadError(false); setDenied(false); setSubscriptions(null); setReloadKey((key) => key + 1); }}
+					onRetry={() => { setLoadError(false); setDenied(false); setSubscriptions((current) => current?.length ? current : null); setReloadKey((key) => key + 1); }}
 					onEdit={setEditingId} onCancelEdit={() => setEditingId(null)} onSave={save} onDelete={(subscription) => void remove(subscription)} />
 			</div>
 		</>

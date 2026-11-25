@@ -1923,6 +1923,8 @@
 	"calendar.feeds.status.pending": "Статус: ще не перевірялося.",
 	"calendar.feeds.importNotes": "Примітки до імпорту:",
 	"calendar.feeds.unavailable": "Підписки на стрічки недоступні для цього облікового запису.",
+	"calendar.feeds.eventDetails": "Деталі події",
+	"calendar.feeds.eventReadOnly": "Синхронізовано з підписки на стрічку — ця подія доступна лише для читання.",
 	"booking.hostListFailed": "Не вдалося завантажити список користувачів.",
 	"booking.loadFailed": "Не вдалося завантажити бронювання.",
 	"booking.saveFailed": "Не вдалося зберегти подію бронювання.",

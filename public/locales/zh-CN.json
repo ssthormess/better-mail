@@ -1890,6 +1890,8 @@
 	"calendar.feeds.status.pending": "状态：尚未检查。",
 	"calendar.feeds.importNotes": "导入备注：",
 	"calendar.feeds.unavailable": "此帐户无法使用订阅源。",
+	"calendar.feeds.eventDetails": "日程详情",
+	"calendar.feeds.eventReadOnly": "来自订阅源的同步 — 此日程为只读。",
 	"booking.hostListFailed": "无法加载用户列表。",
 	"booking.loadFailed": "无法加载预约。",
 	"booking.saveFailed": "无法保存预约日程。",

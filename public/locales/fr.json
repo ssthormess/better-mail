@@ -1912,6 +1912,8 @@
 	"calendar.feeds.status.pending": "État : pas encore vérifié.",
 	"calendar.feeds.importNotes": "Notes d'importation :",
 	"calendar.feeds.unavailable": "Les abonnements aux flux ne sont pas disponibles pour ce compte.",
+	"calendar.feeds.eventDetails": "Détails de l'événement",
+	"calendar.feeds.eventReadOnly": "Synchronisé depuis un abonnement à un flux — cet événement est en lecture seule.",
 	"booking.hostListFailed": "Impossible de charger la liste des utilisateurs.",
 	"booking.loadFailed": "Impossible de charger les réservations.",
 	"booking.saveFailed": "Impossible d'enregistrer l'événement de réservation.",

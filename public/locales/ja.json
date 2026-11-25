@@ -1890,6 +1890,8 @@
 	"calendar.feeds.status.pending": "ステータス: 未確認",
 	"calendar.feeds.importNotes": "インポートメモ:",
 	"calendar.feeds.unavailable": "このアカウントではフィード購読を利用できません。",
+	"calendar.feeds.eventDetails": "予定の詳細",
+	"calendar.feeds.eventReadOnly": "フィード購読から同期 — この予定は読み取り専用です。",
 	"booking.hostListFailed": "ユーザー一覧を読み込めませんでした。",
 	"booking.loadFailed": "予約を読み込めませんでした。",
 	"booking.saveFailed": "予約イベントを保存できませんでした。",

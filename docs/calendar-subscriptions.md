@@ -8,7 +8,7 @@ Open **Calendar**, then the options menu in the top bar, then **Feed subscriptio
 
 Subscribing does a first fetch and import right away, so it can take a few seconds for a large feed. The dialog reports how many events could not be imported and shows any notes the importer recorded; the feed then shows up in the list with its event count.
 
-Feed events appear inline in the calendar like any other event. They are read-only copies — the API refuses edits and deletes on them, and the next refresh would overwrite a local change anyway — so changes happen at the source and come down on the next refresh. An event is identified by the feed it came through — the same event UID published by two different feeds lands as two separate events.
+Feed events appear inline in the calendar like any other event. They are read-only copies — the API refuses edits and deletes on them, the assistant's calendar tools reject them the same way, and the next refresh would overwrite a local change anyway — so changes happen at the source and come down on the next refresh. An event is identified by the feed it came through — the same event UID published by two different feeds lands as two separate events.
 
 ## Refreshing
 

@@ -1900,6 +1900,8 @@
 	"calendar.feeds.status.pending": "Status: belum diperiksa.",
 	"calendar.feeds.importNotes": "Nota import:",
 	"calendar.feeds.unavailable": "Langganan suapan tidak tersedia untuk akaun ini.",
+	"calendar.feeds.eventDetails": "Butiran acara",
+	"calendar.feeds.eventReadOnly": "Disegerakkan daripada langganan suapan — acara ini baca sahaja.",
 	"booking.hostListFailed": "Tidak dapat memuatkan senarai pengguna.",
 	"booking.loadFailed": "Tidak dapat memuatkan tempahan.",
 	"booking.saveFailed": "Tidak dapat menyimpan acara tempahan.",

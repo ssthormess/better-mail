@@ -1899,6 +1899,8 @@
 	"calendar.feeds.status.pending": "స్థితి: ఇంకా తనిఖీ చేయలేదు.",
 	"calendar.feeds.importNotes": "దిగుమతి గమనికలు:",
 	"calendar.feeds.unavailable": "ఈ ఖాతాకు ఫీడ్ సబ్‌స్క్రిప్షన్‌లు అందుబాటులో లేవు.",
+	"calendar.feeds.eventDetails": "ఈవెంట్ వివరాలు",
+	"calendar.feeds.eventReadOnly": "ఫీడ్ సబ్‌స్క్రిప్షన్ నుండి సింక్ చేయబడింది — ఈ ఈవెంట్ చదవడానికి మాత్రమే.",
 	"booking.hostListFailed": "వినియోగదారు జాబితాను లోడ్ చేయలేకపోయాం.",
 	"booking.loadFailed": "బుకింగ్‌లను లోడ్ చేయలేకపోయాం.",
 	"booking.saveFailed": "బుకింగ్ ఈవెంట్‌ను సేవ్ చేయలేకపోయాం.",

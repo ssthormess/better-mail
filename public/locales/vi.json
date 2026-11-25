@@ -1890,6 +1890,8 @@
 	"calendar.feeds.status.pending": "Trạng thái: chưa kiểm tra.",
 	"calendar.feeds.importNotes": "Ghi chú nhập:",
 	"calendar.feeds.unavailable": "Đăng ký nguồn cấp không khả dụng cho tài khoản này.",
+	"calendar.feeds.eventDetails": "Chi tiết sự kiện",
+	"calendar.feeds.eventReadOnly": "Được đồng bộ từ một gói đăng ký nguồn cấp — sự kiện này ở chế độ chỉ đọc.",
 	"booking.hostListFailed": "Không thể tải danh sách người dùng.",
 	"booking.loadFailed": "Không thể tải các lịch hẹn.",
 	"booking.saveFailed": "Không thể lưu sự kiện đặt lịch hẹn.",

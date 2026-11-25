@@ -1900,6 +1900,8 @@
 	"calendar.feeds.status.pending": "สถานะ: ยังไม่ได้ตรวจสอบ",
 	"calendar.feeds.importNotes": "หมายเหตุการนำเข้า:",
 	"calendar.feeds.unavailable": "การสมัครรับฟีดไม่พร้อมใช้งานสำหรับบัญชีนี้",
+	"calendar.feeds.eventDetails": "รายละเอียดกิจกรรม",
+	"calendar.feeds.eventReadOnly": "ซิงค์มาจากการสมัครฟีด — กิจกรรมนี้อ่านอย่างเดียว",
 	"booking.hostListFailed": "ไม่สามารถโหลดรายชื่อผู้ใช้ได้",
 	"booking.loadFailed": "ไม่สามารถโหลดการจองได้",
 	"booking.saveFailed": "ไม่สามารถบันทึกกิจกรรมการจองได้",

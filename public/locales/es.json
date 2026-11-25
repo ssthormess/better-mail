@@ -1912,6 +1912,8 @@
 	"calendar.feeds.status.pending": "Estado: aún no comprobado.",
 	"calendar.feeds.importNotes": "Notas de importación:",
 	"calendar.feeds.unavailable": "Las suscripciones a feeds no están disponibles para esta cuenta.",
+	"calendar.feeds.eventDetails": "Detalles del evento",
+	"calendar.feeds.eventReadOnly": "Sincronizado desde una suscripción a un feed: este evento es de solo lectura.",
 	"booking.hostListFailed": "No se pudo cargar la lista de usuarios.",
 	"booking.loadFailed": "No se pudieron cargar las reservas.",
 	"booking.saveFailed": "No se pudo guardar el evento de reserva.",

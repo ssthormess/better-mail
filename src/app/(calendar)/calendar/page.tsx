@@ -108,6 +108,8 @@ export default function CalendarPage() {
   const [location, setLocation] = useState("");
   const [description, setDescription] = useState("");
   const [editing, setEditing] = useState<CalendarEvent | null>(null);
+  // Feed-owned events open in the same dialog but read-only — the feed owns their fields.
+  const feedEvent = Boolean(editing?.subscriptionId);
   const guestReplies = (() => {
     try {
       const responses = JSON.parse(editing?.attendeeResponses || "{}") as Record<string, string>;
@@ -630,7 +632,7 @@ export default function CalendarPage() {
 
       {adding && createPortal(
         <div className={clsx("dialog-overlay fixed inset-0 z-[120] flex items-center justify-center bg-black/35 p-4 dark:bg-black/55", closingEventEditor && "pointer-events-none")} data-state={closingEventEditor ? "closed" : "open"}>
-          <DialogFrame label={editing ? t("calendar.editEvent") : t("calendar.createEvent")} onClose={() => { if (pendingAction !== "save") setClosingEventEditor(true); }} className="dialog-content max-h-[calc(100dvh-2rem)] w-full max-w-xl overflow-y-auto rounded-2xl bg-white p-5 shadow-2xl sm:p-6" data-state={closingEventEditor ? "closed" : "open"}
+          <DialogFrame label={editing ? (feedEvent ? t("calendar.feeds.eventDetails") : t("calendar.editEvent")) : t("calendar.createEvent")} onClose={() => { if (pendingAction !== "save") setClosingEventEditor(true); }} className="dialog-content max-h-[calc(100dvh-2rem)] w-full max-w-xl overflow-y-auto rounded-2xl bg-white p-5 shadow-2xl sm:p-6" data-state={closingEventEditor ? "closed" : "open"}
             onAnimationEnd={(event) => {
               if (!closingEventEditor || event.target !== event.currentTarget) return;
               setAdding(false);
@@ -638,11 +640,12 @@ export default function CalendarPage() {
               setClosingEventEditor(false);
             }}>
             <div className="flex items-start gap-3">
-              <input value={title} onChange={(event) => setTitle(event.target.value)} placeholder={t("calendar.addTitle")} aria-label={t("calendar.eventName")}
+              <input value={title} onChange={(event) => setTitle(event.target.value)} readOnly={feedEvent} placeholder={t("calendar.addTitle")} aria-label={t("calendar.eventName")}
                 className="min-w-0 flex-1 rounded-md border border-transparent bg-transparent px-2 py-1 text-2xl font-medium text-neutral-900 outline-none placeholder:text-neutral-500 hover:bg-white/60 focus:border-blue-600 focus:bg-white" />
               <button type="button" aria-label={t("calendar.closeEditor")} disabled={pendingAction === "save"} onClick={() => setClosingEventEditor(true)} className="shrink-0 rounded-full p-1 text-neutral-600 hover:bg-neutral-200 disabled:opacity-50"><X className="h-5 w-5" /></button>
             </div>
-            <div className="mt-4 space-y-2">
+            {feedEvent && <p className="mt-2 rounded-lg bg-neutral-50 px-3 py-2 text-xs text-neutral-500">{t("calendar.feeds.eventReadOnly")}</p>}
+            <fieldset disabled={feedEvent} className="mt-4 min-w-0 space-y-2">
               <div className="grid grid-cols-[24px_minmax(0,1fr)] items-start gap-3">
                 <Clock3 aria-hidden="true" className="mt-2 h-5 w-5 text-neutral-600" />
                 <div className="min-w-0" onBlur={(event) => {
@@ -671,7 +674,7 @@ export default function CalendarPage() {
               <div className="grid grid-cols-[24px_minmax(0,1fr)] items-start gap-3">
                 <Bell aria-hidden="true" className="mt-2 h-5 w-5 text-neutral-600" />
                 <div className="relative min-w-0">
-                  <Select value={reminderMinutes ?? ""} containerClassName="contents" onChange={(event) => setReminderMinutes(event.target.value === "" ? null : Number(event.target.value))} aria-label={t("calendar.reminder")}
+                  <Select value={reminderMinutes ?? ""} containerClassName="contents" disabled={feedEvent} onChange={(event) => setReminderMinutes(event.target.value === "" ? null : Number(event.target.value))} aria-label={t("calendar.reminder")}
                     className="h-9 rounded-md border border-transparent pl-2 pr-2 text-sm text-neutral-700 hover:bg-neutral-50 focus-visible:border-blue-600 focus-visible:bg-white">
                     <option value="">{t("calendar.reminder.none")}</option>
                     {REMINDER_MINUTE_OPTIONS.map((minutes) => (
@@ -684,7 +687,7 @@ export default function CalendarPage() {
                 <Repeat2 aria-hidden="true" className="mt-2 h-5 w-5 text-neutral-600" />
                 <div className="min-w-0">
                   <div className="relative">
-                    <Select value={repeat} onChange={(event) => setRepeat(event.target.value as CalendarRepeat)} aria-label={t("calendar.repeat")} containerClassName="contents"
+                    <Select value={repeat} onChange={(event) => setRepeat(event.target.value as CalendarRepeat)} aria-label={t("calendar.repeat")} containerClassName="contents" disabled={feedEvent}
                     className="h-9 rounded-md border border-transparent pl-2 pr-2 text-sm text-neutral-700 hover:bg-neutral-50 focus-visible:border-blue-600 focus-visible:bg-white">
                     <option value="none">{t("calendar.repeat.none")}</option>
                     <option value="daily">{t("calendar.repeat.daily")}</option>
@@ -727,7 +730,7 @@ export default function CalendarPage() {
                     <div className="flex flex-wrap items-center gap-2 px-2 pt-1">
                       <label className="text-xs text-neutral-600">
                         <span className="mr-1">{t("calendar.repeatWeek")}</span>
-                        <Select value={repeatWeek ?? ""} onChange={(event) => setRepeatWeek(event.target.value === "" ? null : Number(event.target.value))} aria-label={t("calendar.repeatWeek")} containerClassName="contents"
+                        <Select value={repeatWeek ?? ""} onChange={(event) => setRepeatWeek(event.target.value === "" ? null : Number(event.target.value))} aria-label={t("calendar.repeatWeek")} containerClassName="contents" disabled={feedEvent}
                           className="h-7 rounded-md border border-neutral-200 bg-white px-1 text-xs">
                           <option value={1}>{t("calendar.repeatWeek.1")}</option>
                           <option value={2}>{t("calendar.repeatWeek.2")}</option>
@@ -739,7 +742,7 @@ export default function CalendarPage() {
                       </label>
                       <label className="text-xs text-neutral-600">
                         <span className="mr-1">{t("calendar.repeatWeekday")}</span>
-                        <Select value={repeatWeekday ?? ""} onChange={(event) => setRepeatWeekday(event.target.value === "" ? null : Number(event.target.value))} aria-label={t("calendar.repeatWeekday")} containerClassName="contents"
+                        <Select value={repeatWeekday ?? ""} onChange={(event) => setRepeatWeekday(event.target.value === "" ? null : Number(event.target.value))} aria-label={t("calendar.repeatWeekday")} containerClassName="contents" disabled={feedEvent}
                           className="h-7 rounded-md border border-neutral-200 bg-white px-1 text-xs">
                           {WEEKDAY_OPTIONS.map((day) => (
                             <option key={day.value} value={day.value}>{t(`weekday.${day.value}` as TranslationKey)}</option>
@@ -788,13 +791,13 @@ export default function CalendarPage() {
               <div className="grid grid-cols-[24px_minmax(0,1fr)] gap-3 pt-6">
                 <div />
                 <div className="flex justify-between gap-2">
-                  <div>{editing && <Button variant="ghost" disabled={pendingAction !== null} onClick={() => void deleteEvent(editing.id)} className="px-2 text-red-600 hover:bg-red-50"><Trash2 className="h-4 w-4" />{t("common.delete")}</Button>}</div>
-                  <Button onClick={() => void addEvent()} disabled={!title.trim() || !parseUserDateTimeLocal(startsAt) || !parseUserDateTimeLocal(endsAt) || parseUserDateTimeLocal(endsAt)! <= parseUserDateTimeLocal(startsAt)! || (repeat === "weekdays" && repeatDays.length === 0) || (repeat === "monthly" && monthlyMode === "weekday" && (repeatWeekday == null || repeatWeek == null)) || pendingAction === "save"} className="rounded-full bg-blue-600 px-6 text-white hover:bg-blue-700">
+                  <div>{editing && !feedEvent && <Button variant="ghost" disabled={pendingAction !== null} onClick={() => void deleteEvent(editing.id)} className="px-2 text-red-600 hover:bg-red-50"><Trash2 className="h-4 w-4" />{t("common.delete")}</Button>}</div>
+                  {!feedEvent && <Button onClick={() => void addEvent()} disabled={!title.trim() || !parseUserDateTimeLocal(startsAt) || !parseUserDateTimeLocal(endsAt) || parseUserDateTimeLocal(endsAt)! <= parseUserDateTimeLocal(startsAt)! || (repeat === "weekdays" && repeatDays.length === 0) || (repeat === "monthly" && monthlyMode === "weekday" && (repeatWeekday == null || repeatWeek == null)) || pendingAction === "save"} className="rounded-full bg-blue-600 px-6 text-white hover:bg-blue-700">
                     {pendingAction === "save" ? t("common.saving") : t("settings.autoReply.save")}
-                  </Button>
+                  </Button>}
                 </div>
               </div>
-            </div>
+            </fieldset>
           </DialogFrame>
         </div>,
         document.body,

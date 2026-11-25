@@ -1890,6 +1890,8 @@
 	"calendar.feeds.status.pending": "Status: belum diperiksa.",
 	"calendar.feeds.importNotes": "Catatan impor:",
 	"calendar.feeds.unavailable": "Langganan feed tidak tersedia untuk akun ini.",
+	"calendar.feeds.eventDetails": "Detail acara",
+	"calendar.feeds.eventReadOnly": "Disinkronkan dari langganan feed — acara ini hanya-baca.",
 	"booking.hostListFailed": "Tidak dapat memuat daftar pengguna.",
 	"booking.loadFailed": "Tidak dapat memuat pemesanan.",
 	"booking.saveFailed": "Tidak dapat menyimpan acara pemesanan.",

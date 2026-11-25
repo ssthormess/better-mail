@@ -1923,6 +1923,8 @@
 	"calendar.feeds.status.pending": "Статус: ещё не проверялось.",
 	"calendar.feeds.importNotes": "Примечания к импорту:",
 	"calendar.feeds.unavailable": "Подписки на ленты недоступны для этого аккаунта.",
+	"calendar.feeds.eventDetails": "Детали события",
+	"calendar.feeds.eventReadOnly": "Синхронизировано из подписки на ленту — это событие доступно только для чтения.",
 	"booking.hostListFailed": "Не удалось загрузить список пользователей.",
 	"booking.loadFailed": "Не удалось загрузить бронирования.",
 	"booking.saveFailed": "Не удалось сохранить событие бронирования.",

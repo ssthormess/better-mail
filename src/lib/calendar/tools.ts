@@ -75,12 +75,24 @@ async function overridesForEvents(db: ReturnType<typeof getDb>, ids: string[]) {
 	return map;
 }
 
+/** Feed-owned series are read-only; throw naming them so an assistant can report which ones. */
+function assertNoFeedOwned(feedOwned: string[]) {
+	if (feedOwned.length) throw new Error(`Events synced from a feed subscription are read-only: ${feedOwned.join(", ")}`);
+}
+
 export async function runCalendarTool(context: CalendarToolContext, name: CalendarToolName, rawInput: unknown): Promise<unknown> {
 	if (!context.user.calendarEnabled) throw new Error("Calendar is disabled for this account");
 	const input = calendarToolSchemas[name].parse(rawInput) as Record<string, unknown>;
 	const db = getDb(context.env);
 	// Editing or deleting events is only proposed by an assistant; the user approves it in the app.
 	if (CONFIRMED_CALENDAR_TOOLS.has(name) && !context.confirmed) {
+		// A feed event can never be approved, so refuse the proposal instead of handing out a
+		// review that can only fail — feed state is rechecked again at confirmation time.
+		const targets = name === "update_events" ? (input.updates as { eventId: string }[]).map((item) => item.eventId) : input.eventIds as string[];
+		const feedOwned = (await db.select({ id: calendarEvents.id, subscriptionId: calendarEvents.subscriptionId }).from(calendarEvents)
+			.where(and(eq(calendarEvents.userId, context.user.id), inArray(calendarEvents.id, targets))))
+			.filter((row) => row.subscriptionId).map((row) => row.id);
+		assertNoFeedOwned(feedOwned);
 		const token = await createCalendarConfirmation(context.env, context.user.id, name, rawInput);
 		const count = ((input.updates ?? input.eventIds) as unknown[]).length;
 		return {
@@ -146,6 +158,9 @@ export async function runCalendarTool(context: CalendarToolContext, name: Calend
 		if (new Set(ids).size !== ids.length || ids.some((value) => parseCalendarOccurrenceId(value))) throw new Error("Use unique series IDs for updates");
 		const existing = await Promise.all(ids.map(async (eventId) => (await db.select().from(calendarEvents).where(and(eq(calendarEvents.id, eventId), eq(calendarEvents.userId, context.user.id))).limit(1))[0]));
 		if (existing.some((row) => !row)) throw new Error("Event not found");
+		// Check the whole batch before any write — approval rechecks land here too, so a feed
+		// that subscribed the series between proposal and confirmation is still refused.
+		assertNoFeedOwned(existing.filter((row) => row?.subscriptionId).map((row) => row!.id));
 		for (const [index, item] of updates.entries()) {
 			const row = existing[index]!;
 			if ((item.endsAt ? new Date(item.endsAt) : row.endsAt) <= (item.startsAt ? new Date(item.startsAt) : row.startsAt)) throw new Error("Event end must be after its start");
@@ -172,8 +187,9 @@ export async function runCalendarTool(context: CalendarToolContext, name: Calend
 	}
 	const ids = input.eventIds as string[];
 	if (new Set(ids).size !== ids.length || ids.some((value) => parseCalendarOccurrenceId(value))) throw new Error("Use unique series IDs for deletion");
-	const existing = await Promise.all(ids.map(async (eventId) => (await db.select({ id: calendarEvents.id }).from(calendarEvents).where(and(eq(calendarEvents.id, eventId), eq(calendarEvents.userId, context.user.id))).limit(1))[0]));
+	const existing = await Promise.all(ids.map(async (eventId) => (await db.select({ id: calendarEvents.id, subscriptionId: calendarEvents.subscriptionId }).from(calendarEvents).where(and(eq(calendarEvents.id, eventId), eq(calendarEvents.userId, context.user.id))).limit(1))[0]));
 	if (existing.some((row) => !row)) throw new Error("Event not found");
+	assertNoFeedOwned(existing.filter((row) => row?.subscriptionId).map((row) => row!.id));
 	for (const eventId of ids) await db.delete(calendarEvents).where(and(eq(calendarEvents.id, eventId), eq(calendarEvents.userId, context.user.id)));
 	return { eventIds: ids, status: "deleted" };
 }

@@ -1899,6 +1899,8 @@
 	"calendar.feeds.status.pending": "حیثیت: ابھی جانچا نہیں گیا۔",
 	"calendar.feeds.importNotes": "درآمد کے نوٹ:",
 	"calendar.feeds.unavailable": "اس اکاؤنٹ کے لیے فیڈ سبسکرپشنز دستیاب نہیں ہیں۔",
+	"calendar.feeds.eventDetails": "تقریب کی تفصیلات",
+	"calendar.feeds.eventReadOnly": "فیڈ سبسکرپشن سے مطابقت پذیر — یہ تقریب صرف پڑھنے کے لیے ہے۔",
 	"booking.hostListFailed": "صارفین کی فہرست لوڈ نہیں ہو سکی۔",
 	"booking.loadFailed": "بکنگز لوڈ نہیں ہو سکیں۔",
 	"booking.saveFailed": "بکنگ تقریب محفوظ نہیں ہو سکی۔",

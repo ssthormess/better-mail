@@ -1899,6 +1899,8 @@
 	"calendar.feeds.status.pending": "স্থিতি: এখনও পরীক্ষা হয়নি।",
 	"calendar.feeds.importNotes": "ইমপোর্ট নোট:",
 	"calendar.feeds.unavailable": "এই অ্যাকাউন্টে ফিড সাবস্ক্রিপশন উপলব্ধ নয়।",
+	"calendar.feeds.eventDetails": "ইভেন্টের বিবরণ",
+	"calendar.feeds.eventReadOnly": "একটি ফিড সাবস্ক্রিপশন থেকে সিঙ্ক হয়েছে — এই ইভেন্টটি শুধুমাত্র পঠনযোগ্য।",
 	"booking.hostListFailed": "ব্যবহারকারীর তালিকা লোড করা যায়নি।",
 	"booking.loadFailed": "বুকিং লোড করা যায়নি।",
 	"booking.saveFailed": "বুকিং ইভেন্ট সংরক্ষণ করা যায়নি।",

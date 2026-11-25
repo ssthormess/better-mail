@@ -1901,6 +1901,8 @@
 	"calendar.feeds.status.pending": "Status: noch nicht geprüft.",
 	"calendar.feeds.importNotes": "Import-Hinweise:",
 	"calendar.feeds.unavailable": "Feed-Abonnements sind für dieses Konto nicht verfügbar.",
+	"calendar.feeds.eventDetails": "Termindetails",
+	"calendar.feeds.eventReadOnly": "Aus einem Feed-Abonnement synchronisiert — dieser Termin ist schreibgeschützt.",
 	"booking.hostListFailed": "Die Benutzerliste konnte nicht geladen werden.",
 	"booking.loadFailed": "Die Buchungen konnten nicht geladen werden.",
 	"booking.saveFailed": "Der Buchungstermin konnte nicht gespeichert werden.",

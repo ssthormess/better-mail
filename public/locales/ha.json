@@ -1901,6 +1901,8 @@
 	"calendar.feeds.status.pending": "Matsayi: ba a duba tukuna.",
 	"calendar.feeds.importNotes": "Bayanan shigo:",
 	"calendar.feeds.unavailable": "Babu rajistar feed don wannan asusun.",
+	"calendar.feeds.eventDetails": "Cikakkun bayanan taron",
+	"calendar.feeds.eventReadOnly": "An daidaita shi daga rajistar feed — wannan taron karanta kawai ne.",
 	"booking.hostListFailed": "Ba a iya loda jerin masu amfani ba.",
 	"booking.loadFailed": "Ba a iya loda ajiyar wuri ba.",
 	"booking.saveFailed": "Ba a iya adana taron ajiyar wuri ba.",
