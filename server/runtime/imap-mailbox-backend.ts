@@ -3,12 +3,28 @@ import type { SQL } from "drizzle-orm";
 import type { AppDatabase } from "@/db";
 import { folders, messages } from "@/db/schema";
 import type { ApiAuthResult } from "@/lib/api/key-auth-types";
-import { draftsVisibleTo } from "@/lib/email/draft-access";
+import { draftsVisibleTo, logMessageHidden, privateDraftForStatus } from "@/lib/email/draft-access";
 import { newId } from "@/lib/ids";
-import type { SystemRole } from "@/lib/jmap/types";
+import { getImportMessageUserId } from "@/lib/import/destination";
+import type { ImportDestination, ImportSystemSection } from "@/lib/import/destination-types";
+import { describeImportError, importMessageToMailbox } from "@/lib/import/service";
+import { targetFromMailboxIds } from "@/lib/jmap/emails";
+import { encodeMailboxRef } from "@/lib/jmap/ids";
+import type { MailboxRef, SystemRole } from "@/lib/jmap/types";
 import { getMailboxAccessLevel, listAccessibleMailboxes } from "@/lib/mailboxes/access";
 import { planImapMailboxEntries } from "./imap-mailboxes";
-import type { ImapFolderTarget, ImapFolderWriteResult, ImapMailboxBackend, ImapMailboxCounts, ImapMailboxEntry, ImapMessageEntry, ImapSelectedMailbox } from "./imap-protocol";
+import type {
+	ImapAppendRequest,
+	ImapAppendResult,
+	ImapFolderTarget,
+	ImapFolderWriteResult,
+	ImapMailboxBackend,
+	ImapMailboxCounts,
+	ImapMailboxEntry,
+	ImapMessageEntry,
+	ImapMoveOutcome,
+	ImapSelectedMailbox,
+} from "./imap-protocol";
 
 /** Statuses each role folder counts, mirroring the JMAP mailbox counts (sent folds in queued and failed). */
 const ROLE_STATUSES: Record<SystemRole, string[]> = {
@@ -18,6 +34,16 @@ const ROLE_STATUSES: Record<SystemRole, string[]> = {
 	archive: ["archived"],
 	junk: ["spam"],
 	trash: ["trash"],
+};
+
+/** Role folder → the import section REST and JMAP import place mail with, so all three agree on a row's columns. */
+const ROLE_SECTIONS: Record<SystemRole, ImportSystemSection> = {
+	inbox: "inbox",
+	sent: "sent",
+	drafts: "drafts",
+	archive: "archived",
+	junk: "spam",
+	trash: "trash",
 };
 
 /** Every IMAP-visible name for the authenticated account, parents included. */
@@ -82,6 +108,7 @@ async function mailboxMessages(db: AppDatabase, auth: ApiAuthResult, entry: Imap
 	if (!conditions) return [];
 	const rows = await db
 		.select({
+			id: messages.id,
 			read: messages.read,
 			starred: messages.starred,
 			trashedAt: messages.trashedAt,
@@ -92,6 +119,7 @@ async function mailboxMessages(db: AppDatabase, auth: ApiAuthResult, entry: Imap
 		.where(and(...conditions))
 		.orderBy(asc(messages.createdAt), asc(messages.id));
 	return rows.map((row, index) => ({
+		id: row.id,
 		uid: index + 1,
 		read: row.read,
 		starred: row.starred,
@@ -130,7 +158,7 @@ async function folderRowExists(db: AppDatabase, target: ImapFolderTarget): Promi
 }
 
 /** The database side of the protocol. The catalogue is re-read per call so folder writes show up immediately. */
-export function imapMailboxBackend(db: AppDatabase, auth: ApiAuthResult): ImapMailboxBackend {
+export function imapMailboxBackend(db: AppDatabase, auth: ApiAuthResult, env: CloudflareEnv): ImapMailboxBackend {
 	// No catalogue cache: LIST, SELECT and FETCH all have to see the folder table as it is now, so a
 	// folder this session (or another) just created is in the very next LIST reply.
 	const list = () => listImapMailboxEntries(db, auth);
@@ -144,7 +172,96 @@ export function imapMailboxBackend(db: AppDatabase, auth: ApiAuthResult): ImapMa
 		createFolder: (target) => createFolderRow(db, auth, target),
 		deleteFolder: (target) => deleteFolderRow(db, auth, target),
 		renameFolder: (target, name) => renameFolderRow(db, auth, target, name),
+		append: (request) => appendMessage(env, db, auth, request),
+		move: (source, messageIds, destination) => moveMessages(db, auth, source, messageIds, destination),
 	};
+}
+
+/**
+ * APPEND. The message is written by `importMessageToMailbox`, the seam REST and JMAP import use: it parses
+ * the MIME, dedupes on the Message-ID, fills the envelope/threading columns, stores the raw bytes and the
+ * attachments, and lets the schema triggers keep FTS and the change journal current.
+ *
+ * The destination decides the placement (`getImportMessagePlacement`), which is what makes appending to
+ * Sent write direction='outbound'/status='sent' and appending to Drafts write a private draft, instead of
+ * a folder-shaped guess. `getImportMessageUserId` follows: sent and draft mail belongs to the appender.
+ */
+async function appendMessage(env: CloudflareEnv, db: AppDatabase, auth: ApiAuthResult, request: ImapAppendRequest): Promise<ImapAppendResult> {
+	const access = await folderWriteAccess(db, auth, request.entry.mailboxId);
+	if (!access?.canManage) return "denied";
+	const destination: ImportDestination = request.entry.folderId
+		? { type: "folder", folderId: request.entry.folderId }
+		: { type: "system", section: ROLE_SECTIONS[request.entry.role ?? "inbox"] };
+	// A filename is what the synthetic provider id is built from when a message has no Message-ID. An APPEND
+	// has no filename, and a fixed one would make the seam's `import:<name>:<bytes>` key collide between two
+	// different messages of the same size, so each append names itself: such a message then dedupes on its
+	// Message-ID only, which is all IMAP itself dedupes on.
+	const filename = `imap-append-${newId("msg")}.eml`;
+	try {
+		const imported = await importMessageToMailbox(env, {
+			userId: getImportMessageUserId(destination, auth.userId, access.mailbox.userId),
+			mailboxId: request.entry.mailboxId,
+			destination,
+			filename,
+			raw: request.raw,
+			// Not `?? placement.direction`: APPEND states the flags, so a message without \\Seen is unseen.
+			read: request.flags.includes("\\Seen"),
+			starred: request.flags.includes("\\Flagged"),
+			createdAt: request.internalDate ?? undefined,
+		});
+		return imported ? "ok" : "duplicate";
+	} catch (error) {
+		// A MIME that will not parse or an attachment the size limits reject leaves no row: the seam deletes what
+		// it stored before throwing, so there is nothing to roll back here.
+		console.error("IMAP APPEND failed", filename, describeImportError(error));
+		return "invalid";
+	}
+}
+
+/**
+ * MOVE. The membership rule is JMAP's: `targetFromMailboxIds` is the same function `Email/set` moves with
+ * (one mailbox per message, no received mail into Sent, a folder move that leaves a draft private), applied
+ * here to a `MailboxRef` built from the IMAP destination. The follow-up is `Email/set`'s too: one update of
+ * `status`/`folder_id`, and a `hidden` journal entry when the move turns a visible message into a draft.
+ */
+async function moveMessages(
+	db: AppDatabase,
+	auth: ApiAuthResult,
+	source: ImapMailboxEntry,
+	messageIds: string[],
+	destination: ImapMailboxEntry,
+): Promise<ImapMoveOutcome> {
+	// `messages.mailbox_id` is in every reader's scope (counts, folders, the change journal), and JMAP refuses
+	// the same move, so an IMAP move between two of the account's mailboxes is refused rather than half-written.
+	if (destination.mailboxId !== source.mailboxId) return { result: "cross-mailbox" };
+	const access = await folderWriteAccess(db, auth, source.mailboxId);
+	if (!access?.canManage) return { result: "denied" };
+	const ref: MailboxRef = destination.folderId
+		? { kind: "folder", mailboxId: destination.mailboxId, folderId: destination.folderId }
+		: { kind: "role", mailboxId: destination.mailboxId, role: destination.role ?? "inbox" };
+	const rows = await db
+		.select()
+		.from(messages)
+		.where(and(inArray(messages.id, messageIds), eq(messages.mailboxId, source.mailboxId)));
+	if (rows.length !== messageIds.length) return { result: "missing" };
+	const accessible = new Set([source.mailboxId]);
+	const changed: string[] = [];
+	for (const row of rows) {
+		const target = targetFromMailboxIds(row, { mailboxIds: { [encodeMailboxRef(ref)]: true } }, accessible);
+		if (!target) return { result: "missing" };
+		if ("error" in target) return { result: "invalid", description: String(target.error.description ?? "Mailboxes cannot hold this message") };
+		const status = target.status ?? row.status;
+		const folderId = target.folderId !== undefined ? target.folderId : row.folderId;
+		// Same mailbox and same folder: IMAP allows the command, and nothing about the row changes.
+		if (status === row.status && folderId === row.folderId) continue;
+		await db
+			.update(messages)
+			.set({ status, folderId, ...privateDraftForStatus(status) })
+			.where(eq(messages.id, row.id));
+		if (status === "draft" && !row.privateDraft) await logMessageHidden(db, row);
+		changed.push(row.id);
+	}
+	return { result: "ok", changed };
 }
 
 /** CREATE. `userId` is the mailbox owner, the same column REST and JMAP write. */

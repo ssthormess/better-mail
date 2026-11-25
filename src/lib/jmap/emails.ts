@@ -204,8 +204,13 @@ function unescapeJsonPointer(token: string): string {
 	return token.replace(/~1/g, "/").replace(/~0/g, "~");
 }
 
-/** Where a patched `mailboxIds` puts the message: exactly one JMAP mailbox is supported. */
-function targetFromMailboxIds(row: MessageRow, patch: Record<string, unknown>, accessible: Set<string>): { status?: string; folderId?: string | null } | { error: Record<string, unknown> } | null {
+/**
+ * The status/folder a `mailboxIds` patch means for a message, which is also the rule every other
+ * protocol's move has to follow: one mailbox per message, no cross-mailbox moves, no received mail
+ * filed into Sent, and a folder move that keeps a draft private. Exported so IMAP MOVE reuses it
+ * instead of restating (and drifting from) the membership rules.
+ */
+export function targetFromMailboxIds(row: MessageRow, patch: Record<string, unknown>, accessible: Set<string>): { status?: string; folderId?: string | null } | { error: Record<string, unknown> } | null {
 	let ids: string[] | null = null;
 	if (patch.mailboxIds && typeof patch.mailboxIds === "object") {
 		ids = Object.entries(patch.mailboxIds as Record<string, boolean>).filter(([, on]) => on).map(([id]) => id);

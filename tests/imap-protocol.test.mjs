@@ -9,10 +9,10 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const outDir = mkdtempSync(join(root, "tests", ".tmp-imap-protocol-"));
 after(() => rmSync(outDir, { recursive: true, force: true }));
 await build({
-	stdin: { contents: 'export { parseImapCommand, dispatchImapCommand, loginResult, quoteImapLiteral, encodeModifiedUtf7, decodeModifiedUtf7 } from "./server/runtime/imap-protocol.ts";', resolveDir: root, sourcefile: "imap-entry.ts" },
+	stdin: { contents: 'export { parseImapCommand, dispatchImapCommand, loginResult, quoteImapLiteral, encodeModifiedUtf7, decodeModifiedUtf7, parseImapAppendArguments, parseImapDateTime } from "./server/runtime/imap-protocol.ts";', resolveDir: root, sourcefile: "imap-entry.ts" },
 	outfile: join(outDir, "entry.mjs"), bundle: true, platform: "node", format: "esm", target: "node22", tsconfig: join(root, "tsconfig.json"), logLevel: "silent",
 });
-const { parseImapCommand, dispatchImapCommand, loginResult, quoteImapLiteral, encodeModifiedUtf7, decodeModifiedUtf7 } = await import(pathToFileURL(join(outDir, "entry.mjs")).href);
+const { parseImapCommand, dispatchImapCommand, loginResult, quoteImapLiteral, encodeModifiedUtf7, decodeModifiedUtf7, parseImapAppendArguments, parseImapDateTime } = await import(pathToFileURL(join(outDir, "entry.mjs")).href);
 
 test("parses tagged commands and quoted arguments with escaped quotes", () => {
 	assert.deepEqual(parseImapCommand('A1 LOGIN "alice@example.test" "p\\\"ass"'), { tag: "A1", verb: "LOGIN", args: ["alice@example.test", 'p"ass'] });
@@ -80,4 +80,36 @@ test("modified UTF-7 refuses sequences it cannot decode instead of inventing cha
 	assert.equal(decodeModifiedUtf7("&A!A-"), null);
 	assert.equal(decodeModifiedUtf7("&AAA-"), null);
 	assert.equal(decodeModifiedUtf7("&/w-"), null);
+});
+
+test("APPEND arguments split into a mailbox, a flag list and an internal date", () => {
+	assert.deepEqual(parseImapAppendArguments(["INBOX"]), { name: "INBOX", flags: [], internalDate: null });
+	// The command line is split on spaces, so a parenthesized flag list arrives as several tokens.
+	assert.deepEqual(parseImapAppendArguments(["INBOX", "(\\Seen", "\\Flagged)"]).flags, ["\\Seen", "\\Flagged"]);
+	assert.deepEqual(parseImapAppendArguments(["INBOX", "()"]).flags, []);
+	assert.deepEqual(parseImapAppendArguments(["INBOX", "\\Seen"]), { error: "date-time is malformed" });
+	assert.deepEqual(parseImapAppendArguments(["INBOX", "(\\Seen"]), { error: "flag list is not closed" });
+	assert.deepEqual(parseImapAppendArguments(["INBOX", "((\\Seen))"]), { error: "flag list is malformed" });
+	assert.deepEqual(parseImapAppendArguments([]), { error: "needs a mailbox name" });
+	// A quoted date-time is one token; a client that leaves it unquoted spreads it over three and it is rejoined.
+	const dated = parseImapAppendArguments(["INBOX", "(\\Seen)", "22-Nov-2026", "18:00:00", "+0000"]);
+	assert.equal(dated.internalDate.toISOString(), "2026-11-22T18:00:00.000Z");
+	// The quoted form goes through the command-line tokenizer first, which is how a client sends a name with
+	// spaces and a date-time in one argument.
+	const quoted = parseImapCommand('A APPEND "My Folder" (\\Seen) "22-Nov-2026 18:00:00 +0000"');
+	const parsedQuoted = parseImapAppendArguments(quoted.args);
+	assert.equal(parsedQuoted.name, "My Folder");
+	assert.deepEqual(parsedQuoted.flags, ["\\Seen"]);
+	assert.equal(parsedQuoted.internalDate.toISOString(), "2026-11-22T18:00:00.000Z");
+});
+
+test("RFC 3501 date-times are read with their zone offset", () => {
+	assert.equal(parseImapDateTime("22-Nov-2026 18:00:00 +0000").toISOString(), "2026-11-22T18:00:00.000Z");
+	assert.equal(parseImapDateTime("22-Nov-2026 18:00:00 +0200").toISOString(), "2026-11-22T16:00:00.000Z");
+	assert.equal(parseImapDateTime("22-Nov-2026 18:00:00 -0500").toISOString(), "2026-11-22T23:00:00.000Z");
+	assert.equal(parseImapDateTime("  1-jan-2026 00:00:00 +0000 ").toISOString(), "2026-01-01T00:00:00.000Z");
+	// A date that does not exist, an unknown month, a bad clock and free text are all refused rather than rolled over.
+	for (const value of ["31-Feb-2026 18:00:00 +0000", "22-Xyz-2026 18:00:00 +0000", "22-Nov-2026 24:00:00 +0000", "22-Nov-2026 18:60:00 +0000", "soon", "22 Nov 2026 18:00:00 +0000"]) {
+		assert.equal(parseImapDateTime(value), null, value);
+	}
 });

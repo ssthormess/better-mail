@@ -30,7 +30,9 @@ export function startImapListener(env: CloudflareEnv, options: ImapOptions) {
 		let buffer = Buffer.alloc(0);
 		let pendingPrefix: string | null = null;
 		let pendingLiteralLength = 0;
-		let pendingLiteralNonSynchronizing = false;
+		// A binary literal for APPEND: the raw bytes are not run through the quoted-string tokenizer, so they
+		// reach the import seam exactly as the client sent them (attachments included).
+		let pendingAppendLiteral: { prefix: string; literal: Buffer } | null = null;
 		const session: ImapSession = asImapSession("not-authenticated");
 		let auth: ApiAuthResult | null = null;
 		// One backend per login. It reads the catalogue fresh on every call, so a folder written
@@ -38,17 +40,19 @@ export function startImapListener(env: CloudflareEnv, options: ImapOptions) {
 		let backend: ImapMailboxBackend | null = null;
 
 		let commandQueue = Promise.resolve();
-		const enqueueLine = (line: string) => {
-			commandQueue = commandQueue.then(() => handleLine(line)).catch((error: unknown) => {
+		const enqueueLine = (line: string, literal: Buffer | null = null) => {
+			commandQueue = commandQueue.then(() => handleLine(line, literal)).catch((error: unknown) => {
 				console.error("IMAP command failed", error);
 				socket.write("* BYE Temporary server error\r\n");
 				socket.end();
 			});
 		};
-		const handleLine = async (line: string) => {
+		const handleLine = async (line: string, literal: Buffer | null) => {
 			const command = parseImapCommand(line);
 			if (!command) { socket.write("* BAD Invalid command syntax\r\n"); return; }
-			const mailboxBackend = auth ? (backend ??= imapMailboxBackend(getDb(env), auth)) : undefined;
+			// APPEND's literal is the message itself, so it travels beside the arguments rather than as a token.
+			if (literal) command.literal = literal.buffer.slice(literal.byteOffset, literal.byteOffset + literal.byteLength) as ArrayBuffer;
+			const mailboxBackend = auth ? (backend ??= imapMailboxBackend(getDb(env), auth, env)) : undefined;
 			const action = await dispatchImapCommand(session, command, mailboxBackend);
 			if (action.login) {
 				if (!(await isImapEnabled(env))) { socket.write(`${command.tag} NO IMAP disabled\r\n`); return; }
@@ -73,11 +77,34 @@ export function startImapListener(env: CloudflareEnv, options: ImapOptions) {
 
 		const consume = () => {
 			while (!socket.destroyed) {
+				if (pendingAppendLiteral !== null) {
+					// The literal is followed by the CRLF that ends the command line (RFC 3501 §4.3).
+					const end = buffer.indexOf("\r\n");
+					if (end < 0) {
+						if (buffer.length > MAX_LINE_BYTES) { socket.write("* BAD Command line too long\r\n"); socket.destroy(); }
+						return;
+					}
+					const tail = buffer.subarray(0, end).toString("utf8");
+					buffer = buffer.subarray(end + 2);
+					const { prefix, literal } = pendingAppendLiteral;
+					pendingAppendLiteral = null;
+					enqueueLine(prefix + tail, literal);
+					continue;
+				}
 				if (pendingPrefix !== null) {
 					if (buffer.length < pendingLiteralLength) return;
-					const literal = buffer.subarray(0, pendingLiteralLength).toString("utf8");
-					buffer = Buffer.concat([Buffer.from(pendingPrefix + quoteImapLiteral(literal)), buffer.subarray(pendingLiteralLength)]);
+					const literal = buffer.subarray(0, pendingLiteralLength);
+					const rest = buffer.subarray(pendingLiteralLength);
+					const prefix = pendingPrefix;
 					pendingPrefix = null;
+					// APPEND carries a message, not a name: keep the bytes and wait for the line terminator.
+					if (/^\S+\s+APPEND(\s|$)/i.test(prefix)) {
+						pendingAppendLiteral = { prefix, literal: Buffer.from(literal) };
+						buffer = rest;
+						continue;
+					}
+					// Every other literal is a mailbox name or a credential, which the tokenizer can read as a quoted string.
+					buffer = Buffer.concat([Buffer.from(prefix + quoteImapLiteral(literal.toString("utf8"))), rest]);
 					continue;
 				}
 				const end = buffer.indexOf("\r\n");
@@ -91,9 +118,9 @@ export function startImapListener(env: CloudflareEnv, options: ImapOptions) {
 				if (literal) {
 					pendingLiteralLength = Number(literal[1]);
 					if (!Number.isSafeInteger(pendingLiteralLength) || pendingLiteralLength > MAX_LITERAL_BYTES) { socket.write("* BAD Literal too large\r\n"); socket.destroy(); return; }
-					pendingLiteralNonSynchronizing = literal[0].endsWith("+");
 					pendingPrefix = line.slice(0, literal.index);
-					if (!pendingLiteralNonSynchronizing) socket.write("+ Ready for literal data\r\n");
+					// `{n+}` (LITERAL+) means the client sends the bytes without waiting for the continuation.
+					if (!literal[0].endsWith("+")) socket.write("+ Ready for literal data\r\n");
 					continue;
 				}
 				enqueueLine(line);

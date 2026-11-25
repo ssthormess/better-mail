@@ -77,7 +77,7 @@ const countsByRef = new Map([
  * Rows as the backend hands them over: one per flag column, so the mapping is pinned to
  * `read`/`starred`/`trashed_at`/`status='draft'`/`direction` rather than to a flag string.
  */
-const message = (uid, overrides = {}) => ({ uid, read: false, starred: false, trashed: false, draft: false, outbound: false, ...overrides });
+const message = (uid, overrides = {}) => ({ id: `msg${uid}`, uid, read: false, starred: false, trashed: false, draft: false, outbound: false, ...overrides });
 const messagesByRef = new Map([
 	["mbx1~inbox", [message(1), message(2, { read: true, starred: true }), message(3, { trashed: true })]],
 	["mbx1~drafts", [message(1, { draft: true, outbound: true })]],
@@ -201,7 +201,7 @@ test("SELECT and FETCH advertise only the flags the bridge can report", async ()
 	const advertised = advertisement.slice(advertisement.indexOf("(") + 1, -1).split(" ");
 	const produced = new Set();
 	for (const read of [false, true]) for (const starred of [false, true]) for (const trashed of [false, true]) for (const draft of [false, true]) for (const outbound of [false, true]) {
-		for (const flag of imapMessageFlags({ read, starred, trashed, draft, outbound })) produced.add(flag);
+		for (const flag of imapMessageFlags({ id: "msg1", read, starred, trashed, draft, outbound })) produced.add(flag);
 	}
 	assert.deepEqual([...produced].sort(), [...advertised].sort());
 });
@@ -566,4 +566,149 @@ test("folder writes stay behind authentication", async () => {
 		assert.equal((await dispatchImapCommand("not-authenticated", parseImapCommand(line), client)).response, "A BAD Authenticate first\r\n", line);
 	}
 	assert.deepEqual(state.writes, []);
+});
+
+/**
+ * A backend that records what APPEND and MOVE asked of it, so the protocol's own decisions (name
+ * resolution, flags, internal date, which UIDs to expunge) can be checked without any storage.
+ */
+function messageWriteBackend({ append = "ok", move = null } = {}) {
+	const calls = { append: [], move: [] };
+	const client = {
+		list: async () => entries,
+		counts: async (entry) => countsByRef.get(entry.ref) ?? { messages: 0, unseen: 0 },
+		messages: async (selected) => messagesByRef.get(selected.ref) ?? [],
+		append: async (request) => {
+			calls.append.push(request);
+			return append;
+		},
+		move: async (source, ids, destination) => {
+			calls.move.push({ source, ids, destination });
+			if (move && move.result !== "ok") return move;
+			return { result: "ok", changed: move?.changed ?? ids };
+		},
+	};
+	return { client, calls };
+}
+
+/** A command plus the literal the socket layer reads after a `{n}` marker: the bytes never go through the tokenizer. */
+const literalCommand = (line, text) => {
+	const parsed = parseImapCommand(line);
+	const bytes = Buffer.from(text, "utf8");
+	return { ...parsed, literal: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) };
+};
+const LITERAL = "From: kevin@example.com\r\nSubject: Offer\r\n\r\nHello\r\n";
+
+const runLiteral = (line, text, client, state = session) => dispatchImapCommand(state, literalCommand(line, text), client);
+
+test("APPEND resolves its destination, flags and internal date, then hands the bytes over", async () => {
+	const { client, calls } = messageWriteBackend();
+	assert.equal((await runLiteral("A APPEND INBOX (\\Seen \\Flagged)", LITERAL, client)).response, "A OK APPEND completed\r\n");
+	assert.equal(calls.append.length, 1);
+	assert.equal(calls.append[0].entry.ref, "mbx1~inbox");
+	assert.deepEqual(calls.append[0].flags, ["\\Seen", "\\Flagged"]);
+	assert.equal(calls.append[0].internalDate, null);
+	// The literal arrives as the message bytes, not as a token that was round-tripped through text.
+	assert.equal(new TextDecoder().decode(calls.append[0].raw), LITERAL);
+	assert.equal(calls.append[0].raw.byteLength, Buffer.byteLength(LITERAL));
+
+	// A namespaced custom folder and a role mailbox resolve through the same catalogue SELECT uses.
+	await runLiteral('B APPEND "sales@example.test/Leads"', LITERAL, client);
+	assert.equal(calls.append[1].entry.ref, "mbx2~f~fld3");
+	assert.equal(calls.append[1].entry.mailboxId, "mbx2");
+	await runLiteral("C APPEND Drafts (\\Draft)", LITERAL, client);
+	assert.equal(calls.append[2].entry.ref, "mbx1~drafts");
+	assert.deepEqual(calls.append[2].flags, ["\\Draft"]);
+	// An empty flag list and a date-time are both legal.
+	await runLiteral('D APPEND INBOX () "22-Nov-2026 18:00:00 +0000"', LITERAL, client);
+	assert.deepEqual(calls.append[3].flags, []);
+	assert.equal(calls.append[3].internalDate.toISOString(), "2026-11-22T18:00:00.000Z");
+	// Keywords and \Recent have no column: they are dropped rather than reported as flags nothing holds.
+	await runLiteral("E APPEND INBOX (\\Recent $label1)", LITERAL, client);
+	assert.deepEqual(calls.append[4].flags, []);
+});
+
+test("APPEND refuses what it cannot store, before the backend is asked", async () => {
+	const { client, calls } = messageWriteBackend();
+	// RFC 3501 §6.3.11 names TRYCREATE for a mailbox that does not exist.
+	assert.equal((await runLiteral("A APPEND Nope", LITERAL, client)).response, "A NO [TRYCREATE] No such mailbox\r\n");
+	// \Draft and \Deleted are the Drafts and Trash mailboxes, so a flag that contradicts the destination is refused.
+	assert.equal((await runLiteral("B APPEND INBOX (\\Draft)", LITERAL, client)).response, "B NO Drafts mail is only appendable to the Drafts mailbox\r\n");
+	assert.equal((await runLiteral("C APPEND Sent (\\Deleted)", LITERAL, client)).response, "C NO Deleted mail is only appendable to the Trash mailbox\r\n");
+	assert.equal((await runLiteral("D APPEND Receipts (\\Draft)", LITERAL, client)).response, "D NO Drafts mail is only appendable to the Drafts mailbox\r\n");
+	// A malformed command line is a protocol error, so the client knows to fix it rather than retry the message.
+	assert.equal((await runOn(client, "E APPEND INBOX")).response, "E BAD APPEND needs a message literal\r\n");
+	assert.equal((await dispatchImapCommand(session, literalCommand("E2 APPEND INBOX", ""), client)).response, "E2 BAD APPEND needs a message literal\r\n");
+	assert.equal((await runLiteral("F APPEND INBOX (\\Seen", LITERAL, client)).response, "F BAD APPEND flag list is not closed\r\n");
+	assert.equal((await runLiteral("G APPEND INBOX (\\Seen) tomorrow", LITERAL, client)).response, "G BAD APPEND date-time is malformed\r\n");
+	assert.equal((await runLiteral("H APPEND \u0026", LITERAL, client)).response, "H BAD APPEND mailbox name must be modified UTF-7\r\n");
+	// The protocol cap is the same one JMAP uploads use, so APPEND cannot store what no other path would accept.
+	const oversize = { ...literalCommand("I APPEND INBOX", LITERAL), literal: new ArrayBuffer(11 * 1024 * 1024) };
+	assert.match((await dispatchImapCommand(session, oversize, client)).response, /^I NO Message is larger than \d+ bytes\r\n$/);
+	assert.deepEqual(calls.append, []);
+});
+
+test("APPEND reports what the storage seam did with the message", async () => {
+	const denied = messageWriteBackend({ append: "denied" }).client;
+	assert.equal((await runLiteral("A APPEND INBOX", LITERAL, denied)).response, "A NO APPEND is not allowed on this mailbox\r\n");
+	// A duplicate Message-ID is stored already, which is what OK means: there is nothing for the client to fix.
+	const duplicate = messageWriteBackend({ append: "duplicate" }).client;
+	assert.equal((await runLiteral("B APPEND INBOX", LITERAL, duplicate)).response, "B OK APPEND completed\r\n");
+	const rejected = messageWriteBackend({ append: "invalid" }).client;
+	assert.equal((await runLiteral("C APPEND INBOX", LITERAL, rejected)).response, "C NO Message could not be stored\r\n");
+});
+
+test("MOVE re-files the sequence set and expunges what left the mailbox, newest first", async () => {
+	const { client, calls } = messageWriteBackend();
+	const inbox = await runOn(client, "A SELECT INBOX");
+	assert.equal(inbox.selected.ref, "mbx1~inbox");
+	// EXPUNGE responses are in descending order so the remaining sequence numbers stay valid (RFC 3501 §7.4.1).
+	assert.equal((await runOn(client, "B MOVE 1:2 Receipts", inbox)).response, "* 2 EXPUNGE\r\n* 1 EXPUNGE\r\nB OK MOVE completed\r\n");
+	assert.deepEqual(calls.move[0].ids, ["msg1", "msg2"]);
+	assert.equal(calls.move[0].source.ref, "mbx1~inbox");
+	assert.equal(calls.move[0].destination.ref, "mbx1~f~fld1");
+	// A UID is a position here, so UID MOVE takes the same numbers.
+	assert.equal((await runOn(client, "C UID MOVE 3 Trash", inbox)).response, "* 3 EXPUNGE\r\nC OK UID MOVE completed\r\n");
+	assert.deepEqual(calls.move[1].ids, ["msg3"]);
+	// Only the messages the backend says it changed are expunged: a move level with a message already there
+	// changes nothing, so the client is not told to drop a row that is still listed.
+	const partial = messageWriteBackend({ move: { result: "ok", changed: ["msg1"] } });
+	assert.equal((await runOn(partial.client, "D MOVE 1:3 Receipts", inbox)).response, "* 1 EXPUNGE\r\nD OK MOVE completed\r\n");
+	const noop = messageWriteBackend({ move: { result: "ok", changed: [] } });
+	assert.equal((await runOn(noop.client, "E MOVE 1 Receipts", inbox)).response, "E OK MOVE completed\r\n");
+	// The selection survives a move, unlike a DELETE of the selected mailbox.
+	assert.equal((await runOn(client, "F NOOP", inbox)).response, "F OK NOOP completed\r\n");
+});
+
+test("MOVE answers NO for what the mailbox model cannot represent", async () => {
+	const { client, calls } = messageWriteBackend();
+	const inbox = await runOn(client, "A SELECT INBOX");
+	assert.equal((await runOn(client, "B MOVE 1 Receipts")).response, "B BAD No mailbox selected\r\n");
+	assert.equal((await runOn(client, "C MOVE 1", inbox)).response, "C BAD MOVE needs a sequence set and a mailbox name\r\n");
+	assert.equal((await runOn(client, "D MOVE 9 Receipts", inbox)).response, "D BAD MOVE sequence set is malformed or out of range\r\n");
+	assert.equal((await runOn(client, "E MOVE 1 Nope", inbox)).response, "E NO [TRYCREATE] No such mailbox\r\n");
+	assert.equal((await runOn(client, "F MOVE 1 \u0026", inbox)).response, "F BAD MOVE mailbox name must be modified UTF-7\r\n");
+	assert.deepEqual(calls.move, []);
+	const denied = messageWriteBackend({ move: { result: "denied" } });
+	assert.equal((await runOn(denied.client, "G MOVE 1 Receipts", inbox)).response, "G NO MOVE is not allowed on this mailbox\r\n");
+	const cross = messageWriteBackend({ move: { result: "cross-mailbox" } });
+	assert.equal((await runOn(cross.client, "H MOVE 1 \"sales@example.test/INBOX\"", inbox)).response, "H NO MOVE cannot move mail between mailboxes\r\n");
+	const invalid = messageWriteBackend({ move: { result: "invalid", description: "Received mail cannot be moved to Sent" } });
+	assert.equal((await runOn(invalid.client, "I MOVE 1 Sent", inbox)).response, "I NO Received mail cannot be moved to Sent\r\n");
+	const missing = messageWriteBackend({ move: { result: "missing" } });
+	assert.equal((await runOn(missing.client, "J MOVE 1 Receipts", inbox)).response, "J NO No such mailbox\r\n");
+});
+
+test("the write slice is APPEND and MOVE only", async () => {
+	const { client } = messageWriteBackend();
+	const inbox = await runOn(client, "A SELECT INBOX");
+	// Capability is how a client knows MOVE is there (RFC 6851 §3.1).
+	assert.match((await run("A CAPABILITY")).response, /^\* CAPABILITY IMAP4rev1 MOVE ID\r\n/);
+	for (const line of ["B STORE 1 +FLAGS (\\Seen)", "C UID STORE 1 +FLAGS (\\Seen)", "D COPY 1 Receipts", "E UID COPY 1 Receipts", "F EXPUNGE", "G UID EXPUNGE 1"]) {
+		assert.equal((await runOn(client, line, inbox)).response, `${line.split(" ")[0]} NO Not implemented yet\r\n`, line);
+	}
+	// APPEND writes messages; it does not make flags mutable in a session.
+	const selected = await runOn(client, "H SELECT INBOX");
+	assert.match(selected.response, /\* OK \[PERMANENTFLAGS \(\)\] Read-only mailbox/);
+	assert.match(selected.response, /\* OK \[UIDNEXT 4\] Predicted next UID/);
 });

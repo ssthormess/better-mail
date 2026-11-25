@@ -1,4 +1,5 @@
 import type { SystemRole } from "@/lib/jmap/types";
+import { LIMITS } from "@/lib/jmap/constants";
 import { resolveImapFolderTarget, type ImapFolderTargetResolution } from "./imap-mailboxes";
 
 /**
@@ -7,7 +8,11 @@ import { resolveImapFolderTarget, type ImapFolderTargetResolution } from "./imap
  * back to `authenticated` without guessing.
  */
 export type ImapSessionState = "not-authenticated" | "authenticated" | "selected" | "logged-out";
-export type ImapCommand = { tag: string; verb: string; args: string[] };
+/**
+ * One parsed command line. `literal` is the message bytes the socket layer read after a `{n}`
+ * marker: the literal is binary, so it never travels through the quoted-string tokenizer.
+ */
+export type ImapCommand = { tag: string; verb: string; args: string[]; literal?: ArrayBuffer };
 
 /** The mailbox a session has selected. `ref` is the stable JMAP mailbox reference it resolved to. */
 export type ImapSelectedMailbox = { name: string; ref: string; uidValidity: number; readOnly: boolean };
@@ -33,6 +38,8 @@ export type ImapMailboxCounts = { messages: number; unseen: number };
  * mailbox, ordered by arrival, so `uid` is what the backend assigned the row.
  */
 export type ImapMessageEntry = {
+	/** `messages.id` — what a MOVE has to act on; the UID is only a position. */
+	id: string;
 	uid: number;
 	/** `messages.read` — directed mail has no read toggle, hence `outbound` below. */
 	read: boolean;
@@ -66,6 +73,30 @@ export type ImapFolderTarget = {
  */
 export type ImapFolderWriteResult = "ok" | "denied" | "exists" | "missing";
 
+/** What APPEND hands the backend: where the message goes, the flags it arrived with, and the bytes. */
+export type ImapAppendRequest = {
+	entry: ImapMailboxEntry;
+	/** Canonical flags (`\\Seen`), only the ones the bridge can store. */
+	flags: string[];
+	/** RFC 3501 §6.3.11 internal date, null when the client sent none. */
+	internalDate: Date | null;
+	raw: ArrayBuffer;
+};
+
+/**
+ * `duplicate` is a stored message whose Message-ID is already in the mailbox: the append did not add a
+ * row. `invalid` is a payload the import seam could not store (unparsable MIME, rejected attachment).
+ */
+export type ImapAppendResult = "ok" | "duplicate" | "denied" | "invalid";
+
+/** `denied` needs full_access; `cross-mailbox` is a move between two of the account's mailboxes. */
+export type ImapMoveOutcome =
+	| { result: "ok"; changed: string[] }
+	| { result: "denied" }
+	| { result: "missing" }
+	| { result: "cross-mailbox" }
+	| { result: "invalid"; description: string };
+
 /** What the dispatcher needs from the database. Kept behind an interface so the protocol stays pure and testable. */
 export type ImapMailboxBackend = {
 	list(): Promise<ImapMailboxEntry[]>;
@@ -78,6 +109,10 @@ export type ImapMailboxBackend = {
 	deleteFolder(target: ImapFolderTarget): Promise<ImapFolderWriteResult>;
 	/** RENAME: renames in place, so message folder refs stay valid (the id does not change). */
 	renameFolder(target: ImapFolderTarget, name: string): Promise<ImapFolderWriteResult>;
+	/** APPEND: stores the literal as a real message in that mailbox, through the import seam. */
+	append(request: ImapAppendRequest): Promise<ImapAppendResult>;
+	/** MOVE: re-files the rows, reusing the JMAP membership rule; returns the ids that changed. */
+	move(source: ImapMailboxEntry, messageIds: string[], destination: ImapMailboxEntry): Promise<ImapMoveOutcome>;
 };
 
 export type ImapAction = {
@@ -149,7 +184,7 @@ export async function dispatchImapCommand(
 ): Promise<ImapAction> {
 	const session = asImapSession(sessionInput);
 	const { tag, verb, args } = command;
-	if (verb === "CAPABILITY") return { response: `* CAPABILITY IMAP4rev1 ID\r\n${tag} OK CAPABILITY completed\r\n` };
+	if (verb === "CAPABILITY") return { response: `* CAPABILITY IMAP4rev1 MOVE ID\r\n${tag} OK CAPABILITY completed\r\n` };
 	if (verb === "NOOP") return { response: `${tag} OK NOOP completed\r\n` };
 	if (verb === "LOGOUT") return { response: `* BYE Logging out\r\n${tag} OK LOGOUT completed\r\n`, state: "logged-out", selected: null };
 	if (verb === "ID") return { response: `* ID (\"name\" \"Mailflare\")\r\n${tag} OK ID completed\r\n` };
@@ -169,6 +204,10 @@ export async function dispatchImapCommand(
 	if (verb === "CREATE") return createCommand(tag, args, backend);
 	if (verb === "DELETE") return deleteCommand(tag, args, session, backend);
 	if (verb === "RENAME") return renameCommand(tag, args, session, backend);
+	// APPEND is legal in both the authenticated and the selected state (RFC 3501 §6.3.11), and it names
+	// its own destination, so it does not read the selection.
+	if (verb === "APPEND") return appendCommand(tag, command, backend);
+	if (verb === "MOVE") return moveCommand(tag, false, args, session, backend);
 	if (verb === "FETCH") return fetchCommand(tag, false, args, session, backend);
 	if (verb === "UID") return uidCommand(tag, args, session, backend);
 	if (verb === "UNSELECT" || verb === "CLOSE") {
@@ -447,13 +486,172 @@ function folderWriteResponse(result: ImapFolderWriteResult, verb: "CREATE" | "DE
 }
 
 /**
+ * The flags APPEND can store, in canonical spelling. Anything else (`\\Recent`, a keyword, a client's
+ * `$label`) has no column in this model, so it is dropped rather than echoed back as a flag nothing holds.
+ */
+const APPEND_FLAGS: Record<string, string> = {
+	"\\SEEN": "\\Seen",
+	"\\FLAGGED": "\\Flagged",
+	"\\DRAFT": "\\Draft",
+	"\\DELETED": "\\Deleted",
+};
+
+/**
+ * APPEND: `APPEND <mailbox> [(<flags>)] [<date-time>] {<n>}` + literal bytes.
+ *
+ * The bytes go through the same import seam as REST and JMAP (`importMessageToMailbox`), so placement,
+ * threading, attachments, FTS and the change journal are written once, by the code that already owns them.
+ * The flag list is not a set of columns: `\\Draft` and `\\Deleted` are the Drafts/Trash mailboxes here
+ * (status, and the trigger-maintained `trashed_at`), so a flag that contradicts the destination cannot be
+ * stored honestly. Marking INBOX mail `\\Draft` would make it a private draft of the appender, and `\\Deleted`
+ * would move it out of the mailbox the client appended it to, so both answer NO and write nothing.
+ *
+ * An internal date older than the mailbox's newest message files the row earlier in the sequence, and the UID
+ * of everything after it moves up by one: this bridge's UIDs are the arrival position (see `mailboxMessages`),
+ * so APPEND is the one command that can renumber. Nothing here advertises CONDSTORE/QRESYNC, and the client
+ * sees the new message through its next SELECT/STATUS rather than an untagged EXISTS.
+ */
+async function appendCommand(tag: string, command: ImapCommand, backend?: ImapMailboxBackend): Promise<ImapAction> {
+	const parsed = parseImapAppendArguments(command.args);
+	if ("error" in parsed) return { response: `${tag} BAD APPEND ${parsed.error}\r\n` };
+	const name = decodeModifiedUtf7(parsed.name);
+	if (name === null) return { response: `${tag} BAD APPEND mailbox name must be modified UTF-7\r\n` };
+	const raw = command.literal;
+	if (!raw || raw.byteLength === 0) return { response: `${tag} BAD APPEND needs a message literal\r\n` };
+	// The socket layer already refuses a literal over its own buffer cap; this is the protocol-level cap,
+	// the same one JMAP uploads use, so a client cannot store a message no other protocol would accept.
+	if (raw.byteLength > LIMITS.maxSizeUpload) return { response: `${tag} NO Message is larger than ${LIMITS.maxSizeUpload} bytes\r\n` };
+	if (!backend) return mailboxUnavailable(tag);
+	const entry = resolveImapMailbox(await backend.list(), name);
+	// RFC 3501 §6.3.11: a name that is not there yet is what TRYCREATE is for.
+	if (!entry) return { response: `${tag} NO [TRYCREATE] No such mailbox\r\n` };
+	const flags = parsed.flags.map((flag) => APPEND_FLAGS[flag.toUpperCase()]).filter((flag): flag is string => Boolean(flag));
+	if (flags.includes("\\Draft") && entry.role !== "drafts") return { response: `${tag} NO Drafts mail is only appendable to the Drafts mailbox\r\n` };
+	if (flags.includes("\\Deleted") && entry.role !== "trash") return { response: `${tag} NO Deleted mail is only appendable to the Trash mailbox\r\n` };
+	const result = await backend.append({ entry, flags, internalDate: parsed.internalDate, raw });
+	return { response: `${tag} ${appendResponse(result)}\r\n` };
+}
+
+/** The flags decide their own columns, so APPEND never falls back to the import hints for read/starred. */
+function appendResponse(result: ImapAppendResult): string {
+	// A duplicate Message-ID is still "the message is in the mailbox", so the append succeeded: what it did not
+	// do is add a second row (the seam may still add \\Seen/\\Flagged to the row it found). RFC 3501 has no
+	// response code for that — APPENDUID is UIDPLUS, which this server does not advertise — and a NO would make
+	// a client retry a message that is already stored.
+	if (result === "ok" || result === "duplicate") return "OK APPEND completed";
+	if (result === "invalid") return "NO Message could not be stored";
+	// `denied` is the canManage gate. The mailbox is in this session's own catalogue (LIST and SELECT already
+	// name it), so unlike CREATE's "NO No such mailbox" there is nothing left for the refusal to hide.
+	return "NO APPEND is not allowed on this mailbox";
+}
+
+/**
+ * MOVE (RFC 6851): `MOVE <seq-set> <mailbox>` and `UID MOVE`, over the selected mailbox. The row keeps its
+ * id and its raw MIME; only `folder_id`/`status` (and, through them, `trashed_at`) change, so this is the same
+ * membership update JMAP `Email/set` makes, reused from `targetFromMailboxIds`.
+ *
+ * The bridge has no per-message flags to rewrite in place, so a move between two of the account's mailboxes is
+ * refused exactly as JMAP refuses it — `messages.mailbox_id` is part of every reader's scope (folders, the
+ * change journal, the counts) and the model has no notion of a message belonging to two mailboxes.
+ */
+async function moveCommand(
+	tag: string,
+	uid: boolean,
+	args: string[],
+	session: ImapSession,
+	backend?: ImapMailboxBackend,
+): Promise<ImapAction> {
+	const label = uid ? "UID MOVE" : "MOVE";
+	if (!session.selected) return { response: `${tag} BAD No mailbox selected\r\n` };
+	if (args.length !== 2) return { response: `${tag} BAD ${label} needs a sequence set and a mailbox name\r\n` };
+	if (!backend) return mailboxUnavailable(tag);
+	const destinationName = decodeModifiedUtf7(args[1]);
+	if (destinationName === null) return { response: `${tag} BAD ${label} mailbox name must be modified UTF-7\r\n` };
+	const entries = await backend.list();
+	const source = entries.find((entry) => entry.selectable && entry.ref === session.selected!.ref) ?? null;
+	if (!source) return { response: `${tag} NO No such mailbox\r\n` };
+	const destination = resolveImapMailbox(entries, destinationName);
+	if (!destination) return { response: `${tag} NO [TRYCREATE] No such mailbox\r\n` };
+	const messages = await backend.messages(session.selected);
+	if (messages.length === 0) return { response: `${tag} BAD Mailbox is empty\r\n` };
+	const sequenceNumbers = parseImapSequenceSet(args[0], messages.length);
+	if (!sequenceNumbers) return { response: `${tag} BAD ${label} sequence set is malformed or out of range\r\n` };
+	const ids = sequenceNumbers.map((sequence) => messages[sequence - 1].id);
+	const outcome = await backend.move(source, ids, destination);
+	if (outcome.result === "denied") return { response: `${tag} NO ${label} is not allowed on this mailbox\r\n` };
+	if (outcome.result === "cross-mailbox") return { response: `${tag} NO ${label} cannot move mail between mailboxes\r\n` };
+	if (outcome.result === "invalid") return { response: `${tag} NO ${outcome.description}\r\n` };
+	if (outcome.result === "missing") return { response: `${tag} NO No such mailbox\r\n` };
+	// The messages left the selected mailbox, so the client's view is corrected with EXPUNGE responses (RFC 3501
+	// §7.4.1 wants them in descending order) before the tagged OK, which is what RFC 6851 asks MOVE to do in
+	// place of the STORE+EXPUNGE a client would otherwise issue itself. A move that changed nothing (same
+	// mailbox, same folder) has nothing to expunge.
+	const changed = new Set(outcome.changed);
+	const expunged = sequenceNumbers.filter((sequence, index) => changed.has(ids[index])).sort((left, right) => right - left);
+	const untagged = expunged.map((sequence) => `* ${sequence} EXPUNGE\r\n`).join("");
+	return { response: `${untagged}${tag} OK ${label} completed\r\n` };
+}
+
+/**
+ * APPEND's arguments, once the literal is out of the way: `mailbox [(flags)] [date-time]`. The flag list is
+ * split on spaces by the command-line tokenizer, so `(\\Seen \\Flagged)` arrives as several tokens and is
+ * reassembled here; the date-time is a quoted string but is also accepted unquoted, joined back together.
+ */
+export function parseImapAppendArguments(
+	args: string[],
+): { name: string; flags: string[]; internalDate: Date | null } | { error: string } {
+	if (args.length === 0) return { error: "needs a mailbox name" };
+	const name = args[0];
+	const rest = args.slice(1);
+	const flags: string[] = [];
+	if (rest.length > 0 && rest[0].startsWith("(")) {
+		const end = rest.findIndex((token) => token.endsWith(")"));
+		if (end < 0) return { error: "flag list is not closed" };
+		const joined = rest.slice(0, end + 1).join(" ");
+		if (!/^\([^()]*\)$/.test(joined)) return { error: "flag list is malformed" };
+		flags.push(...joined.slice(1, -1).split(/\s+/).filter(Boolean));
+		rest.splice(0, end + 1);
+	}
+	if (rest.length === 0) return { name, flags, internalDate: null };
+	const internalDate = parseImapDateTime(rest.join(" "));
+	if (!internalDate) return { error: "date-time is malformed" };
+	return { name, flags, internalDate };
+}
+
+const IMAP_MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+
+/**
+ * RFC 3501 §9 date-time (`dd-Mon-yyyy HH:mm:ss +ZZZZ`), the internal date APPEND may carry. `created_at`
+ * takes a timestamp, so the value the client states becomes the message's arrival time (and therefore its
+ * position in the UID order) instead of being dropped.
+ */
+export function parseImapDateTime(value: string): Date | null {
+	const match = /^(\d{1,2})-([A-Za-z]{3})-(\d{4}) (\d{2}):(\d{2}):(\d{2}) ([+-])(\d{2})(\d{2})$/.exec(value.trim());
+	if (!match) return null;
+	const month = IMAP_MONTHS.indexOf(match[2].toLowerCase());
+	const day = Number(match[1]);
+	const hour = Number(match[4]);
+	const minute = Number(match[5]);
+	const second = Number(match[6]);
+	if (month < 0 || hour > 23 || minute > 59 || second > 60) return null;
+	const utc = Date.UTC(Number(match[3]), month, day, hour, minute, second);
+	const date = new Date(utc);
+	// Date.UTC rolls 31-Feb over into March instead of refusing it, so the calendar fields are checked back.
+	if (date.getUTCMonth() !== month || date.getUTCDate() !== day) return null;
+	const offset = (Number(match[8]) * 60 + Number(match[9])) * (match[7] === "-" ? -1 : 1);
+	return new Date(utc - offset * 60_000);
+}
+
+/**
  * UID commands share FETCH's sequence model: UIDs are positional, so `UID FETCH` is
- * FETCH with the UID echoed back. Every other UID subcommand (STORE, COPY, SEARCH,
- * EXPUNGE) is a later slice and answers the same honest NO as any unimplemented verb.
+ * FETCH with the UID echoed back and `UID MOVE` is MOVE over the same numbers. Every other UID
+ * subcommand (STORE, COPY, SEARCH, EXPUNGE) is a later slice and answers the same honest NO as
+ * any unimplemented verb.
  */
 async function uidCommand(tag: string, args: string[], session: ImapSession, backend?: ImapMailboxBackend): Promise<ImapAction> {
 	const subcommand = args[0]?.toUpperCase();
 	if (!subcommand) return { response: `${tag} BAD UID needs a subcommand\r\n` };
+	if (subcommand === "MOVE") return moveCommand(tag, true, args.slice(1), session, backend);
 	if (subcommand !== "FETCH") return { response: `${tag} NO Not implemented yet\r\n` };
 	return fetchCommand(tag, true, args.slice(1), session, backend);
 }

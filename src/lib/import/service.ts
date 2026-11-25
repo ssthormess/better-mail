@@ -46,7 +46,13 @@ export async function importMessagesToMailbox(
 	return result;
 }
 
-async function importMessageToMailbox(
+/**
+ * Store one `message/rfc822` payload in a mailbox and return whether a new row was written
+ * (false means the Message-ID was already there). Shared by the REST import job, the Takeout
+ * import and IMAP APPEND, so placement, threading, the FTS triggers and the change journal are
+ * the same whichever protocol asked for the write.
+ */
+export async function importMessageToMailbox(
 	env: CloudflareEnv,
 	input: {
 		userId: string;
@@ -56,6 +62,8 @@ async function importMessageToMailbox(
 		raw: ArrayBuffer;
 		read?: boolean;
 		starred?: boolean;
+		/** IMAP APPEND's internal date. `created_at` takes it, so it wins over the Date header. */
+		createdAt?: Date;
 	},
 ): Promise<boolean> {
 	const parsed = await parseRawMime(input.raw);
@@ -81,7 +89,7 @@ async function importMessageToMailbox(
 	const rawR2Key = `imports/${messageId}.eml`;
 	const fromAddr = parsed.fromAddr ?? "unknown";
 	const toAddr = parsed.toAddr ?? "";
-	const createdAt = parsed.date ?? new Date();
+	const createdAt = input.createdAt ?? parsed.date ?? new Date();
 	const hints = getImportMessageHints(input.raw);
 	const placement = getImportMessagePlacement(applyImportHints(input.destination, hints));
 	const read = input.read ?? hints.read ?? placement.direction === "outbound";
