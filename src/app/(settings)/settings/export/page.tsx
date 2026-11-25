@@ -3,14 +3,15 @@
 import { useState } from "react";
 import { Download } from "@/components/icons";
 import { useLanguage } from "@/components/language-provider";
-import { useSelectedMailbox } from "@/components/mailbox-provider";
+import { useActiveMailbox } from "@/components/use-active-mailbox";
 import { Button } from "@/components/ui/button";
 import type { ExportState } from "./types";
 import { exportMailbox } from "./utils";
 
 export default function SettingsExportPage() {
 	const { t } = useLanguage();
-	const { selectedMailbox } = useSelectedMailbox();
+	// Exports one mailbox; in unified mode that is the primary.
+	const selectedMailbox = useActiveMailbox();
 	const [exportState, setExportState] = useState<ExportState>({ error: null, loading: false });
 
 	async function onExport() {

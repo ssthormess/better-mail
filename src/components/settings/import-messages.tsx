@@ -4,7 +4,7 @@ import type { FormEvent } from "react";
 import { useState } from "react";
 import { Upload } from "@/components/icons";
 import { useLanguage } from "@/components/language-provider";
-import { useSelectedMailbox } from "@/components/mailbox-provider";
+import { useActiveMailbox } from "@/components/use-active-mailbox";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Label } from "@/components/ui/label";
@@ -14,7 +14,8 @@ import { importMessageFiles } from "./import-messages-utils";
 
 export function ImportMessages({ destination, sourceLabel }: ImportMessagesProps) {
 	const { t } = useLanguage();
-	const { selectedMailbox } = useSelectedMailbox();
+	// Imports land in one mailbox; in unified mode that is the primary.
+	const selectedMailbox = useActiveMailbox();
 	const [files, setFiles] = useState<File[]>([]);
 	const [loading, setLoading] = useState(false);
 	const [result, setResult] = useState<ImportMessagesResult | null>(null);

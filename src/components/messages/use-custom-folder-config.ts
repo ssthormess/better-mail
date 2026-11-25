@@ -2,13 +2,14 @@
 
 import { Folder } from "@/components/icons";
 import { useEffect, useMemo, useState } from "react";
-import { useSelectedMailbox } from "@/components/mailbox-provider";
+import { useActiveMailbox } from "@/components/use-active-mailbox";
 import { getMailboxFolders } from "@/lib/folders/client";
 import type { CustomFolderSummary } from "./custom-folder-config-types";
 import type { MessageFolderConfig } from "./types";
 
 export function useCustomFolderConfig(folderId: string): MessageFolderConfig {
-	const { selectedMailbox } = useSelectedMailbox();
+	// Custom folders live in one mailbox; in unified mode that is the primary.
+	const selectedMailbox = useActiveMailbox();
 	const [folderName, setFolderName] = useState("Folder");
 
 	useEffect(() => {

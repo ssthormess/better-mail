@@ -429,6 +429,7 @@
 	"account.calendar": "ปฏิทิน",
 	"account.settings": "การตั้งค่า",
 	"account.inboxes": "กล่องจดหมายเข้า ({count})",
+	"account.allMailboxes": "กล่องจดหมายทั้งหมด",
 	"account.otherAccounts": "บัญชีอื่น",
 	"account.admin": "ผู้ดูแลระบบ",
 	"account.addAnother": "เพิ่มบัญชีอื่น",

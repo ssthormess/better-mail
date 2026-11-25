@@ -16,6 +16,11 @@ import {
 	SELECTED_MAILBOX_STORAGE_KEY,
 } from "./mailbox-provider-utils";
 import {
+	parseStoredMailboxSelection,
+	resolveMailboxSelection,
+	serializeMailboxSelection,
+} from "./mailbox-selection";
+import {
 	AUTH_SESSION_CHANGED_EVENT,
 	getClientSessionToken,
 } from "@/lib/auth/client";
@@ -44,6 +49,7 @@ export type MailboxOption = {
 };
 
 type MailboxContextValue = {
+	/** null means every accessible mailbox: the unified inbox. */
 	selectedMailbox: MailboxOption | null;
 	setSelectedMailbox: (mb: MailboxOption | null) => void;
 	mailboxes: MailboxOption[];
@@ -75,19 +81,15 @@ export function MailboxProvider({ children }: { children: ReactNode }) {
 				if (!isCurrent()) return;
 				setMailboxes(items);
 
-				const storedId = localStorage.getItem(SELECTED_MAILBOX_STORAGE_KEY);
-				if (storedId) {
-					const found = items.find((mb) => mb.id === storedId);
-					if (found) {
-						setSelectedMailboxState(found);
-						return;
-					}
-				}
-
-				const primary = items.find((mb) => mb.isPrimary) ?? items[0] ?? null;
-				if (primary) {
-					setSelectedMailboxState(primary);
-					localStorage.setItem(SELECTED_MAILBOX_STORAGE_KEY, primary.id);
+				// A stored "all mailboxes" sentinel (or a stale id) resolves here rather than
+				// silently falling back to the primary mailbox.
+				const resolved = resolveMailboxSelection(
+					items,
+					parseStoredMailboxSelection(localStorage.getItem(SELECTED_MAILBOX_STORAGE_KEY)),
+				);
+				setSelectedMailboxState(resolved.mailbox);
+				if (resolved.storageValue !== null) {
+					localStorage.setItem(SELECTED_MAILBOX_STORAGE_KEY, resolved.storageValue);
 				}
 			})
 			.catch(() => {})
@@ -155,10 +157,9 @@ export function MailboxProvider({ children }: { children: ReactNode }) {
 		setSelectedMailboxState((current) => (current?.id === mb?.id ? current : mb));
 		if (mb) {
 			setMailboxes((items) => items.map((item) => (item.id === mb.id && item !== mb ? mb : item)));
-			localStorage.setItem(SELECTED_MAILBOX_STORAGE_KEY, mb.id);
-		} else {
-			localStorage.removeItem(SELECTED_MAILBOX_STORAGE_KEY);
 		}
+		// null is stored as the sentinel, so picking "All mailboxes" survives a reload.
+		localStorage.setItem(SELECTED_MAILBOX_STORAGE_KEY, serializeMailboxSelection(mb?.id ?? null));
 	}, []);
 
 	return (

@@ -4,7 +4,7 @@ import type { FormEvent } from "react";
 import { useEffect, useRef, useState } from "react";
 import { Upload } from "@/components/icons";
 import { useLanguage } from "@/components/language-provider";
-import { useSelectedMailbox } from "@/components/mailbox-provider";
+import { useActiveMailbox } from "@/components/use-active-mailbox";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
@@ -42,7 +42,8 @@ function cloneSummary(summary: TakeoutImportSummary): TakeoutImportSummary {
 /** Imports a Google Takeout export: the zip is read in the browser and messages are uploaded in batches. */
 export function TakeoutImport() {
 	const { t } = useLanguage();
-	const { selectedMailbox } = useSelectedMailbox();
+	// Takeout imports land in one mailbox; in unified mode that is the primary.
+	const selectedMailbox = useActiveMailbox();
 	const [files, setFiles] = useState<File[]>([]);
 	const [folders, setFolders] = useState(true);
 	const [skipSpam, setSkipSpam] = useState(false);

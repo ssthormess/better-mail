@@ -5,7 +5,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Plus, Search, UsersRound } from "@/components/icons";
 import { useLanguage } from "@/components/language-provider";
 import { useCompose } from "@/components/compose/compose-context";
-import { useSelectedMailbox } from "@/components/mailbox-provider";
+import { useActiveMailbox } from "@/components/use-active-mailbox";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { List } from "@/components/ui/list";
@@ -24,7 +24,8 @@ const SEARCH_DEBOUNCE_MS = 250;
 export function ContactsPage() {
 	const { t } = useLanguage();
 	const queryClient = useQueryClient();
-	const { selectedMailbox } = useSelectedMailbox();
+	// Contacts belong to one mailbox's address book; in unified mode that is the primary.
+	const selectedMailbox = useActiveMailbox();
 	const { openComposer } = useCompose();
 	const mailboxId = selectedMailbox?.id ?? "";
 	const [input, setInput] = useState("");

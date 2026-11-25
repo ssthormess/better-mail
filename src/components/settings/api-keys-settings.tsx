@@ -6,6 +6,7 @@ import { useEffect, useState } from "react";
 import { Copy, KeyRound, Plus, Trash2 } from "@/components/icons";
 import { useLanguage } from "@/components/language-provider";
 import { useSelectedMailbox } from "@/components/mailbox-provider";
+import { useActiveMailbox } from "@/components/use-active-mailbox";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -25,7 +26,9 @@ import { createManagedApiKey, keyPermissions, loadManagedApiKeys, MCP_KEY_SCOPES
 
 export function ApiKeysSettings() {
 	const { t } = useLanguage();
-	const { mailboxes, selectedMailbox } = useSelectedMailbox();
+	// A new key defaults to one mailbox; in unified mode that is the primary.
+	const { mailboxes } = useSelectedMailbox();
+	const selectedMailbox = useActiveMailbox();
 	const { status } = useSecurityStatus();
 	const [confirming, setConfirming] = useState(false);
 	const [keys, setKeys] = useState<ManagedApiKey[]>([]);

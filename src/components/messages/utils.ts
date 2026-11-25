@@ -85,6 +85,12 @@ export function getMailboxAddress(mailbox: Pick<MailboxOption, "localPart" | "ho
 	return `${mailbox.localPart}@${mailbox.hostname}`;
 }
 
+/** What a unified-inbox row badge shows for the row's mailbox. */
+export function getRowMailboxLabel(mailbox: Pick<MailboxOption, "displayName" | "localPart"> | null | undefined): string | null {
+	if (!mailbox) return null;
+	return mailbox.displayName ?? mailbox.localPart;
+}
+
 export function getEmailPageTitleCount(total: number, unread: number): number {
 	return unread > 0 ? unread : total;
 }

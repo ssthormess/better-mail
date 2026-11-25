@@ -2,6 +2,7 @@ import type { TranslationKey } from "@/lib/i18n/types";
 import type { LucideIcon } from "@/components/icons";
 import type { Dispatch, ReactNode, SetStateAction } from "react";
 import type { Message, MessageFolder } from "@/hooks/types";
+import type { MailboxOption } from "@/components/mailbox-provider";
 import type { BulkMessageAction } from "@/app/api/messages/bulk/types";
 
 export type MessageFolderConfig = {
@@ -27,6 +28,8 @@ export type MessageListRowProps = {
 	opening?: boolean;
 	compact?: boolean;
 	currentAccountName?: string;
+	/** The row's mailbox, passed only when the list merges mailboxes; draws the row badge. */
+	rowMailbox?: MailboxOption | null;
 	onSelectedChange: (messageId: string, selected: boolean) => void;
 	onMessageAction: (messageId: string, action: RowMessageAction) => Promise<void>;
 	onOpening?: (messageId: string) => void;

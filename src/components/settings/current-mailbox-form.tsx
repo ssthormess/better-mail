@@ -5,6 +5,7 @@ import { useState } from "react";
 import { Save } from "@/components/icons";
 import { useLanguage } from "@/components/language-provider";
 import { useSelectedMailbox } from "@/components/mailbox-provider";
+import { useActiveMailbox } from "@/components/use-active-mailbox";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -15,7 +16,9 @@ import { getMailboxAddress, updateCurrentMailboxName } from "./utils";
 
 export function CurrentMailboxForm() {
 	const { t } = useLanguage();
-	const { selectedMailbox, setSelectedMailbox, isLoading } = useSelectedMailbox();
+	// These settings edit one mailbox; in unified mode that is the primary.
+	const { setSelectedMailbox, isLoading } = useSelectedMailbox();
+	const selectedMailbox = useActiveMailbox();
 	const [displayName, setDisplayName] = useState(selectedMailbox?.displayName ?? "");
 	const [savedDisplayName, setSavedDisplayName] = useState(selectedMailbox?.displayName ?? "");
 	const [status, setStatus] = useState<string | null>(null);

@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { useLanguage } from "@/components/language-provider";
 import { useSelectedMailbox } from "@/components/mailbox-provider";
+import { useActiveMailbox } from "@/components/use-active-mailbox";
 import { isHtmlSignature } from "@/components/compose/rich-text-utils";
 import { EmailHtmlRenderer } from "@/components/messages/email-html-renderer";
 import { Button } from "@/components/ui/button";
@@ -12,7 +13,9 @@ import { updateMailboxSignature } from "./utils";
 
 export function MailboxSignatureForm() {
 	const { t } = useLanguage();
-	const { selectedMailbox, setSelectedMailbox, isLoading } = useSelectedMailbox();
+	// Signatures are per mailbox; in unified mode the form edits the primary.
+	const { setSelectedMailbox, isLoading } = useSelectedMailbox();
+	const selectedMailbox = useActiveMailbox();
 	const [signature, setSignature] = useState(selectedMailbox?.signature ?? "");
 	const [savedSignature, setSavedSignature] = useState(selectedMailbox?.signature ?? "");
 	const [status, setStatus] = useState<string | null>(null);

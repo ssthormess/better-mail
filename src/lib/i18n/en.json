@@ -436,6 +436,7 @@
 	"account.openApps": "Open apps menu",
 	"account.settings": "Settings",
 	"account.inboxes": "Inboxes ({count})",
+	"account.allMailboxes": "All mailboxes",
 	"account.otherAccounts": "Other accounts",
 	"account.signOutAccountConfirm": "Sign out {name} ({email})? You will need to sign in again to use this account.",
 	"account.admin": "Admin",

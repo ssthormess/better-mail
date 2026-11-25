@@ -435,6 +435,7 @@
 	"account.calendar": "Calendário",
 	"account.settings": "Configurações",
 	"account.inboxes": "Caixas ({count})",
+	"account.allMailboxes": "Todas as caixas",
 	"account.otherAccounts": "Outras contas",
 	"account.admin": "Administração",
 	"account.addAnother": "Adicionar outra conta",

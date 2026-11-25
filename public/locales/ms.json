@@ -429,6 +429,7 @@
 	"account.calendar": "Kalendar",
 	"account.settings": "Tetapan",
 	"account.inboxes": "Peti masuk ({count})",
+	"account.allMailboxes": "Semua peti mel",
 	"account.otherAccounts": "Akaun lain",
 	"account.admin": "Admin",
 	"account.addAnother": "Tambah akaun lain",

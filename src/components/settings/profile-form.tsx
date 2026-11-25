@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { useLanguage } from "@/components/language-provider";
 import { useSelectedMailbox } from "@/components/mailbox-provider";
+import { useActiveMailbox } from "@/components/use-active-mailbox";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -19,7 +20,9 @@ export function ProfileForm({
   initialResetEmail,
 }: ProfileFormProps) {
   const { t } = useLanguage();
-  const { selectedMailbox, setSelectedMailbox, isLoading } = useSelectedMailbox();
+  // Identity settings edit one mailbox; in unified mode that is the primary.
+  const { setSelectedMailbox, isLoading } = useSelectedMailbox();
+  const selectedMailbox = useActiveMailbox();
   const [name, setName] = useState(selectedMailbox?.displayName ?? "");
   const [savedName, setSavedName] = useState(selectedMailbox?.displayName ?? "");
   const [resetEmail, setResetEmail] = useState(initialResetEmail);

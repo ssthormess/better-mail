@@ -440,6 +440,7 @@
 	"account.calendar": "Календарь",
 	"account.settings": "Настройки",
 	"account.inboxes": "Ящики ({count})",
+	"account.allMailboxes": "Все ящики",
 	"account.otherAccounts": "Другие аккаунты",
 	"account.admin": "Администрирование",
 	"account.addAnother": "Добавить другой аккаунт",

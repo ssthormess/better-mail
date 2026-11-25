@@ -23,6 +23,7 @@ import {
   Trash2,
 } from "@/components/icons";
 import { useSelectedMailbox } from "@/components/mailbox-provider";
+import { useActiveMailbox } from "@/components/use-active-mailbox";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -116,13 +117,15 @@ export function DashboardNav({ className }: { className?: string }) {
   const moreOpen = moreOpenChoice ?? (hydrated && readStorage(MORE_OPEN_KEY, false));
   const foldersOpen = foldersOpenChoice ?? (hydrated && readStorage(FOLDERS_OPEN_KEY, false));
   const [foldersSectionOpen, toggleFoldersSection] = useSectionOpen("mailflare:nav:folders-section-open");
+  // Counts merge every mailbox in unified mode; custom folders stay the primary mailbox's.
   const { selectedMailbox, isLoading } = useSelectedMailbox();
+  const activeMailbox = useActiveMailbox();
   const { counts } = useMessageCounts(selectedMailbox?.id, !isLoading);
   const [folders, setFolders] = useState<CustomFolder[]>([]);
-  const [foldersMailboxId, setFoldersMailboxId] = useState(selectedMailbox?.id);
-  if (foldersMailboxId !== selectedMailbox?.id) {
-    setFoldersMailboxId(selectedMailbox?.id);
-    if (!selectedMailbox?.id) setFolders([]);
+  const [foldersMailboxId, setFoldersMailboxId] = useState(activeMailbox?.id);
+  if (foldersMailboxId !== activeMailbox?.id) {
+    setFoldersMailboxId(activeMailbox?.id);
+    if (!activeMailbox?.id) setFolders([]);
   }
   const [newFolderName, setNewFolderName] = useState("");
   const [newFolderColor, setNewFolderColor] =
@@ -206,10 +209,10 @@ export function DashboardNav({ className }: { className?: string }) {
   const foldersOverflow = !minimal && folders.length > MAX_VISIBLE_FOLDERS;
 
   useEffect(() => {
-    if (!selectedMailbox?.id) return;
+    if (!activeMailbox?.id) return;
 
     let cancelled = false;
-    getMailboxFolders<{ folders?: CustomFolder[] }>(selectedMailbox.id)
+    getMailboxFolders<{ folders?: CustomFolder[] }>(activeMailbox.id)
       .then((data) => {
         if (!cancelled) setFolders(data.folders ?? []);
       })
@@ -220,11 +223,11 @@ export function DashboardNav({ className }: { className?: string }) {
     return () => {
       cancelled = true;
     };
-  }, [selectedMailbox?.id]);
+  }, [activeMailbox?.id]);
 
   async function createFolder(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!selectedMailbox?.id || !newFolderName.trim()) return;
+    if (!activeMailbox?.id || !newFolderName.trim()) return;
 
     setAddingFolder(true);
     setFolderError(null);
@@ -233,7 +236,7 @@ export function DashboardNav({ className }: { className?: string }) {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          mailboxId: selectedMailbox.id,
+          mailboxId: activeMailbox.id,
           name: newFolderName,
           color: newFolderColor,
         }),
@@ -278,7 +281,7 @@ export function DashboardNav({ className }: { className?: string }) {
       {minimal && <hr className="mx-6 my-2 border-neutral-200/70" />}
       {!minimal && (
         <NavSectionHeader label={t("navigation.folders")} open={foldersSectionOpen} onToggle={toggleFoldersSection}>
-          {selectedMailbox && (
+          {activeMailbox && (
             <Dialog open={folderDialogOpen} onOpenChange={(open) => { setFolderDialogOpen(open); if (!open) setFolderError(null); }}>
               <DialogTrigger asChild>
                 <button

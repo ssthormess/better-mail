@@ -5,7 +5,7 @@ import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Folder, Forward, Plus, ShieldAlert, Trash2 } from "@/components/icons";
 import { useLanguage } from "@/components/language-provider";
-import { useSelectedMailbox } from "@/components/mailbox-provider";
+import { useActiveMailbox } from "@/components/use-active-mailbox";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import {
@@ -38,7 +38,8 @@ import {
 export function InboxRules() {
   const { t } = useLanguage();
   const queryClient = useQueryClient();
-  const { selectedMailbox } = useSelectedMailbox();
+  // Rules belong to one mailbox; in unified mode that is the primary.
+  const selectedMailbox = useActiveMailbox();
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editingRule, setEditingRule] = useState<InboxRule | null>(null);
   const [matchField, setMatchField] = useState<InboxRule["matchField"]>(

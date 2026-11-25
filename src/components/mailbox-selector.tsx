@@ -9,6 +9,7 @@ import { useDismissible } from "@/components/use-dismissible";
 import { AppsMenu } from "@/components/apps-menu";
 import { useLanguage } from "@/components/language-provider";
 import { useSelectedMailbox } from "@/components/mailbox-provider";
+import { useUnifiedInbox } from "@/components/use-active-mailbox";
 import { ProgressiveAvatarImage } from "@/components/progressive-avatar-image";
 import { isIdentityMailbox } from "@/components/mailbox-provider-utils";
 import { useMessageCounts } from "@/hooks/use-message-counts";
@@ -103,6 +104,20 @@ function AccountAvatar({
 	);
 }
 
+/** The "All mailboxes" identity: a dark tile, so it never reads as one mailbox avatar. */
+function AllMailboxesAvatar({ size = "small" }: { size?: "small" | "large" }) {
+	const sizeClass = size === "large" ? "h-16 w-16" : "h-10 w-10";
+	const iconClass = size === "large" ? "h-7 w-7" : "h-5 w-5";
+	return (
+		<div
+			className={`${sizeClass} flex shrink-0 items-center justify-center rounded-full bg-neutral-900 text-white`}
+			aria-hidden="true"
+		>
+			<UsersRound className={iconClass} />
+		</div>
+	);
+}
+
 function MailboxAccountRow({ mailbox, unread, avatarUrl, onSelect }: MailboxAccountRowProps) {
 	const { t } = useLanguage();
 	const name = getMailboxName(mailbox);
@@ -144,6 +159,7 @@ function MailboxAccountRow({ mailbox, unread, avatarUrl, onSelect }: MailboxAcco
 export function MailboxSelector({ initialUser }: MailboxSelectorProps = {}) {
 	const { t } = useLanguage();
 	const { selectedMailbox, setSelectedMailbox, mailboxes, isLoading } = useSelectedMailbox();
+	const isUnified = useUnifiedInbox();
 	const pathname = usePathname();
 	const router = useRouter();
 	const [open, setOpen] = useState(false);
@@ -237,8 +253,18 @@ export function MailboxSelector({ initialUser }: MailboxSelectorProps = {}) {
 		return <Skeleton className="h-10 w-10 rounded-full" />;
 	}
 
-	const selectedName = selectedMailbox ? getMailboxName(selectedMailbox) : user?.name ?? t("account.fallbackName");
-	const selectedEmail = selectedMailbox ? getMailboxAddress(selectedMailbox) : user?.email ?? "";
+	const selectedName = selectedMailbox
+		? getMailboxName(selectedMailbox)
+		: isUnified
+			? t("account.allMailboxes")
+			: user?.name ?? t("account.fallbackName");
+	const selectedEmail = selectedMailbox
+		? getMailboxAddress(selectedMailbox)
+		: isUnified
+			? t("account.inboxes", { count: mailboxes.length })
+			: user?.email ?? "";
+	// One mailbox makes unified mode the same list with no row to tell apart, so we never offer it.
+	const canSelectAllMailboxes = mailboxes.length > 1;
 	const selectedMailboxAvatarUrl = selectedMailbox
 		? mailboxAvatarUrls[selectedMailbox.id]
 		: undefined;
@@ -280,7 +306,9 @@ export function MailboxSelector({ initialUser }: MailboxSelectorProps = {}) {
 		router.refresh();
 	}
 
-	const triggerAvatar = (
+	const triggerAvatar = isUnified ? (
+		<AllMailboxesAvatar />
+	) : (
 		<AccountAvatar
 			name={selectedName}
 			colorSeed={selectedEmail || selectedName}
@@ -320,22 +348,43 @@ export function MailboxSelector({ initialUser }: MailboxSelectorProps = {}) {
 			{open && (
 				<div className="absolute right-0 top-14 w-[360px] overflow-hidden rounded-[28px] border border-neutral-200 bg-[#eef3fb] p-3 shadow-2xl shadow-neutral-900/20 max-h-[82vh] overflow-y-auto z-90">
 					<div className="rounded-[22px] bg-white px-2 py-2">
+						{canSelectAllMailboxes && !isUnified && (
+							<button
+								type="button"
+								onClick={() => {
+									setSelectedMailbox(null);
+									setOpen(false);
+									router.push("/inbox");
+								}}
+								className="mb-1 flex w-full items-center gap-4 rounded-2xl bg-blue-50 px-3 py-2.5 text-left ring-1 ring-inset ring-blue-100 transition-colors hover:bg-blue-100 active:bg-blue-100"
+							>
+								<AllMailboxesAvatar />
+								<span className="min-w-0 flex-1">
+									<span className="block truncate text-sm font-semibold text-neutral-900">{t("account.allMailboxes")}</span>
+									<span className="block truncate text-xs text-neutral-500">{t("account.inboxes", { count: mailboxes.length })}</span>
+								</span>
+							</button>
+						)}
 						<Link
 							href="/inbox"
 							onClick={() => setOpen(false)}
 							className="flex items-center gap-4 rounded-2xl px-3 py-3 transition-colors hover:bg-blue-50 active:bg-blue-50"
 						>
-							<AccountAvatar
-								name={selectedName}
-								colorSeed={selectedEmail || selectedName}
-								hasAvatar={selectedHasAvatar}
-								avatarUrl={selectedAvatarUrl}
-								size="large"
-								placeholder={identityPending}
-								onAvatarError={() => {
-									if (!selectedMailbox) setHasAvatar(false);
-								}}
-							/>
+							{isUnified ? (
+								<AllMailboxesAvatar size="large" />
+							) : (
+								<AccountAvatar
+									name={selectedName}
+									colorSeed={selectedEmail || selectedName}
+									hasAvatar={selectedHasAvatar}
+									avatarUrl={selectedAvatarUrl}
+									size="large"
+									placeholder={identityPending}
+									onAvatarError={() => {
+										if (!selectedMailbox) setHasAvatar(false);
+									}}
+								/>
+							)}
 							<div className="min-w-0 flex-1">
 								<div className="flex items-center gap-2">
 									<p className="truncate text-lg font-semibold text-neutral-900">{selectedName}</p>

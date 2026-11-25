@@ -22,7 +22,7 @@ import type { TranslationKey } from "@/lib/i18n/types";
 import type { CalendarRepeat } from "@/lib/calendar/types";
 import { useLanguage } from "@/components/language-provider";
 import { folderColorKeys } from "@/lib/folders/color-keys";
-import { useSelectedMailbox } from "@/components/mailbox-provider";
+import { useActiveMailbox } from "@/components/use-active-mailbox";
 import { useSidebar } from "@/components/sidebar-state";
 import { UpcomingSidebar } from "../upcoming-sidebar";
 import { DayEvents } from "./day-events";
@@ -126,7 +126,8 @@ export default function CalendarPage() {
   const [pendingAction, setPendingAction] = useState<"save" | string | null>(null);
   const router = useRouter();
   const eventFromUrl = useSearchParams().get("event");
-  const { selectedMailbox } = useSelectedMailbox();
+  // Calendar events are created as one mailbox; in unified mode that is the primary.
+  const selectedMailbox = useActiveMailbox();
   const { minimal: sidebarMinimal, mobile } = useSidebar();
   const minimal = sidebarMinimal || mobile;
 

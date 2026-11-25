@@ -421,6 +421,7 @@
 	"account.calendar": "Takvim",
 	"account.settings": "Ayarlar",
 	"account.inboxes": "Gelen kutuları ({count})",
+	"account.allMailboxes": "Tüm posta kutuları",
 	"account.otherAccounts": "Diğer hesaplar",
 	"account.admin": "Yönetici",
 	"account.addAnother": "Başka bir hesap ekle",

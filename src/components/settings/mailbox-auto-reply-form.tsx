@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { useLanguage } from "@/components/language-provider";
 import { useSelectedMailbox } from "@/components/mailbox-provider";
+import { useActiveMailbox } from "@/components/use-active-mailbox";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
@@ -14,8 +15,9 @@ import { Switch } from "../ui/switch";
 
 export function MailboxAutoReplyForm() {
   const { t } = useLanguage();
-  const { selectedMailbox, setSelectedMailbox, isLoading } =
-    useSelectedMailbox();
+  // Auto-reply is per mailbox; in unified mode the form edits the primary.
+  const { setSelectedMailbox, isLoading } = useSelectedMailbox();
+  const selectedMailbox = useActiveMailbox();
   const mailboxSettings: MailboxAutoReplySettings = {
     enabled: selectedMailbox?.autoReplyEnabled ?? false,
     subject: selectedMailbox?.autoReplySubject ?? "Out of office",

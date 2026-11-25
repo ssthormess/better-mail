@@ -5,6 +5,7 @@ import QRCode from "qrcode";
 import { Copy, KeyRound } from "@/components/icons";
 import { useLanguage } from "@/components/language-provider";
 import { useSelectedMailbox } from "@/components/mailbox-provider";
+import { useActiveMailbox } from "@/components/use-active-mailbox";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { confirmDestructive } from "@/components/ui/confirm-dialog";
@@ -33,7 +34,9 @@ type Created = CreatedAppPassword & { username: string };
  */
 export function AppPasswordsSettings() {
 	const { t } = useLanguage();
-	const { mailboxes, selectedMailbox, isLoading } = useSelectedMailbox();
+	// App passwords are scoped to mailboxes; the default scope follows the active one.
+	const { mailboxes, isLoading } = useSelectedMailbox();
+	const selectedMailbox = useActiveMailbox();
 	const { status } = useSecurityStatus();
 	const [list, setList] = useState<AppPasswordList | null>(null);
 	const [loadFailed, setLoadFailed] = useState(false);

@@ -430,6 +430,7 @@
 	"account.calendar": "Kalender",
 	"account.settings": "Einstellungen",
 	"account.inboxes": "Postfächer ({count})",
+	"account.allMailboxes": "Alle Postfächer",
 	"account.otherAccounts": "Weitere Konten",
 	"account.admin": "Administration",
 	"account.addAnother": "Weiteres Konto hinzufügen",

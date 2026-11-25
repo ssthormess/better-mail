@@ -425,6 +425,7 @@
 	"account.calendar": "Kalender",
 	"account.settings": "Pengaturan",
 	"account.inboxes": "Kotak masuk ({count})",
+	"account.allMailboxes": "Semua kotak surat",
 	"account.otherAccounts": "Akun lainnya",
 	"account.admin": "Admin",
 	"account.addAnother": "Tambahkan akun lain",

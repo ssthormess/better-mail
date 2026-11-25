@@ -21,6 +21,7 @@ import { Switch } from "@/components/ui/switch";
 import { Tooltip } from "@/components/ui/tooltip";
 import { CardGridSkeleton } from "@/components/page-skeletons";
 import { useSelectedMailbox } from "@/components/mailbox-provider";
+import { useActiveMailbox } from "@/components/use-active-mailbox";
 import { useCurrentUser } from "@/hooks/use-current-user";
 import { canManageDomains } from "@/lib/auth/admin";
 import { ClientRequestError } from "@/lib/http/client-error";
@@ -51,7 +52,9 @@ const ACTION_ICONS = {
 export function DomainRouting({ domain }: DomainRoutingProps = {}) {
 	const { t } = useLanguage();
 	const qc = useQueryClient();
-	const { selectedMailbox, isLoading: isMailboxLoading } = useSelectedMailbox();
+	// Routing is shown for one mailbox's domain; in unified mode that is the primary.
+	const { isLoading: isMailboxLoading } = useSelectedMailbox();
+	const selectedMailbox = useActiveMailbox();
 	const currentUser = useCurrentUser();
 	const [dialogOpen, setDialogOpen] = useState(false);
 	const [editing, setEditing] = useState<DomainRule | null>(null);

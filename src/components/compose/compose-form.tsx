@@ -11,6 +11,7 @@ import { Label } from "@/components/ui/label";
 import { Select } from "@/components/ui/select";
 import { Tooltip } from "@/components/ui/tooltip";
 import { useSelectedMailbox } from "@/components/mailbox-provider";
+import { useActiveMailbox } from "@/components/use-active-mailbox";
 import { authFetch } from "@/lib/auth/client";
 import { formatEmailAddress, getEmailAddress } from "@/lib/email/address";
 import { clearMessageDetailCache } from "@/lib/messages/detail-cache";
@@ -60,7 +61,9 @@ export function ComposeForm({
 	const { t } = useLanguage();
 	const router = useRouter();
 	const { showNotice, openDraftComposer, isCurrentNotice } = useCompose();
-	const { selectedMailbox, setSelectedMailbox, mailboxes } = useSelectedMailbox();
+	// Compose always acts as one concrete mailbox; in unified mode that is the primary.
+	const { setSelectedMailbox, mailboxes } = useSelectedMailbox();
+	const selectedMailbox = useActiveMailbox();
 	const [draftId, setDraftId] = useState<string | null>(null);
 	const [saveFailed, setSaveFailed] = useState(false);
 	const [agentRevision, setAgentRevision] = useState<number | null>(null);

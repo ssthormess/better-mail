@@ -9,6 +9,7 @@ import { useLanguage } from "@/components/language-provider";
 import { formatUserDate } from "@/lib/time/utils";
 import { markMessageRead } from "@/components/mark-read";
 import { useSelectedMailbox } from "@/components/mailbox-provider";
+import { useActiveMailbox } from "@/components/use-active-mailbox";
 import { ContactDetailsTrigger } from "@/components/contacts/contact-details";
 import { ContactAvatar } from "@/components/contacts/contact-avatar";
 import { MessageActions } from "@/components/message-actions/message-actions";
@@ -72,7 +73,8 @@ export default function MessageDetailPage() {
 
 function MessageDetailContent({ messageId }: { messageId: string }) {
   const { t } = useLanguage();
-  const { selectedMailbox, mailboxes } = useSelectedMailbox();
+  const { mailboxes } = useSelectedMailbox();
+  const activeMailbox = useActiveMailbox();
   const [data, setData] = useState<MessageDetailResponse | null>(
     () => getCachedMessageDetailForDisplay(messageId) ?? null,
   );
@@ -238,7 +240,7 @@ function MessageDetailContent({ messageId }: { messageId: string }) {
   const attachments = data?.attachments ?? EMPTY_ATTACHMENTS;
   const scheduledAt = data?.scheduledAt;
   const messageMailbox =
-    mailboxes.find((mailbox) => mailbox.id === message?.mailboxId) ?? selectedMailbox;
+    mailboxes.find((mailbox) => mailbox.id === message?.mailboxId) ?? activeMailbox;
   const currentAccountName =
     messageMailbox?.displayName ?? messageMailbox?.localPart;
   const headerParties = message

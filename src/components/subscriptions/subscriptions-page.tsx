@@ -5,6 +5,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChevronLeft, ChevronRight } from "@/components/icons";
 import { useLanguage } from "@/components/language-provider";
 import { useSelectedMailbox } from "@/components/mailbox-provider";
+import { useActiveMailbox } from "@/components/use-active-mailbox";
 import { getMailboxAddress } from "@/components/messages/utils";
 import { blockMessageContact, openUnsubscribeUrl } from "@/components/message-actions/utils";
 import { requestUnsubscribe } from "@/components/messages/unsubscribe-button-utils";
@@ -38,7 +39,8 @@ const LOADING: ListState = { status: "loading", senders: [], total: 0 };
 
 export function SubscriptionsPage() {
 	const { t } = useLanguage();
-	const { mailboxes, selectedMailbox, isLoading: mailboxesLoading } = useSelectedMailbox();
+	const { mailboxes, isLoading: mailboxesLoading } = useSelectedMailbox();
+	const selectedMailbox = useActiveMailbox();
 	// A refetch after an action flips isLoading again; the list stays up, only the first load shows a skeleton.
 	// No mailbox id asks for every mailbox the user can read, which is what the picker needs.
 	const { counts, isLoading: countsLoading } = useMessageCounts(null);

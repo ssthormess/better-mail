@@ -12,6 +12,7 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Tooltip } from "@/components/ui/tooltip";
 import { useMailSearch } from "@/components/mail-search/mail-search-context";
 import { useSelectedMailbox } from "@/components/mailbox-provider";
+import { useUnifiedInbox } from "@/components/use-active-mailbox";
 import { usePageLoading } from "@/components/page-loading";
 import { formatScheduledSendTime } from "./scheduled-send-utils";
 import { useHasHover, useIsDesktop, useIsMobile } from "@/components/sidebar-mobile-utils";
@@ -32,6 +33,7 @@ import { rememberOpenedUnreadMessage } from "./message-detail-navigation-utils";
 import { useConversationView } from "./use-conversation-view";
 import { OpenedIndicator } from "./message-open-status";
 import { MessageNotesPopover, NoteBadge } from "./message-notes-popover";
+import { MessageRowMailboxBadge } from "./message-row-mailbox-badge";
 import type { MessageFolderConfig, MessageFolderPageProps, MessageListRowProps, RowMessageAction } from "./types";
 import {
 	formatMessageListTimestamp,
@@ -112,6 +114,7 @@ function MessageListRowComponent({
 	opening = false,
 	compact = false,
 	currentAccountName,
+	rowMailbox,
 	onSelectedChange,
 	onMessageAction,
 	onOpening,
@@ -142,6 +145,8 @@ function MessageListRowComponent({
 	const unread = isMessageListRowUnread(rowMessage);
 	const draggable = config.folder === "inbox" && message.direction === "inbound";
 	const party = getMessageParty(rowMessage, config.folder, currentAccountName, t);
+	// Unified mode lists every mailbox, so each row says which one it came from.
+	const mailboxBadge = <MessageRowMailboxBadge mailbox={rowMailbox} />;
 	const preview = getMessagePreview(rowMessage, config.folder, t);
 	const href = `${config.hrefPrefix}/${message.id}`;
 	const navigation = useMessageNavigation(href, rowMessage);
@@ -242,6 +247,7 @@ function MessageListRowComponent({
 						<span className={clsx(unread && "font-semibold",getMessagePartyClassName(rowMessage, config.folder))}>
 							{unread && <span className="sr-only">{t("list.unread")} </span>}
 							{party}
+							{mailboxBadge}
 
 							{(message.threadCount ?? 1) > 1 && (
 								<span className="ml-2 text-xs font-normal text-neutral-500">{message.threadCount}</span>
@@ -329,6 +335,7 @@ function MessageListRowComponent({
 			<span className={clsx(unread && "font-semibold", getMessagePartyClassName(rowMessage, config.folder))}>
 				{unread && <span className="sr-only">{t("list.unread")} </span>}
 				{party}
+				{mailboxBadge}
 
 				{(message.threadCount ?? 1) > 1 && (
 					<span className="ml-2 text-xs text-neutral-500">{message.threadCount}</span>
@@ -423,7 +430,8 @@ export function MessageFolderPage({
 }: MessageFolderPageProps) {
 	const { t } = useLanguage();
 	const title = config.titleKey ? t(config.titleKey) : config.title;
-	const { selectedMailbox, isLoading: mailboxesLoading } = useSelectedMailbox();
+	const { selectedMailbox, isLoading: mailboxesLoading, mailboxes: accessibleMailboxes } = useSelectedMailbox();
+	const isUnified = useUnifiedInbox();
 	const { query } = useMailSearch();
 	const router = useRouter();
 	const isMobile = useIsMobile();
@@ -477,7 +485,11 @@ export function MessageFolderPage({
 		group: grouped ? "thread" : undefined,
 	}, !mailboxesLoading, config.folderId);
 	const { counts, isLoading: countsLoading } = useMessageCounts(selectedMailbox?.id, !mailboxesLoading);
-	const { mailboxes: accessibleMailboxes } = useSelectedMailbox();
+	// Only unified mode needs to resolve each row's mailbox; one mailbox draws no badge.
+	const rowMailboxById = useMemo(
+		() => new Map(accessibleMailboxes.map((mailbox) => [mailbox.id, mailbox])),
+		[accessibleMailboxes],
+	);
 	const getPromotionMode = useCallback((message: Message): "show" | "separate" | undefined => counts.promotionModes?.[message.mailboxId ?? ""], [counts.promotionModes]);
 	// Only received mail in Inbox or Promotions moves between them, in mailboxes with Promotions on that the user manages.
 	const canMovePromotions = useCallback((message: Message) => (config.folder === "promotions" || (config.folder === "inbox" && !config.folderId)) && canMoveCategory({
@@ -781,7 +793,7 @@ export function MessageFolderPage({
 								</Button>
 							</Tooltip>
 						)}
-						{permanentDeleteFolder && (
+						{permanentDeleteFolder && !isUnified && (
 							<Tooltip label={getEmptyFolderLabel(permanentDeleteFolder, t)}>
 								<Button
 									type="button"
@@ -824,6 +836,7 @@ export function MessageFolderPage({
 							onOpening={markMessageOpening}
 							compact={compact || isMobile}
 							currentAccountName={currentAccountName}
+							rowMailbox={isUnified ? rowMailboxById.get(message.mailboxId ?? "") : undefined}
 							onSelectedChange={updateSelectedMessage}
 							onMessageAction={handleMessageAction}
 							onSnoozeChange={handleSnoozeChange}

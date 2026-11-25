@@ -5,7 +5,7 @@ import type { FormEvent } from "react";
 import { useEffect, useRef, useState } from "react";
 import { Upload } from "@/components/icons";
 import { useLanguage } from "@/components/language-provider";
-import { useSelectedMailbox } from "@/components/mailbox-provider";
+import { useActiveMailbox } from "@/components/use-active-mailbox";
 import { uploadContactAvatar } from "@/components/contacts/contact-avatar-form-utils";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -31,7 +31,8 @@ const TONE_CLASSES = {
 /** The contacts files found in the picked files: one row each, with the photo option, Import, Preview and the results. */
 export function TakeoutContactsCard({ sources }: TakeoutContactsCardProps) {
 	const { t } = useLanguage();
-	const { selectedMailbox } = useSelectedMailbox();
+	// The address book belongs to one mailbox; in unified mode that is the primary.
+	const selectedMailbox = useActiveMailbox();
 	const user = useCurrentUser();
 	// A delegate of a shared mailbox gets 404 from the import route, so the buttons are off for them.
 	const ownsBook = isAddressBookOwner(selectedMailbox, user?.id);

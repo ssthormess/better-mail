@@ -5,6 +5,7 @@ import { Check, ChevronDown, UsersRound } from "@/components/icons";
 import { useDismissible } from "@/components/use-dismissible";
 import { useLanguage } from "@/components/language-provider";
 import { useSelectedMailbox, type MailboxOption } from "@/components/mailbox-provider";
+import { useActiveMailbox } from "@/components/use-active-mailbox";
 import { ProgressiveAvatarImage } from "@/components/progressive-avatar-image";
 import { getAccountInitial, getMailboxAddress, getMailboxName } from "@/components/mailbox-selector-utils";
 import { getAvatarColorStyle } from "@/lib/avatar-colors";
@@ -57,7 +58,9 @@ function InboxLabel({ mailbox }: { mailbox: MailboxOption }) {
 
 export function InboxSwitcher() {
 	const { t } = useLanguage();
-	const { selectedMailbox, setSelectedMailbox, mailboxes } = useSelectedMailbox();
+	// The switcher edits one mailbox at a time; in unified mode it shows the primary.
+	const { setSelectedMailbox, mailboxes } = useSelectedMailbox();
+	const selectedMailbox = useActiveMailbox();
 	const [open, setOpen] = useState(false);
 	const ref = useRef<HTMLDivElement>(null);
 

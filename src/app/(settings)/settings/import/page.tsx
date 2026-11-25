@@ -5,7 +5,7 @@ import { useMemo, useState } from "react";
 import { Folder, Server, Upload } from "@/components/icons";
 import { useLanguage } from "@/components/language-provider";
 import type { TranslationKey } from "@/lib/i18n/types";
-import { useSelectedMailbox } from "@/components/mailbox-provider";
+import { useActiveMailbox } from "@/components/use-active-mailbox";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
@@ -68,7 +68,8 @@ export default function SettingsImportPage() {
   const { t } = useLanguage();
   // System sections are translated; folders discovered on the source keep their own names.
   const sourceLabel = (source: ImportSourceItem) => source.sourceSection ? t(SECTION_LABEL_KEYS[source.sourceSection]) : source.label;
-  const { selectedMailbox } = useSelectedMailbox();
+  // Imports land in one mailbox; in unified mode that is the primary.
+  const selectedMailbox = useActiveMailbox();
   const [activeTab, setActiveTab] = useState<ImportTab>("file");
   const [selectedSections, setSelectedSections] =
     useState<ImportSourceSection[]>(defaultSections);
