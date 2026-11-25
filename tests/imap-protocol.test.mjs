@@ -9,10 +9,10 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const outDir = mkdtempSync(join(root, "tests", ".tmp-imap-protocol-"));
 after(() => rmSync(outDir, { recursive: true, force: true }));
 await build({
-	stdin: { contents: 'export { parseImapCommand, dispatchImapCommand, loginResult, quoteImapLiteral } from "./server/runtime/imap-protocol.ts";', resolveDir: root, sourcefile: "imap-entry.ts" },
+	stdin: { contents: 'export { parseImapCommand, dispatchImapCommand, loginResult, quoteImapLiteral, encodeModifiedUtf7, decodeModifiedUtf7 } from "./server/runtime/imap-protocol.ts";', resolveDir: root, sourcefile: "imap-entry.ts" },
 	outfile: join(outDir, "entry.mjs"), bundle: true, platform: "node", format: "esm", target: "node22", tsconfig: join(root, "tsconfig.json"), logLevel: "silent",
 });
-const { parseImapCommand, dispatchImapCommand, loginResult, quoteImapLiteral } = await import(pathToFileURL(join(outDir, "entry.mjs")).href);
+const { parseImapCommand, dispatchImapCommand, loginResult, quoteImapLiteral, encodeModifiedUtf7, decodeModifiedUtf7 } = await import(pathToFileURL(join(outDir, "entry.mjs")).href);
 
 test("parses tagged commands and quoted arguments with escaped quotes", () => {
 	assert.deepEqual(parseImapCommand('A1 LOGIN "alice@example.test" "p\\\"ass"'), { tag: "A1", verb: "LOGIN", args: ["alice@example.test", 'p"ass'] });
@@ -43,4 +43,41 @@ test("LOGIN transitions state only after successful app-password authentication"
 	assert.deepEqual(loginResult("A", true), { response: "A OK LOGIN completed\r\n", state: "authenticated" });
 	assert.deepEqual(loginResult("A", false), { response: "A NO Authentication failed\r\n" });
 	assert.match((await dispatchImapCommand("authenticated", parseImapCommand("B LOGIN user pass"))).response, /B BAD/);
+});
+
+/**
+ * RFC 3501 §5.1.3 modified UTF-7. The vectors are the RFC's own examples (`~peter/mail/`
+ * folders, "Entwürfe") plus the cases the codec must not corrupt: a literal `&`, a
+ * surrogate pair and a control character.
+ */
+test("modified UTF-7 encodes and decodes mailbox names", () => {
+	assert.equal(encodeModifiedUtf7("INBOX"), "INBOX");
+	assert.equal(encodeModifiedUtf7("My Folder"), "My Folder");
+	assert.equal(encodeModifiedUtf7("Entwürfe"), "Entw&APw-rfe");
+	assert.equal(encodeModifiedUtf7("日本語"), "&ZeVnLIqe-");
+	assert.equal(encodeModifiedUtf7("A&B"), "A&-B");
+	assert.equal(encodeModifiedUtf7("&"), "&-");
+	assert.equal(encodeModifiedUtf7("a😀b"), "a&2D3eAA-b");
+	assert.equal(decodeModifiedUtf7("&-"), "&");
+	assert.equal(decodeModifiedUtf7("Entw&APw-rfe"), "Entwürfe");
+	assert.equal(decodeModifiedUtf7("&ZeVnLIqe-"), "日本語");
+	assert.equal(decodeModifiedUtf7("A&-B"), "A&B");
+	assert.equal(decodeModifiedUtf7("a&2D3eAA-b"), "a😀b");
+	// ASCII names must not move, which is what keeps every earlier LIST/SELECT reply identical.
+	for (const name of ["INBOX", "Sent", "My Folder", "sales@example.test/Leads", "mbx1~f~fld1"]) {
+		assert.equal(encodeModifiedUtf7(name), name);
+		assert.equal(decodeModifiedUtf7(name), name);
+	}
+	for (const name of ["Entwürfe", "日本語", "A&B", "&", "a😀b", "line\nbreak", "&AMQ-", "Grüße/Ärger"]) {
+		assert.equal(decodeModifiedUtf7(encodeModifiedUtf7(name)), name, name);
+	}
+});
+
+test("modified UTF-7 refuses sequences it cannot decode instead of inventing characters", () => {
+	assert.equal(decodeModifiedUtf7("&"), null);
+	assert.equal(decodeModifiedUtf7("Entw&APw"), null);
+	assert.equal(decodeModifiedUtf7("&A-"), null);
+	assert.equal(decodeModifiedUtf7("&A!A-"), null);
+	assert.equal(decodeModifiedUtf7("&AAA-"), null);
+	assert.equal(decodeModifiedUtf7("&/w-"), null);
 });

@@ -1,6 +1,6 @@
 import { encodeMailboxRef, SYSTEM_ROLES } from "@/lib/jmap/ids";
 import type { SystemRole } from "@/lib/jmap/types";
-import { IMAP_DELIMITER, type ImapMailboxEntry } from "./imap-protocol";
+import { IMAP_DELIMITER, type ImapFolderTarget, type ImapMailboxEntry } from "./imap-protocol";
 
 /**
  * Display name per system role. JMAP calls the junk role "Spam", but IMAP's
@@ -70,4 +70,65 @@ export function planImapMailboxEntries(
 		}
 	}
 	return entries;
+}
+
+/**
+ * What a CREATE/DELETE/RENAME name means. Resolution is the inverse of
+ * `planImapMailboxEntries`: a bare name lands in the primary mailbox, `addr/Name` in that
+ * address's mailbox, and a name that matches no namespace is refused exactly like SELECT
+ * refuses it, so an inaccessible mailbox stays indistinguishable from a nonexistent one.
+ *
+ * Folders are flat. The only delimiter use is the `addr/` namespace prefix, so a second
+ * delimiter (`addr/A/B`) addresses a parent that does not exist and is refused rather than
+ * implying nesting.
+ */
+export type ImapFolderTargetResolution =
+	| { kind: "invalid"; message: string }
+	| { kind: "role"; entry: ImapMailboxEntry }
+	| { kind: "parent"; entry: ImapMailboxEntry }
+	| { kind: "folder"; entry: ImapMailboxEntry; target: ImapFolderTarget }
+	| { kind: "new"; target: ImapFolderTarget };
+
+/** The same 80-character cap REST and JMAP enforce on a folder name. */
+const MAX_FOLDER_NAME_LENGTH = 80;
+
+export function resolveImapFolderTarget(entries: ImapMailboxEntry[], value: string): ImapFolderTargetResolution {
+	const wanted = value.trim();
+	if (!wanted) return { kind: "invalid", message: "Empty mailbox name" };
+	const lower = wanted.toLowerCase();
+	// Names are unique case-insensitively in the catalogue (role names win), so one predicate covers
+	// role mailboxes, `addr/` parents and existing folders alike.
+	const exact = entries.find((entry) => entry.name.toLowerCase() === lower);
+	if (exact) {
+		if (!exact.selectable) return { kind: "parent", entry: exact };
+		if (exact.role) return { kind: "role", entry: exact };
+		return {
+			kind: "folder",
+			entry: exact,
+			target: {
+				mailboxId: exact.mailboxId,
+				folderId: exact.folderId ?? undefined,
+				name: exact.name.slice(exact.name.lastIndexOf(IMAP_DELIMITER) + 1),
+				imapName: exact.name,
+			},
+		};
+	}
+	const slash = wanted.lastIndexOf(IMAP_DELIMITER);
+	if (slash < 0) {
+		// Bare names exist only when the account has a primary mailbox; otherwise every name is namespaced.
+		const bareMailboxId = entries.find((entry) => entry.name === "INBOX")?.mailboxId;
+		if (!bareMailboxId) return { kind: "invalid", message: "No such mailbox" };
+		return newFolderTarget(bareMailboxId, wanted, wanted);
+	}
+	const prefix = wanted.slice(0, slash);
+	const name = wanted.slice(slash + 1);
+	const parent = entries.find((entry) => !entry.selectable && entry.name.toLowerCase() === prefix.toLowerCase());
+	if (!parent) return { kind: "invalid", message: "No such mailbox" };
+	if (!name) return { kind: "invalid", message: "Empty mailbox name" };
+	return newFolderTarget(parent.mailboxId, name, wanted);
+}
+
+function newFolderTarget(mailboxId: string, name: string, imapName: string): ImapFolderTargetResolution {
+	if (name.length > MAX_FOLDER_NAME_LENGTH) return { kind: "invalid", message: "Mailbox name is too long" };
+	return { kind: "new", target: { mailboxId, name, imapName } };
 }

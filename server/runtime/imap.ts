@@ -33,7 +33,8 @@ export function startImapListener(env: CloudflareEnv, options: ImapOptions) {
 		let pendingLiteralNonSynchronizing = false;
 		const session: ImapSession = asImapSession("not-authenticated");
 		let auth: ApiAuthResult | null = null;
-		// One backend per login, so LIST answers from a catalogue the later SELECTs share.
+		// One backend per login. It reads the catalogue fresh on every call, so a folder written
+		// through CREATE (or another session) is visible to the next LIST without a reconnect.
 		let backend: ImapMailboxBackend | null = null;
 
 		let commandQueue = Promise.resolve();

@@ -24,8 +24,9 @@ await build({
 	imapUidValidity,
 	formatImapName,
 	formatImapListEntry,
+	encodeModifiedUtf7,
 } from "./server/runtime/imap-protocol.ts";
-export { planImapMailboxEntries } from "./server/runtime/imap-mailboxes.ts";`,
+export { planImapMailboxEntries, resolveImapFolderTarget } from "./server/runtime/imap-mailboxes.ts";`,
 		resolveDir: root,
 		sourcefile: "imap-mailboxes-entry.ts",
 	},
@@ -51,7 +52,9 @@ const {
 	imapUidValidity,
 	formatImapName,
 	formatImapListEntry,
+	encodeModifiedUtf7,
 	planImapMailboxEntries,
+	resolveImapFolderTarget,
 } = await import(pathToFileURL(join(outDir, "entry.mjs")).href);
 
 const PRIMARY = { id: "mbx1", localPart: "alice", hostname: "example.test", isPrimary: true };
@@ -87,6 +90,7 @@ const backend = {
 };
 const session = { state: "authenticated", selected: null };
 const run = (line, state = session) => dispatchImapCommand(state, parseImapCommand(line), backend);
+const runOn = (client, line, state = session) => dispatchImapCommand(state, parseImapCommand(line), client);
 const verbLines = (verb, response) => response.split("\r\n").filter((line) => line.startsWith(`* ${verb}`));
 const listLines = (response) => verbLines("LIST", response);
 
@@ -351,4 +355,215 @@ test("patterns, names and UIDVALIDITY behave the way the replies above rely on",
 	assert.equal(resolveImapMailbox(entries, "sales@example.test/INBOX").mailboxId, "mbx2");
 	assert.equal(resolveImapMailbox(entries, "sales@example.test"), null);
 	assert.equal(resolveImapMailbox(entries, ""), null);
+});
+
+/**
+ * A backend over a mutable folder store, so it behaves like the database one where it matters
+ * here: `list` is rebuilt per call, so a folder created through CREATE shows up in the next LIST.
+ * `denied` stands in for the authz gate (a read-only grant) without touching the protocol.
+ */
+function writableBackend() {
+	const store = new Map([
+		["mbx1", [{ id: "fld1", name: "Receipts" }, { id: "fld2", name: "My Folder" }]],
+		["mbx2", [{ id: "fld3", name: "Leads" }]],
+	]);
+	const state = { denied: false, writes: [], sequence: 3 };
+	const client = {
+		list: async () => planImapMailboxEntries([SECONDARY, PRIMARY], store),
+		counts: async () => ({ messages: 0, unseen: 0 }),
+		messages: async () => [],
+		createFolder: async (target) => {
+			state.writes.push({ verb: "create", target });
+			if (state.denied) return "denied";
+			const rows = store.get(target.mailboxId);
+			if (rows.some((folder) => folder.name.toLowerCase() === target.name.toLowerCase())) return "exists";
+			rows.push({ id: `fld${++state.sequence}`, name: target.name });
+			return "ok";
+		},
+		deleteFolder: async (target) => {
+			state.writes.push({ verb: "delete", target });
+			if (state.denied) return "denied";
+			const rows = store.get(target.mailboxId);
+			const index = rows.findIndex((folder) => folder.id === target.folderId);
+			if (index < 0) return "missing";
+			rows.splice(index, 1);
+			return "ok";
+		},
+		renameFolder: async (target, name) => {
+			state.writes.push({ verb: "rename", target, name });
+			if (state.denied) return "denied";
+			const rows = store.get(target.mailboxId);
+			const row = rows.find((folder) => folder.id === target.folderId);
+			if (!row) return "missing";
+			row.name = name;
+			return "ok";
+		},
+	};
+	return { client, store, state };
+}
+
+test("CREATE adds a folder to its mailbox namespace and the next LIST sees it", async () => {
+	const { client } = writableBackend();
+	const created = await runOn(client, "A CREATE Reports");
+	assert.equal(created.response, "A OK CREATE completed\r\n");
+	// RFC 3501 permits but does not require an untagged LIST here; this bridge leaves it to the client's own LIST.
+	assert.equal(created.response.startsWith("* "), false);
+	assert.ok(listLines((await runOn(client, 'A LIST "" "*"')).response).includes('* LIST (\\HasNoChildren) "/" Reports'));
+	// The new folder is selectable straight away, because LIST and SELECT read the same fresh catalogue.
+	assert.match((await runOn(client, "B SELECT Reports")).response, /B OK \[READ-ONLY\] SELECT completed/);
+	// A namespaced name creates the folder in that mailbox, not in the primary one.
+	assert.equal((await runOn(client, 'A CREATE "sales@example.test/Leads 2024"')).response, "A OK CREATE completed\r\n");
+	const all = listLines((await runOn(client, 'A LIST "" "*"')).response);
+	assert.ok(all.includes('* LIST (\\HasNoChildren) "/" "sales@example.test/Leads 2024"'));
+	assert.equal(all.includes('* LIST (\\HasNoChildren) "/" "Leads 2024"'), false);
+});
+
+test("CREATE refuses reserved, existing and unusable names without touching the backend", async () => {
+	const { client, state } = writableBackend();
+	for (const line of ["A CREATE INBOX", "A CREATE inbox", "A CREATE Sent", "A CREATE Trash", "A CREATE Drafts", "A CREATE Archive", "A CREATE Junk"]) {
+		assert.equal((await runOn(client, line)).response, "A NO CREATE is not allowed on this mailbox\r\n", line);
+	}
+	// An address parent is a \Noselect namespace, not a folder.
+	assert.equal((await runOn(client, "A CREATE sales@example.test")).response, "A NO CREATE is not allowed on this mailbox\r\n");
+	// Names are unique case-insensitively, the way the catalogue de-duplicates them.
+	assert.equal((await runOn(client, "A CREATE Receipts")).response, "A NO Mailbox already exists\r\n");
+	assert.equal((await runOn(client, "A CREATE receipts")).response, "A NO Mailbox already exists\r\n");
+	// Folders are flat: the only delimiter use is the address prefix, so a deeper path names no mailbox.
+	assert.equal((await runOn(client, "A CREATE Foo/Bar")).response, "A NO No such mailbox\r\n");
+	assert.equal((await runOn(client, "A CREATE elsewhere@example.test/X")).response, "A NO No such mailbox\r\n");
+	assert.equal((await runOn(client, 'A CREATE "sales@example.test/"')).response, "A NO Empty mailbox name\r\n");
+	assert.equal((await runOn(client, 'A CREATE ""')).response, "A NO Empty mailbox name\r\n");
+	assert.equal((await runOn(client, `A CREATE ${"x".repeat(81)}`)).response, "A NO Mailbox name is too long\r\n");
+	assert.equal((await runOn(client, "A CREATE \u0026")).response, "A BAD CREATE mailbox name must be modified UTF-7\r\n");
+	assert.equal((await runOn(client, "A CREATE")).response, "A BAD CREATE needs one mailbox name\r\n");
+	assert.deepEqual(state.writes, []);
+});
+
+test("DELETE removes the row, and a deleted mailbox cannot stay selected", async () => {
+	const { client } = writableBackend();
+	const opened = await runOn(client, "A SELECT Receipts");
+	assert.equal(opened.state, "selected");
+	const deleted = await runOn(client, "B DELETE Receipts", opened);
+	assert.equal(deleted.response, "B OK DELETE completed\r\n");
+	// The selection pointed at a mailbox that no longer exists, so the session drops back instead of pretending.
+	assert.equal(deleted.state, "authenticated");
+	assert.equal(deleted.selected, null);
+	assert.equal(listLines((await runOn(client, 'A LIST "" "*"')).response).includes('* LIST (\\HasNoChildren) "/" Receipts'), false);
+	assert.equal((await runOn(client, "B DELETE Receipts")).response, "B NO No such mailbox\r\n");
+	// DELETE is legal in both states (RFC 3501 §6.3.4), so an unselected session may delete too.
+	assert.equal((await runOn(client, "C DELETE Leads")).response, "C NO No such mailbox\r\n");
+	assert.equal((await runOn(client, 'C DELETE "sales@example.test/Leads"')).response, "C OK DELETE completed\r\n");
+	for (const line of ["A DELETE INBOX", "A DELETE sales@example.test", "A DELETE Nope", "A DELETE Foo/Bar"]) {
+		assert.match((await runOn(client, line)).response, /^A NO (DELETE is not allowed on this mailbox|No such mailbox)\r\n$/, line);
+	}
+	assert.equal((await runOn(client, "A DELETE")).response, "A BAD DELETE needs one mailbox name\r\n");
+});
+
+test("RENAME renames in place and keeps the folder id message refs point at", async () => {
+	const { client } = writableBackend();
+	assert.equal((await runOn(client, "A RENAME Receipts Invoices")).response, "A OK RENAME completed\r\n");
+	const renamed = listLines((await runOn(client, 'A LIST "" "*"')).response);
+	assert.ok(renamed.includes('* LIST (\\HasNoChildren) "/" Invoices'));
+	assert.equal(renamed.includes('* LIST (\\HasNoChildren) "/" Receipts'), false);
+	// The id is unchanged, so a message filed in the folder still points at the renamed folder.
+	assert.equal((await runOn(client, "B SELECT Invoices")).selected.ref, "mbx1~f~fld1");
+	// Renaming the selected mailbox keeps the ref and only moves the reported name.
+	const opened = await runOn(client, "B SELECT Invoices");
+	const moved = await runOn(client, "C RENAME Invoices Statements", opened);
+	assert.equal(moved.response, "C OK RENAME completed\r\n");
+	assert.equal(moved.selected.name, "Statements");
+	assert.equal(moved.selected.ref, "mbx1~f~fld1");
+	// A same-name (or case-only) rename is a harmless no-op rather than an "already exists" refusal.
+	assert.equal((await runOn(client, "C RENAME Statements Statements")).response, "C OK RENAME completed\r\n");
+	assert.equal((await runOn(client, "C RENAME Statements statements")).response, "C OK RENAME completed\r\n");
+});
+
+test("RENAME refuses a taken name, a role name and a move to another mailbox", async () => {
+	const { client } = writableBackend();
+	assert.equal((await runOn(client, "A RENAME Receipts \"My Folder\"")).response, "A NO Mailbox already exists\r\n");
+	assert.equal((await runOn(client, "A RENAME Receipts Sent")).response, "A NO RENAME is not allowed on this mailbox\r\n");
+	assert.equal((await runOn(client, "A RENAME INBOX Anything")).response, "A NO RENAME is not allowed on this mailbox\r\n");
+	assert.equal((await runOn(client, "A RENAME sales@example.test Anything")).response, "A NO RENAME is not allowed on this mailbox\r\n");
+	// Folders belong to one mailbox; a cross-mailbox rename would strand the mailbox's messages on a foreign folder.
+	assert.equal((await runOn(client, "A RENAME Receipts \"sales@example.test/Reports\"")).response, "A NO RENAME cannot move a folder to another mailbox\r\n");
+	assert.equal((await runOn(client, "A RENAME Nope Anything")).response, "A NO No such mailbox\r\n");
+	assert.equal((await runOn(client, "A RENAME Receipts Foo/Bar")).response, "A NO No such mailbox\r\n");
+	assert.equal((await runOn(client, "A RENAME Receipts \"\"")).response, "A NO Empty mailbox name\r\n");
+	assert.equal((await runOn(client, "A RENAME Receipts")).response, "A BAD RENAME needs an old and a new mailbox name\r\n");
+	assert.equal((await runOn(client, "A RENAME Receipts Missing-&")).response, "A BAD RENAME mailbox names must be modified UTF-7\r\n");
+});
+
+test("a mailbox the account may only read refuses every folder write with the unknown-name NO", async () => {
+	const { client, store, state } = writableBackend();
+	state.denied = true;
+	for (const line of ["A CREATE Reports", "A DELETE Receipts", "A RENAME Receipts Invoices"]) {
+		assert.equal((await runOn(client, line)).response, "A NO No such mailbox\r\n", line);
+	}
+	// Identical to the answer for a name outside every namespace, so a read-only share cannot be probed for.
+	assert.equal((await runOn(client, "A CREATE elsewhere@example.test/X")).response, "A NO No such mailbox\r\n");
+	assert.deepEqual(store.get("mbx1").map((folder) => folder.name), ["Receipts", "My Folder"]);
+	// Nothing was attempted through the store: the three calls above are the only recorded writes.
+	assert.equal(state.writes.length, 3);
+});
+
+test("a backend verdict that slipped past the catalogue check still answers honestly", async () => {
+	// Another session creating the same name, or deleting the row, between the catalogue read and the write.
+	const stale = {
+		list: async () => entries,
+		counts: async () => ({ messages: 0, unseen: 0 }),
+		messages: async () => [],
+		createFolder: async () => "exists",
+		deleteFolder: async () => "missing",
+		renameFolder: async () => "missing",
+	};
+	assert.equal((await runOn(stale, 'A CREATE "New Folder"')).response, "A NO Mailbox already exists\r\n");
+	assert.equal((await runOn(stale, "A DELETE Receipts")).response, "A NO No such mailbox\r\n");
+	assert.equal((await runOn(stale, "A RENAME Receipts Invoices")).response, "A NO No such mailbox\r\n");
+	const taken = { ...stale, renameFolder: async () => "exists" };
+	assert.equal((await runOn(taken, "A RENAME Receipts Invoices")).response, "A NO Mailbox already exists\r\n");
+});
+
+test("non-ASCII names cross the wire in modified UTF-7 and come back unchanged", async () => {
+	const { client, store } = writableBackend();
+	// RFC 3501 §5.1.3: the client sends the encoded form for "Entwürfe".
+	assert.equal((await runOn(client, "A CREATE Entw&APw-rfe")).response, "A OK CREATE completed\r\n");
+	assert.equal(store.get("mbx1").at(-1).name, "Entwürfe");
+	assert.ok(listLines((await runOn(client, 'A LIST "" "*"')).response).includes('* LIST (\\HasNoChildren) "/" Entw&APw-rfe'));
+	// The encoded name the client just saw in LIST is what SELECT resolves.
+	assert.equal((await runOn(client, "B SELECT Entw&APw-rfe")).selected.name, "Entwürfe");
+	assert.equal((await runOn(client, "B STATUS Entw&APw-rfe (MESSAGES)")).response, '* STATUS Entw&APw-rfe (MESSAGES 0)\r\nB OK STATUS completed\r\n');
+	// A lenient client that sends raw UTF-8 is understood too, and sees the name already exists.
+	assert.equal((await runOn(client, "A CREATE Entwürfe")).response, "A NO Mailbox already exists\r\n");
+	// A "&" in a new name needs the "&-" escape to survive the round trip.
+	assert.equal((await runOn(client, "A CREATE Rock&-Roll")).response, "A OK CREATE completed\r\n");
+	assert.equal(store.get("mbx1").at(-1).name, "Rock&Roll");
+	assert.ok(listLines((await runOn(client, 'A LIST "" "*"')).response).includes('* LIST (\\HasNoChildren) "/" Rock&-Roll'));
+	assert.equal(formatImapName("Entwürfe"), "Entw&APw-rfe");
+	assert.equal(encodeModifiedUtf7("Entwürfe"), "Entw&APw-rfe");
+});
+
+test("folder names resolve to a mailbox and a folder name, or to a refusal", () => {
+	const resolve = (name) => resolveImapFolderTarget(entries, name);
+	assert.equal(resolve("Receipts").kind, "folder");
+	assert.deepEqual(resolve("Receipts").target, { mailboxId: "mbx1", folderId: "fld1", name: "Receipts", imapName: "Receipts" });
+	assert.deepEqual(resolve("New Folder").target, { mailboxId: "mbx1", name: "New Folder", imapName: "New Folder" });
+	assert.deepEqual(resolve("sales@example.test/Leads 2").target, { mailboxId: "mbx2", name: "Leads 2", imapName: "sales@example.test/Leads 2" });
+	assert.equal(resolve("INBOX").kind, "role");
+	assert.equal(resolve("sales@example.test").kind, "parent");
+	assert.deepEqual(resolve("  Receipts  ").target.name, "Receipts");
+	assert.equal(resolve("").kind, "invalid");
+	assert.equal(resolve("a/b/c").kind, "invalid");
+	// Without a primary mailbox no name is bare, so a root-level create has nowhere to land.
+	const namespacedOnly = planImapMailboxEntries([{ ...PRIMARY, isPrimary: false }], new Map([["mbx1", [{ id: "fld9", name: "Reports" }]]]));
+	assert.equal(resolveImapFolderTarget(namespacedOnly, "Reports").kind, "invalid");
+	assert.equal(resolveImapFolderTarget(namespacedOnly, "alice@example.test/Reports").kind, "folder");
+	assert.equal(resolveImapFolderTarget(namespacedOnly, "alice@example.test/New").kind, "new");
+});
+
+test("folder writes stay behind authentication", async () => {
+	const { client, state } = writableBackend();
+	for (const line of ["A CREATE Reports", "A DELETE Receipts", "A RENAME Receipts Invoices"]) {
+		assert.equal((await dispatchImapCommand("not-authenticated", parseImapCommand(line), client)).response, "A BAD Authenticate first\r\n", line);
+	}
+	assert.deepEqual(state.writes, []);
 });
