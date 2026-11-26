@@ -299,7 +299,15 @@ export async function processInboundMessage(
 			eq(messages.id, messageId),
 			eq(messages.intakeComplete, false),
 		)).returning({ id: messages.id }), options.deadlineAt);
-		effectsWinner = !!completed;
+		if (completed) {
+			effectsWinner = true;
+		} else {
+			// Zero rows may mean another intake completed first, or that its failed attempt deleted this row.
+			// Only the former is an acknowledged replay; a missing/incomplete row must stay retryable.
+			const [current] = await awaitOperation(db.select({ intakeComplete: messages.intakeComplete })
+				.from(messages).where(eq(messages.id, messageId)).limit(1), options.deadlineAt);
+			if (!current?.intakeComplete) throw new Error("Inbound message disappeared before intake completed");
+		}
 
 	} catch (error) {
 		// A deadline cannot cancel an already-submitted insert or attachment write. Leave the row explicitly

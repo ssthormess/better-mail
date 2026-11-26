@@ -78,14 +78,40 @@ function mysqlColumnMatches(actual: MysqlColumnInfo | undefined, expected: Mysql
 	const baseColumnType = columnType.replace(/\s+unsigned$/, "");
 	const typeMatches = aliases[type] ? aliases[type].test(baseColumnType) : baseColumnType === type;
 	const nullable = actual.is_nullable.toUpperCase() === "YES";
-	const actualDefault = actual.column_default === null ? null : String(actual.column_default).replace(/^['\"]|['\"]$/g, "").toLowerCase();
-	const expectedDefault = expected.defaultValue?.toLowerCase() ?? null;
+	const actualDefault = actual.column_default === null ? null : String(actual.column_default).replace(/^['\"]|['\"]$/g, "");
+	const expectedDefault = expected.defaultValue ?? null;
 	const expectedBoolean = type === "boolean";
 	const defaultMatches = actualDefault === expectedDefault
 		|| (expectedBoolean && expectedDefault === "true" && actualDefault === "1")
 		|| (expectedBoolean && expectedDefault === "false" && actualDefault === "0");
 	return typeMatches && unsigned === expectedUnsigned && nullable === expected.nullable
 		&& defaultMatches && !/auto_increment|generated/i.test(actual.extra);
+}
+
+type MysqlIndexInfo = {
+	Column_name?: string;
+	Seq_in_index?: number;
+	Non_unique?: number;
+	Sub_part?: number | null;
+	Index_type?: string;
+	Collation?: string | null;
+	Visible?: string;
+	Ignored?: string;
+};
+
+function mysqlClaimIndexMatches(rows: MysqlIndexInfo[], expectedColumns: string[]): boolean {
+	if (rows.length !== expectedColumns.length) return false;
+	return rows.every((row, index) => {
+		const ignored = row.Ignored?.toUpperCase();
+		const visible = row.Visible?.toUpperCase() ?? (ignored === undefined ? "YES" : ignored === "NO" ? "YES" : "NO");
+		return row.Column_name?.toLowerCase() === expectedColumns[index]
+			&& Number(row.Seq_in_index) === index + 1
+			&& Number(row.Non_unique) === 1
+			&& row.Sub_part === null
+			&& row.Index_type?.toUpperCase() === "BTREE"
+			&& row.Collation?.toUpperCase() === "A"
+			&& visible === "YES";
+	});
 }
 
 async function recordMysqlMigration(db: D1Database, name: string): Promise<void> {
@@ -120,18 +146,10 @@ export async function resumeMysqlExternalAccountPollClaims(db: D1Database, recor
 		if (!until) actions.push("ADD COLUMN `poll_claim_until` BIGINT NULL");
 		else if (!mysqlColumnMatches(until, expectedUntil)) throw new Error("Migration 0036 found an incompatible poll_claim_until shape");
 
-		const { results: indexRows } = await db.prepare(`
-			SELECT column_name AS column_name, seq_in_index AS seq_in_index, non_unique AS non_unique
-			FROM information_schema.statistics
-			WHERE table_schema = database() AND table_name = 'external_accounts' AND index_name = 'external_accounts_claim_idx'
-			ORDER BY seq_in_index
-		`).all<{ column_name: string; seq_in_index: number; non_unique: number }>();
+		const { results: indexRows } = await db.prepare("SHOW INDEX FROM `external_accounts` WHERE Key_name = 'external_accounts_claim_idx'").all<MysqlIndexInfo>();
 		const expectedIndex = ["enabled", "protocol", "poll_claim_until", "last_synced_at"];
-		const currentIndex = indexRows.map((row) => row.column_name.toLowerCase());
-		const indexMatches = currentIndex.length === expectedIndex.length
-			&& currentIndex.every((column, index) => column === expectedIndex[index])
-			&& indexRows.every((row) => Number(row.non_unique) === 1);
-		if (currentIndex.length && !indexMatches) throw new Error("Migration 0036 found an incompatible external_accounts_claim_idx shape");
+		const indexMatches = mysqlClaimIndexMatches(indexRows, expectedIndex);
+		if (indexRows.length && !indexMatches) throw new Error("Migration 0036 found an incompatible external_accounts_claim_idx shape");
 		if (!indexMatches) actions.push("ADD INDEX `external_accounts_claim_idx` (`enabled`,`protocol`,`poll_claim_until`,`last_synced_at`)");
 		if (actions.length) await db.prepare(`ALTER TABLE \`external_accounts\` ${actions.join(", ")}`).run();
 	};
@@ -145,37 +163,27 @@ export async function resumeMysqlExternalAccountPollClaims(db: D1Database, recor
 	if (recordMigration) await recordMysqlMigration(db, name);
 }
 
-function parseMysqlColumnAddition(statement: string): { table: string; column: string; expectation: MysqlColumnExpectation } | null {
-	const match = statement.match(/^\s*ALTER\s+TABLE\s+([`\w]+)\s+ADD(?:\s+COLUMN)?\s+([`\w]+)\s+([\s\S]+?)\s*;?\s*$/i);
-	if (!match) return null;
-	const unquote = (value: string) => value.replace(/^`|`$/g, "").toLowerCase();
-	const definition = match[3].replace(/;\s*$/, "").trim();
-	const typeMatch = definition.match(/^([a-z]+(?:\s*\(\s*\d+(?:\s*,\s*\d+)?\s*\))?(?:\s+unsigned)?)/i);
-	if (!typeMatch) return null;
-	const defaultMatch = definition.match(/\bDEFAULT\s+(true|false|null|-?\d+(?:\.\d+)?|'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\")/i);
-	const defaultValue = defaultMatch ? defaultMatch[1].replace(/^['\"]|['\"]$/g, "").toLowerCase() : null;
-	return {
-		table: unquote(match[1]),
-		column: unquote(match[2]),
-		expectation: { type: typeMatch[1].replace(/\s+/g, " ").trim().toLowerCase(), nullable: !/\bNOT\s+NULL\b/i.test(definition), defaultValue },
+/** MySQL commits DDL before its ledger write; recover only this exact, reviewed 0037 marker shape. */
+async function resumeMysqlIntakeCompletion(db: D1Database, recordMigration = true): Promise<void> {
+	const name = "0037_external_message_intake_completion.sql";
+	const expected = { type: "boolean", nullable: false, defaultValue: "1" };
+	const reconcile = async () => {
+		let marker = await getMysqlColumn(db, "messages", "intake_complete");
+		if (!marker) {
+			const { results } = await db.prepare("SELECT column_name AS column_name FROM information_schema.columns WHERE table_schema = database() AND table_name = 'messages' LIMIT 1").all<{ column_name: string }>();
+			if (!results.length) throw new Error("Migration 0037 cannot find messages");
+			await db.prepare("ALTER TABLE `messages` ADD `intake_complete` boolean DEFAULT true NOT NULL").run();
+			marker = await getMysqlColumn(db, "messages", "intake_complete");
+		}
+		if (!mysqlColumnMatches(marker, expected)) throw new Error("Migration 0037 found an incompatible messages.intake_complete shape");
 	};
-}
-
-async function applyMysqlAddColumnMigration(db: D1Database, name: string, additions: Array<{ statement: string; table: string; column: string; expectation: MysqlColumnExpectation }>): Promise<void> {
-	for (const addition of additions) {
-		const existing = await getMysqlColumn(db, addition.table, addition.column);
-		if (existing) {
-			if (!mysqlColumnMatches(existing, addition.expectation)) throw new Error(`Column ${addition.table}.${addition.column} exists with an incompatible shape`);
-			continue;
-		}
-		try {
-			await db.prepare(addition.statement).run();
-		} catch (error) {
-			const raced = await getMysqlColumn(db, addition.table, addition.column);
-			if (!mysqlColumnMatches(raced, addition.expectation)) throw error;
-		}
+	try {
+		await reconcile();
+	} catch (error) {
+		try { await reconcile(); }
+		catch { throw error; }
 	}
-	await recordMysqlMigration(db, name);
+	if (recordMigration) await recordMysqlMigration(db, name);
 }
 
 export async function getMigrationStatus(db: D1Database): Promise<MigrationStatus> {
@@ -200,13 +208,20 @@ export async function applyPendingMigrations(db: D1Database): Promise<MigrationR
 	await db.prepare(create).run();
 	const applied: string[] = [];
 	const mysqlPollClaimMigration = "0036_external_account_poll_claims.sql";
-	// A draft of 0036 may have recorded its ledger after creating the columns with an older token type.
-	// Verify that already-ledgered state too, so the runtime schema converges without replaying DDL blindly.
+	const mysqlIntakeMigration = "0037_external_message_intake_completion.sql";
+	// Verify already-ledgered feature migrations too, so prior drafts converge only from known exact shapes.
 	if (dialect === "mysql" && !initial.pending.includes(mysqlPollClaimMigration)) {
 		try {
 			await resumeMysqlExternalAccountPollClaims(db, false);
 		} catch (error) {
 			throw new Error(`Migration ${mysqlPollClaimMigration} verification failed: ${error instanceof Error ? error.message : "Database error"}`);
+		}
+	}
+	if (dialect === "mysql" && !initial.pending.includes(mysqlIntakeMigration)) {
+		try {
+			await resumeMysqlIntakeCompletion(db, false);
+		} catch (error) {
+			throw new Error(`Migration ${mysqlIntakeMigration} verification failed: ${error instanceof Error ? error.message : "Database error"}`);
 		}
 	}
 
@@ -215,20 +230,14 @@ export async function applyPendingMigrations(db: D1Database): Promise<MigrationR
 		if (!migration) continue;
 
 		try {
-			if (dialect === "mysql" && name === "0036_external_account_poll_claims.sql") {
+			if (dialect === "mysql" && name === mysqlPollClaimMigration) {
 				await resumeMysqlExternalAccountPollClaims(db);
+			} else if (dialect === "mysql" && name === mysqlIntakeMigration) {
+				await resumeMysqlIntakeCompletion(db);
 			} else if (dialect === "mysql") {
-				const parsedAdditions = migration.statements.map((statement) => ({ statement, parsed: parseMysqlColumnAddition(statement) }));
-				if (parsedAdditions.length && parsedAdditions.every((entry) => entry.parsed)) {
-					await applyMysqlAddColumnMigration(db, name, parsedAdditions.map((entry) => ({ statement: entry.statement, ...entry.parsed! })));
-				} else if (migration.statements.some((statement) => statement.trimStart().toLowerCase().startsWith("alter table") && /\bADD\s+COLUMN\b/i.test(statement))) {
-					throw new Error("MySQL additive-column migration is not in the verifiable single-column ALTER form");
-				} else {
-					// MySQL commits DDL implicitly, so a transaction cannot make a migration atomic. Record it last,
-					// so other migration classes retain their existing path.
-					for (const statement of migration.statements) await db.prepare(statement).run();
-					await db.prepare(`INSERT INTO ${table} (name) VALUES (?)`).bind(name).run();
-				}
+				// MySQL commits DDL implicitly, so a transaction cannot make a migration atomic. Record it last.
+				for (const statement of migration.statements) await db.prepare(statement).run();
+				await db.prepare(`INSERT INTO ${table} (name) VALUES (?)`).bind(name).run();
 			} else {
 				await db.batch([
 					db.prepare(`INSERT INTO ${table} (name) VALUES (?)`).bind(name),

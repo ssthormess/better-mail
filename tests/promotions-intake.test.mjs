@@ -44,10 +44,11 @@ async function fixture(t) {
 		INSERT INTO mailboxes (id, user_id, domain_id, local_part, created_at) VALUES ('box', 'admin', 'one', 'me', 1);
 	`);
 	const objects = new Map();
+	let bucketPut = async () => {};
 	const env = {
 		DB: database,
 		MAILFLARE_RUNTIME: "node",
-		BUCKET: { get: async (key) => (objects.has(key) ? { arrayBuffer: async () => objects.get(key) } : null), put: async () => {}, delete: async (key) => { objects.delete(key); } },
+		BUCKET: { get: async (key) => (objects.has(key) ? { arrayBuffer: async () => objects.get(key) } : null), put: async (...args) => bucketPut(...args), delete: async (key) => { objects.delete(key); } },
 	};
 	globalThis.__mailflareNodeEnv = env;
 	t.after(() => { delete globalThis.__mailflareNodeEnv; });
@@ -69,7 +70,7 @@ async function fixture(t) {
 	// Realtime hub stand-in: every body POSTed to a user's hub, in order.
 	const sent = [];
 	env.REALTIME = { getByName: (user) => ({ fetch: async (_url, init) => { sent.push({ user, body: JSON.parse(init.body) }); return new Response(null, { status: 204 }); } }) };
-	return { deliver, deliverRaw, storeRaw, raw: database.db, database, env, sent };
+	return { deliver, deliverRaw, storeRaw, raw: database.db, database, env, sent, setBucketPut: put => { bucketPut = put; } };
 }
 
 test("intake stores the category and sender address of bulk mail", async (t) => {
@@ -157,6 +158,83 @@ test("concurrent normal duplicate deliveries emit notification effects only for 
 	assert.equal(dedupReads, 2, `both calls passed the pre-insert duplicate lookup together: ${JSON.stringify(preparedQueries.filter(query => /messages/i.test(query)))}`);
 	assert.equal(raw.prepare("SELECT count(*) AS n FROM messages WHERE raw_r2_key = ? AND intake_complete = 1").get(key).n, 1);
 	assert.equal(sent.filter((entry) => entry.body.type === "new_message").length, 1);
+});
+
+test("a failed attachment writer preserves a completed replay and never acknowledges a deleted row", async (t) => {
+	const attachedMime = [
+		"From: friend@outside.test", "To: me@one.test", "Subject: Attachment", "Message-ID: <race-attachment@outside.test>",
+		"MIME-Version: 1.0", 'Content-Type: multipart/mixed; boundary="race"', "", "--race",
+		"Content-Type: text/plain; charset=utf-8", "", "See attached.", "--race",
+		'Content-Type: text/plain; name="note.txt"', 'Content-Disposition: attachment; filename="note.txt"',
+		"Content-Transfer-Encoding: base64", "aGVsbG8=", "--race--", "",
+	].join("\r\n");
+	const deferred = () => {
+		let resolve;
+		let reject;
+		const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+		return { promise, resolve, reject };
+	};
+
+	for (const completeBeforeFailure of [true, false]) {
+		const { storeRaw, raw, database, env, sent, setBucketPut } = await fixture(t);
+		t.mock.method(console, "info", () => {});
+		const firstPutStarted = deferred();
+		const firstPut = deferred();
+		let puts = 0;
+		setBucketPut(async () => {
+			if (puts++ === 0) {
+				firstPutStarted.resolve();
+				return firstPut.promise;
+			}
+		});
+		const key = await storeRaw(attachedMime);
+		const payload = { from: "bounce@outside.test", to: "me@one.test", rawR2Key: key };
+		const firstAttempt = m.processInboundMessage(env, payload);
+		await firstPutStarted.promise;
+
+		let releaseMarker;
+		let markerReached;
+		if (!completeBeforeFailure) {
+			const markerGate = deferred();
+			const markerSignal = deferred();
+			releaseMarker = markerGate.resolve;
+			markerReached = markerSignal.promise;
+			const originalPrepare = database.prepare.bind(database);
+			const wrap = (statement, query) => new Proxy(statement, { get(target, property) {
+				if (/update ["`]?messages["`]? set ["`]?intake_complete["`]?/i.test(query) && ["all", "raw", "run", "first"].includes(property)) {
+					return async (...args) => {
+						markerSignal.resolve();
+						await markerGate.promise;
+						return target[property](...args);
+					};
+				}
+				const value = Reflect.get(target, property, target);
+				if (property === "bind" && typeof value === "function") return (...args) => wrap(value.apply(target, args), query);
+				return typeof value === "function" ? value.bind(target) : value;
+			} });
+			database.prepare = query => wrap(originalPrepare(query), query);
+		}
+		const replay = m.processInboundMessage(env, payload);
+		if (completeBeforeFailure) {
+			await replay;
+			firstPut.reject(new Error("injected attachment PUT failure"));
+			assert.equal((await Promise.allSettled([firstAttempt]))[0].status, "rejected");
+			assert.equal(raw.prepare("SELECT count(*) AS n FROM messages WHERE raw_r2_key = ? AND intake_complete = 1").get(key).n, 1);
+			assert.equal(raw.prepare("SELECT count(*) AS n FROM message_attachments").get().n, 1);
+			assert.equal(sent.filter(entry => entry.body.type === "new_message").length, 1);
+		} else {
+			await markerReached;
+			firstPut.reject(new Error("injected attachment PUT failure"));
+			assert.equal((await Promise.allSettled([firstAttempt]))[0].status, "rejected");
+			releaseMarker();
+			const replayResult = await Promise.allSettled([replay]);
+			assert.equal(replayResult[0].status, "rejected", "a missing row is not an acknowledged completion");
+			assert.match(String(replayResult[0].reason), /disappeared before intake completed/);
+			assert.equal(raw.prepare("SELECT count(*) AS n FROM messages WHERE raw_r2_key = ?").get(key).n, 0);
+			assert.equal(raw.prepare("SELECT count(*) AS n FROM message_attachments").get().n, 0);
+			assert.equal(sent.filter(entry => entry.body.type === "new_message").length, 0);
+		}
+	}
 });
 
 test("a sender override and a correspondent contact keep mail in Inbox", async (t) => {

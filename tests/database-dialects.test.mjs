@@ -192,16 +192,26 @@ test("MySQL external-account poll claims are added in one atomic ALTER with the 
 const mysqlColumn = (name, dataType, columnType = dataType, isNullable = "YES", columnDefault = null) => ({
 	column_name: name, data_type: dataType, column_type: columnType, is_nullable: isNullable, column_default: columnDefault, extra: "",
 });
+const mysqlIndex = (columnName, position, options = {}) => ({
+	Column_name: columnName, Seq_in_index: position, Non_unique: options.nonUnique ?? 1,
+	Sub_part: options.subPart ?? null, Index_type: options.indexType ?? "BTREE",
+	Collation: options.collation ?? "A", Visible: options.visible ?? "YES",
+});
 
-function mysqlResumeFixture({ columns = [], index = [], claimsRecorded = false, intakeRecorded = true, failIntakeAfterCommit = false } = {}) {
+function mysqlResumeFixture({ columns = [], index = [], claimsRecorded = false, intakeRecorded = true, failIntakeAfterCommit = false, pendingNames } = {}) {
 	const bundle = JSON.parse(readFileSync(join(root, "src/lib/migrations/bundle-mysql.json"), "utf8"));
 	const claimsName = "0036_external_account_poll_claims.sql";
 	const intakeName = "0037_external_message_intake_completion.sql";
-	const applied = new Set(bundle.migrations.filter((migration) => migration.name !== claimsName && migration.name !== intakeName).map((migration) => migration.name));
+	const applied = new Set(pendingNames
+		? bundle.migrations.filter((migration) => !pendingNames.includes(migration.name)).map((migration) => migration.name)
+		: bundle.migrations.filter((migration) => migration.name !== claimsName && migration.name !== intakeName).map((migration) => migration.name));
 	if (claimsRecorded) applied.add(claimsName);
 	if (intakeRecorded) applied.add(intakeName);
 	const state = {
-		tables: { external_accounts: [mysqlColumn("id", "varchar", "varchar(191)") , ...columns], messages: [] },
+		tables: {
+			external_accounts: [mysqlColumn("id", "varchar", "varchar(191)"), ...columns],
+			messages: [mysqlColumn("id", "varchar", "varchar(191)"), ...(intakeRecorded ? [mysqlColumn("intake_complete", "tinyint", "tinyint(1)", "NO", "1")] : [])],
+		},
 		index: [...index], alterations: 0, failIntakeAfterCommit,
 	};
 	const db = {
@@ -218,7 +228,7 @@ function mysqlResumeFixture({ columns = [], index = [], claimsRecorded = false, 
 					const columnsForTable = state.tables[table] ?? [];
 						return { results: params.length > 1 ? columnsForTable.filter((column) => column.column_name === params[1]) : columnsForTable };
 					}
-					if (query.includes("information_schema.statistics")) return { results: state.index };
+					if (/show index from `external_accounts`/i.test(query)) return { results: state.index };
 					if (/select name from mailflare_migrations/i.test(query)) return { results: [...applied].map((name) => ({ name })) };
 					return { results: [] };
 				},
@@ -227,13 +237,14 @@ function mysqlResumeFixture({ columns = [], index = [], claimsRecorded = false, 
 						state.alterations++;
 						state.tables.external_accounts = [mysqlColumn("id", "varchar", "varchar(191)"),
 							mysqlColumn("poll_claim_token", "longtext", "longtext"), mysqlColumn("poll_claim_until", "bigint", "bigint")];
-						state.index = ["enabled", "protocol", "poll_claim_until", "last_synced_at"].map((column_name, index) => ({ column_name, seq_in_index: index + 1, non_unique: 1 }));
+						state.index = ["enabled", "protocol", "poll_claim_until", "last_synced_at"].map((column_name, index) => mysqlIndex(column_name, index + 1));
 					}
 					if (/alter table [`"]messages/i.test(query)) {
 						state.alterations++;
-						state.tables.messages = [mysqlColumn("intake_complete", "tinyint", "tinyint(1)", "NO", "1")];
+						state.tables.messages = [mysqlColumn("id", "varchar", "varchar(191)"), mysqlColumn("intake_complete", "tinyint", "tinyint(1)", "NO", "1")];
 						if (state.failIntakeAfterCommit) { state.failIntakeAfterCommit = false; throw new Error("Duplicate column name 'intake_complete'"); }
 					}
+					if (/alter table [`"]app_settings` add [`"]auto_update_channel/i.test(query)) throw new Error("Duplicate column name 'auto_update_channel'");
 					if (/insert ignore into mailflare_migrations/i.test(query)) applied.add(params[0]);
 				return {};
 				},
@@ -243,6 +254,12 @@ function mysqlResumeFixture({ columns = [], index = [], claimsRecorded = false, 
 	};
 	return { db, state, hasLedger: name => applied.has(name) };
 }
+
+test("MySQL 0037 recovery is tied to its exact reviewed marker ALTER", () => {
+	const migration = readFileSync(join(root, "drizzle/migrations-mysql/0037_external_message_intake_completion.sql"), "utf8");
+	const statements = migration.split("--> statement-breakpoint").map(statement => statement.trim()).filter(Boolean);
+	assert.deepEqual(statements, ["ALTER TABLE `messages` ADD `intake_complete` boolean DEFAULT true NOT NULL;"]);
+});
 
 test("MySQL runner resumes 0036 from the legacy token-only partial ALTER", async () => {
 	const fixture = mysqlResumeFixture({ columns: [mysqlColumn("poll_claim_token", "text", "text")] });
@@ -257,7 +274,7 @@ test("MySQL runner resumes 0036 from the legacy token-only partial ALTER", async
 test("MySQL runner reconciles 0036 after its ALTER committed before the ledger write", async () => {
 	const fixture = mysqlResumeFixture({
 		columns: [mysqlColumn("poll_claim_token", "longtext"), mysqlColumn("poll_claim_until", "bigint")],
-		index: ["enabled", "protocol", "poll_claim_until", "last_synced_at"].map((column_name, index) => ({ column_name, seq_in_index: index + 1, non_unique: 1 })),
+		index: ["enabled", "protocol", "poll_claim_until", "last_synced_at"].map((columnName, index) => mysqlIndex(columnName, index + 1)),
 	});
 	const result = await applyPendingMigrations(fixture.db);
 	assert.equal(result.ready, true);
@@ -274,10 +291,12 @@ test("MySQL verifies a ledgered 0036 legacy TEXT token without replaying its led
 	assert.equal(fixture.state.tables.external_accounts.find(column => column.column_name === "poll_claim_token").data_type, "longtext");
 });
 
-test("MySQL refuses wrong 0036 column and unique-index shapes without ledgering", async () => {
+test("MySQL refuses wrong 0036 column, unique-index and prefix-index shapes without ledgering", async () => {
+	const columns = [mysqlColumn("poll_claim_token", "longtext", "longtext"), mysqlColumn("poll_claim_until", "bigint", "bigint")];
 	for (const fixture of [
-		mysqlResumeFixture({ columns: [mysqlColumn("poll_claim_token", "longtext", "longtext"), mysqlColumn("poll_claim_until", "bigint", "bigint unsigned", "NO", "0")] }),
-		mysqlResumeFixture({ columns: [mysqlColumn("poll_claim_token", "longtext", "longtext"), mysqlColumn("poll_claim_until", "bigint", "bigint")], index: ["enabled", "protocol", "poll_claim_until", "last_synced_at"].map((column_name, index) => ({ column_name, seq_in_index: index + 1, non_unique: 0 })) }),
+		mysqlResumeFixture({ columns: [columns[0], mysqlColumn("poll_claim_until", "bigint", "bigint unsigned", "NO", "0")] }),
+		mysqlResumeFixture({ columns, index: ["enabled", "protocol", "poll_claim_until", "last_synced_at"].map((columnName, index) => mysqlIndex(columnName, index + 1, { nonUnique: 0 })) }),
+		mysqlResumeFixture({ columns, index: ["enabled", "protocol", "poll_claim_until", "last_synced_at"].map((columnName, index) => mysqlIndex(columnName, index + 1, { subPart: index === 1 ? 1 : null })) }),
 	]) {
 		await assert.rejects(applyPendingMigrations(fixture.db), /incompatible external_accounts_claim_idx|incompatible poll_claim_until/);
 		assert.equal(fixture.hasLedger("0036_external_account_poll_claims.sql"), false);
@@ -287,26 +306,44 @@ test("MySQL refuses wrong 0036 column and unique-index shapes without ledgering"
 test("MySQL resumes an unledgered 0037 after its column ALTER committed", async () => {
 	const fixture = mysqlResumeFixture({
 		columns: [mysqlColumn("poll_claim_token", "longtext", "longtext"), mysqlColumn("poll_claim_until", "bigint", "bigint")],
-		index: ["enabled", "protocol", "poll_claim_until", "last_synced_at"].map((column_name, index) => ({ column_name, seq_in_index: index + 1, non_unique: 1 })),
+		index: ["enabled", "protocol", "poll_claim_until", "last_synced_at"].map((columnName, index) => mysqlIndex(columnName, index + 1)),
 		claimsRecorded: true, intakeRecorded: false,
 	});
-	fixture.state.tables.messages = [mysqlColumn("intake_complete", "tinyint", "tinyint(1)", "NO", "1")];
+	fixture.state.tables.messages = [mysqlColumn("id", "varchar", "varchar(191)"), mysqlColumn("intake_complete", "tinyint", "tinyint(1)", "NO", "1")];
 	const result = await applyPendingMigrations(fixture.db);
 	assert.equal(result.ready, true);
 	assert.deepEqual(result.applied, ["0037_external_message_intake_completion.sql"]);
 	assert.equal(fixture.state.alterations, 0, "the committed ADD COLUMN is not replayed");
 });
 
-test("MySQL additive-column resume rechecks metadata after a concurrent duplicate-column error", async () => {
+test("MySQL refuses to ledger 0037 when the existing marker has drifted defaults", async () => {
 	const fixture = mysqlResumeFixture({
 		columns: [mysqlColumn("poll_claim_token", "longtext", "longtext"), mysqlColumn("poll_claim_until", "bigint", "bigint")],
-		index: ["enabled", "protocol", "poll_claim_until", "last_synced_at"].map((column_name, index) => ({ column_name, seq_in_index: index + 1, non_unique: 1 })),
+		index: ["enabled", "protocol", "poll_claim_until", "last_synced_at"].map((columnName, index) => mysqlIndex(columnName, index + 1)),
+		claimsRecorded: true, intakeRecorded: false,
+	});
+	fixture.state.tables.messages.push(mysqlColumn("intake_complete", "tinyint", "tinyint(1)", "NO", "0"));
+	await assert.rejects(applyPendingMigrations(fixture.db), /incompatible messages.intake_complete shape/);
+	assert.equal(fixture.hasLedger("0037_external_message_intake_completion.sql"), false);
+});
+
+test("MySQL 0037 recovery rechecks metadata after a competing duplicate-column error", async () => {
+	const fixture = mysqlResumeFixture({
+		columns: [mysqlColumn("poll_claim_token", "longtext", "longtext"), mysqlColumn("poll_claim_until", "bigint", "bigint")],
+		index: ["enabled", "protocol", "poll_claim_until", "last_synced_at"].map((columnName, index) => mysqlIndex(columnName, index + 1)),
 		claimsRecorded: true, intakeRecorded: false, failIntakeAfterCommit: true,
 	});
 	const result = await applyPendingMigrations(fixture.db);
 	assert.equal(result.ready, true);
 	assert.deepEqual(result.applied, ["0037_external_message_intake_completion.sql"]);
 	assert.equal(fixture.hasLedger("0037_external_message_intake_completion.sql"), true);
+});
+
+test("MySQL does not falsely adopt an unledgered migration with a case-drifted string default", async () => {
+	const fixture = mysqlResumeFixture({ claimsRecorded: true, intakeRecorded: true, pendingNames: ["0013_auto_update.sql"] });
+	fixture.state.tables.app_settings = [mysqlColumn("auto_update_channel", "varchar", "varchar(16)", "NO", "RELEASE")];
+	await assert.rejects(applyPendingMigrations(fixture.db), /Migration 0013_auto_update.sql failed: Duplicate column name/);
+	assert.equal(fixture.hasLedger("0013_auto_update.sql"), false);
 });
 
 test("PostgreSQL and MySQL ship the triggers SQLite has", () => {
