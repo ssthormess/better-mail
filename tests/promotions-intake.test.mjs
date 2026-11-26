@@ -237,6 +237,14 @@ test("a failed attachment writer preserves a completed replay and never acknowle
 	}
 });
 
+test("historical intake fails on a missing raw object so the poller can retry", async (t) => {
+	const { env } = await fixture(t);
+	await assert.rejects(
+		m.processInboundMessage(env, { from: "sender@outside.test", to: "no-route@example.test", rawR2Key: "inbound/missing" }, { intakeMode: "historical_import" }),
+		/Missing raw object for historical inbound message/,
+	);
+});
+
 test("a sender override and a correspondent contact keep mail in Inbox", async (t) => {
 	const { deliver, raw } = await fixture(t);
 	raw.exec("INSERT INTO mailbox_sender_preferences (id, mailbox_id, sender_address, category_override, updated_at) VALUES ('p', 'box', 'vip@acme.com', 'inbox', 1)");

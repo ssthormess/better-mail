@@ -81,10 +81,14 @@ export async function processInboundMessage(
 	assertBeforeDeadline();
 	const historicalImport = options.intakeMode === "historical_import";
 	const db = getDb(env);
+	const historicalRawObject = historicalImport
+		? await awaitOperation(env.BUCKET.get(payload.rawR2Key), options.deadlineAt)
+		: null;
+	if (historicalImport && !historicalRawObject) throw new Error("Missing raw object for historical inbound message");
 	// DMARC aggregate reports bypass mailboxes entirely (see report-address.ts); historical imports do not ingest them.
 	const reportTarget = await awaitOperation(matchReportAddress(env, payload.to), options.deadlineAt);
 	if (reportTarget) {
-		if (historicalImport) { await awaitOperation(env.BUCKET.delete(payload.rawR2Key), options.deadlineAt); return; }
+		if (historicalImport) return;
 		// The From header, not the envelope sender: it is what the DMARC verdict aligned to.
 		const from = Object.entries(payload.headers ?? {}).find(([name]) => name.toLowerCase() === "from")?.[1] ?? null;
 		await awaitOperation(ingestReportMail(env, reportTarget, { rawR2Key: payload.rawR2Key, authenticated: readTrustedDmarcResult(payload.headers, payload.verdicts) === "pass", from }, { batchBudget: options.reportBudget }), options.deadlineAt);
@@ -95,27 +99,21 @@ export async function processInboundMessage(
 	assertBeforeDeadline();
 	const decision = await awaitOperation(resolveInboundAddress(db, payload.to, payload.from, { headers: payload.headers }), options.deadlineAt);
 
-	// Nothing references the raw object on these paths, so keep it from piling up in storage.
-	const dropRaw = () => awaitOperation(env.BUCKET.delete(payload.rawR2Key), options.deadlineAt).catch((error) => console.error(`Raw cleanup failed for ${payload.rawR2Key}`, error));
-
+	// Inbound raw keys are content-addressed and may already be referenced by a stored message when rules change.
+	// Drop paths leave them for the age- and reference-aware raw sweeper rather than eagerly deleting shared keys.
 	if (!decision) {
 		console.warn(`No routing for inbound address: ${payload.to}`);
-		await dropRaw();
 		return;
 	}
 
 	if (decision.action === "reject") {
 		console.warn(`Rejected inbound: ${payload.to}`);
-		await dropRaw();
 		return;
 	}
 
 	// A forward decision reaches the queue when the rule keeps a copy or the forward
 	// failed; either way it is stored if there is a mailbox to store it in.
-	if (!decision.mailbox) {
-		await dropRaw();
-		return;
-	}
+	if (!decision.mailbox) return;
 	const [stored] = await awaitOperation(db.select({ id: messages.id, intakeComplete: messages.intakeComplete }).from(messages).where(and(
 		eq(messages.mailboxId, decision.mailbox.mailboxId),
 		eq(messages.rawR2Key, payload.rawR2Key),
@@ -131,7 +129,7 @@ export async function processInboundMessage(
 	}
 
 	assertBeforeDeadline();
-	const raw = await awaitOperation(env.BUCKET.get(payload.rawR2Key), options.deadlineAt);
+	const raw = historicalRawObject ?? await awaitOperation(env.BUCKET.get(payload.rawR2Key), options.deadlineAt);
 	if (!raw) {
 		console.error(`Missing R2 object: ${payload.rawR2Key}`);
 		return;
@@ -146,14 +144,12 @@ export async function processInboundMessage(
 		if (isInboundDeadlineExceeded(error)) throw error;
 		// Deterministic: a retry would repeat the same expensive parse, so drop the message.
 		console.warn(`Inbound MIME rejected for ${payload.to}`, error);
-		await awaitOperation(env.BUCKET.delete(payload.rawR2Key), options.deadlineAt);
 		return;
 	}
 	assertBeforeDeadline();
 	const attachmentLimitReason = inboundAttachmentLimitReason(parsed.attachments);
 	if (attachmentLimitReason) {
 		console.warn(`Inbound attachment limit reached for ${payload.to}: ${attachmentLimitReason}`);
-		await awaitOperation(env.BUCKET.delete(payload.rawR2Key), options.deadlineAt);
 		return;
 	}
 	const messageId = await awaitOperation(inboundMessageId(payload.rawR2Key), options.deadlineAt);

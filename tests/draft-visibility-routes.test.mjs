@@ -16,6 +16,7 @@ const { app, newDatabase } = await loadApp("draft-routes", `
 	export * as opens from "./src/app/api/messages/[messageId]/opens/route.ts";
 	export * as counts from "./src/app/api/messages/counts/route.ts";
 	export { conversationForUser } from "./src/lib/notes/service.ts";
+	export { processInboundMessage } from "./src/lib/email/inbound.ts";
 `, { mocks });
 
 const seed = `${sharedMailboxSeed("read_only")}
@@ -27,12 +28,22 @@ const seed = `${sharedMailboxSeed("read_only")}
 const user = (id) => ({ id, email: `${id}@example.com`, role: "user" });
 const ctx = () => ({ params: Promise.resolve({ messageId: "draft-1" }) });
 async function setup(t, who) {
-	const { env, db } = await newDatabase(t, seed);
-	env.BUCKET = { get: async () => ({ body: "raw", size: 3 }), head: async () => ({}) };
+	const { env, db, sqlite } = await newDatabase(t, seed);
+	const objects = new Map([["drafts/draft-1.eml", new TextEncoder().encode("raw")]]);
+	env.BUCKET = {
+		get: async key => {
+			const bytes = objects.get(key);
+			if (!bytes) return null;
+			return { body: new Blob([bytes]).stream(), size: bytes.byteLength, arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) };
+		},
+		head: async () => ({}),
+		put: async (key, value) => objects.set(key, value instanceof Uint8Array ? value : new Uint8Array(value)),
+		delete: async key => objects.delete(key),
+	};
 	globalThis.draftEnv = env;
 	globalThis.draftUser = user(who);
 	globalThis.draftAuth = { userId: who, scopes: ["read"], mailboxIds: null, keyId: "k" };
-	return { env, db };
+	return { env, db, sqlite, objects };
 }
 const get = (path) => new Request(`http://localhost${path}`, { headers: { accept: "*/*" } });
 
@@ -49,6 +60,40 @@ test("the draft's author still reaches the by-id routes", async (t) => {
 	await setup(t, "author");
 	assert.equal((await app.original.GET(get("/o"), ctx())).status, 200);
 	assert.equal((await app.sendStatus.GET(get("/s"), ctx())).status, 200);
+});
+
+test("a policy-change replay preserves referenced raw MIME and does not accept newly rejected mail", async (t) => {
+	const { env, sqlite, objects } = await setup(t, "admin");
+	const raw = [
+		"From: sender@outside.test", "To: team@example.com", "Subject: Stored original", "Message-ID: <policy-replay@example.test>",
+		"MIME-Version: 1.0", 'Content-Type: multipart/mixed; boundary="proof"', "", "--proof",
+		"Content-Type: text/plain; charset=utf-8", "", "Original source bytes.", "--proof",
+		'Content-Type: text/plain; name="note.txt"', 'Content-Disposition: attachment; filename="note.txt"',
+		"Content-Transfer-Encoding: base64", "aGVsbG8=", "--proof--", "",
+	].join("\r\n");
+	const bytes = new TextEncoder().encode(raw);
+	const key = "inbound/policy-replay";
+	objects.set(key, bytes);
+	const payload = { from: "sender@outside.test", to: "team@example.com", rawR2Key: key };
+	await app.processInboundMessage(env, payload, { intakeMode: "historical_import" });
+	const stored = sqlite.prepare("SELECT id FROM messages WHERE mailbox_id = 'mb-team' AND raw_r2_key = ?").get(key);
+	assert.ok(stored);
+	assert.equal(sqlite.prepare("SELECT count(*) AS n FROM message_attachments WHERE message_id = ?").get(stored.id).n, 1);
+
+	sqlite.prepare(`INSERT INTO routing_rules (id, user_id, domain_id, scope, enabled, pattern, match_field, match_operator, match_value, action, created_at)
+		VALUES ('block-sender', 'admin', 'domain-1', 'domain', 1, 'sender@outside.test', 'sender', 'exact', 'sender@outside.test', 'reject', 1)`).run();
+	await app.processInboundMessage(env, payload, { intakeMode: "historical_import" });
+	assert.equal(sqlite.prepare("SELECT count(*) AS n FROM messages WHERE id = ?").get(stored.id).n, 1);
+	assert.ok(objects.has(key), "replay under the new reject rule leaves the shared raw object intact");
+	const original = await app.original.GET(get("/original"), { params: Promise.resolve({ messageId: stored.id }) });
+	assert.equal(original.status, 200);
+	assert.equal(await original.text(), raw);
+
+	const newlyRejectedKey = "inbound/newly-rejected";
+	objects.set(newlyRejectedKey, bytes);
+	await app.processInboundMessage(env, { ...payload, rawR2Key: newlyRejectedKey }, { intakeMode: "historical_import" });
+	assert.equal(sqlite.prepare("SELECT count(*) AS n FROM messages WHERE raw_r2_key = ?").get(newlyRejectedKey).n, 0, "a new message remains rejected by the unchanged rule");
+	assert.ok(objects.has(newlyRejectedKey), "an unreferenced rejection is left for the sweeper");
 });
 
 test("the API-key list hides another user's draft and keeps the author's own", async (t) => {
