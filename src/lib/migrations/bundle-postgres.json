@@ -571,6 +571,12 @@
         "ALTER TABLE \"external_accounts\" ADD COLUMN \"poll_claim_until\" bigint;",
         "CREATE INDEX \"external_accounts_claim_idx\" ON \"external_accounts\" USING btree (\"enabled\",\"protocol\",\"poll_claim_until\",\"last_synced_at\");"
       ]
+    },
+    {
+      "name": "0037_external_message_intake_completion.sql",
+      "statements": [
+        "ALTER TABLE \"messages\" ADD COLUMN \"intake_complete\" boolean DEFAULT true NOT NULL;"
+      ]
     }
   ]
 }

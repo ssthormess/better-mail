@@ -394,6 +394,8 @@ export const messages = sqliteTable(
 		spamSignals: text("spam_signals"),
 		spamAnalyzedAt: timestamp("spam_analyzed_at"),
 		spamAnalysisError: text("spam_analysis_error"),
+		/** False while the inbound core write set (including attachment rows) is being committed; replay repairs incomplete rows. */
+		intakeComplete: bool("intake_complete").notNull().default(true),
 		/** When the message last entered Trash or Spam; maintained by triggers (migration 0053). */
 		trashedAt: timestamp("trashed_at"),
 		/** `promotions` from bulk-mail headers or a manual move. `primary` is an explicit "not promotions" marker (Move to Inbox) that the backfill must not reclassify. Null is a normal message or one not classified yet; every reader treats `primary` like null. */

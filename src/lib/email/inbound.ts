@@ -55,12 +55,20 @@ export type InboundQueueMessage = {
  * reputation, ingesting DMARC reports, replying, notifying, dispatching webhooks, auto-drafting or avatar lookup.
  * MIME parsing, routing, spam classification and message storage still run.
  */
+class InboundDeadlineExceeded extends Error {
+	constructor() { super("timeout"); }
+}
+
+function isInboundDeadlineExceeded(error: unknown): error is InboundDeadlineExceeded {
+	return error instanceof InboundDeadlineExceeded;
+}
+
 function awaitOperation<T>(work: Promise<T>, deadlineAt?: number, maxWaitMs = 5_000): Promise<T> {
 	if (deadlineAt === undefined) return work;
 	const end = Math.min(deadlineAt, Date.now() + maxWaitMs);
-	if (end <= Date.now()) { void work.catch(() => {}); return Promise.reject(new Error("timeout")); }
+	if (end <= Date.now()) { void work.catch(() => {}); return Promise.reject(new InboundDeadlineExceeded()); }
 	let timer: ReturnType<typeof setTimeout> | undefined;
-	return Promise.race([work, new Promise<T>((_resolve, reject) => { timer = setTimeout(() => reject(new Error("timeout")), end - Date.now()); })])
+	return Promise.race([work, new Promise<T>((_resolve, reject) => { timer = setTimeout(() => reject(new InboundDeadlineExceeded()), end - Date.now()); })])
 		.finally(() => { if (timer) clearTimeout(timer); });
 }
 
@@ -69,7 +77,7 @@ export async function processInboundMessage(
 	payload: InboundQueueMessage,
 	options: { reportBudget?: BatchBudget; intakeMode?: "realtime" | "historical_import"; deadlineAt?: number } = {},
 ): Promise<void> {
-	const assertBeforeDeadline = () => { if (options.deadlineAt !== undefined && Date.now() >= options.deadlineAt) throw new Error("timeout"); };
+	const assertBeforeDeadline = () => { if (options.deadlineAt !== undefined && Date.now() >= options.deadlineAt) throw new InboundDeadlineExceeded(); };
 	assertBeforeDeadline();
 	const historicalImport = options.intakeMode === "historical_import";
 	const db = getDb(env);
@@ -108,11 +116,11 @@ export async function processInboundMessage(
 		await dropRaw();
 		return;
 	}
-	const [stored] = await awaitOperation(db.select({ id: messages.id }).from(messages).where(and(
+	const [stored] = await awaitOperation(db.select({ id: messages.id, intakeComplete: messages.intakeComplete }).from(messages).where(and(
 		eq(messages.mailboxId, decision.mailbox.mailboxId),
 		eq(messages.rawR2Key, payload.rawR2Key),
 	)).limit(1), options.deadlineAt);
-	if (stored) {
+	if (stored?.intakeComplete) {
 		if (!historicalImport) {
 			try {
 				const [existing] = await awaitOperation(db.select().from(messages).where(eq(messages.id, stored.id)).limit(1), options.deadlineAt);
@@ -135,7 +143,7 @@ export async function processInboundMessage(
 	try {
 		parsed = boundParsedEmail(await awaitOperation(parseRawMime(buffer), options.deadlineAt));
 	} catch (error) {
-		if (error instanceof Error && error.message === "timeout") throw error;
+		if (isInboundDeadlineExceeded(error)) throw error;
 		// Deterministic: a retry would repeat the same expensive parse, so drop the message.
 		console.warn(`Inbound MIME rejected for ${payload.to}`, error);
 		await awaitOperation(env.BUCKET.delete(payload.rawR2Key), options.deadlineAt);
@@ -187,7 +195,7 @@ export async function processInboundMessage(
 			}), options.deadlineAt);
 			assertBeforeDeadline();
 		} catch (error) {
-			if (error instanceof Error && error.message === "timeout") throw error;
+			if (isInboundDeadlineExceeded(error)) throw error;
 			spamAnalysisError = error instanceof Error ? error.message.slice(0, 300) : "Spam analysis failed";
 			console.error(`Spam analysis failed for ${messageId}`, error);
 		}
@@ -214,7 +222,7 @@ export async function processInboundMessage(
 		// Spam senders are strangers at best; do not announce them to Gravatar.
 		lookupAvatar: !historicalImport && status !== "spam" && status !== "trash",
 	}), options.deadlineAt).catch((error) => {
-		if (error instanceof Error && error.message === "timeout") throw error;
+		if (isInboundDeadlineExceeded(error)) throw error;
 		console.error(`Contact upsert failed for ${messageId}`, error);
 		return null;
 	});
@@ -236,7 +244,7 @@ export async function processInboundMessage(
 			senderAddress: getEmailAddress(fromAddr) || null,
 		}), options.deadlineAt);
 	} catch (error) {
-		if (error instanceof Error && error.message === "timeout") throw error;
+		if (isInboundDeadlineExceeded(error)) throw error;
 		console.error("Inbound thread lookup failed", {
 			rawR2Key: payload.rawR2Key,
 			recipient: payload.to,
@@ -247,6 +255,7 @@ export async function processInboundMessage(
 	}
 	assertBeforeDeadline();
 
+	let insertedNewRow = false;
 	try {
 		assertBeforeDeadline();
 		const inserted = await awaitOperation(db.insert(messages).values({
@@ -272,6 +281,7 @@ export async function processInboundMessage(
 			inReplyTo: parsed.inReplyTo,
 			references: parsed.references.length ? parsed.references.join(" ") : null,
 			hasUnsubscribe: !!extractUnsubscribeUrlFromRaw(buffer) || !!extractUnsubscribeLinkFromBody(parsed.html, parsed.text),
+			intakeComplete: false,
 			category,
 			senderAddress,
 			spamScore: spamAnalysis?.score ?? null,
@@ -280,14 +290,15 @@ export async function processInboundMessage(
 			spamAnalyzedAt: spamAnalysis ? new Date() : null,
 			spamAnalysisError,
 		}).onConflictDoNothing().returning({ id: messages.id }), options.deadlineAt);
-		if (!inserted.length) return;
-		// Finish the post-commit write set once the message row exists. Aborting here would make a retry
-		// mistake a partially stored message for a complete duplicate and skip its attachments.
-		await awaitOperation(storeMessageAttachments(env, messageId, parsed.attachments), options.deadlineAt);
+		insertedNewRow = inserted.length > 0;
+		// Attachment IDs and object keys are deterministic for this message. If a timed-out attempt is still
+		// finishing, a retry can safely repeat the same writes without duplicating or deleting its objects.
+		await awaitOperation(storeMessageAttachments(env, messageId, parsed.attachments, { retrySafe: true }), options.deadlineAt);
 		if (!historicalImport && status !== "spam" && status !== "trash") {
 			await registerInboundInvite(env, { userId: decision.mailbox.userId, mailboxId: decision.mailbox.mailboxId, messageId, senderAddress: fromAddr, attachments: parsed.attachments });
 		}
-		if (spamAnalysis && !historicalImport) {
+		await awaitOperation(db.update(messages).set({ intakeComplete: true }).where(eq(messages.id, messageId)), options.deadlineAt);
+		if (spamAnalysis && !historicalImport && inserted.length > 0) {
 			try {
 				await recordReputationObservation(env, decision.mailbox.mailboxId, getReputationKeys(parsed, spamAnalysis.fingerprint));
 			} catch (error) {
@@ -301,7 +312,9 @@ export async function processInboundMessage(
 			}));
 		}
 	} catch (error) {
-		await awaitOperation(db.delete(messages).where(eq(messages.id, messageId)), options.deadlineAt).catch(() => {});
+		// A deadline cannot cancel an already-submitted insert or attachment write. Leave the row explicitly
+		// incomplete so replay repairs it; only roll back an insert on a real, observed dependency failure.
+		if (!isInboundDeadlineExceeded(error) && insertedNewRow) await awaitOperation(db.delete(messages).where(eq(messages.id, messageId)), options.deadlineAt);
 		throw error;
 	}
 

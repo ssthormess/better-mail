@@ -158,6 +158,51 @@ test("a crash after canonical store but before cursor commit is idempotent on re
  assert.deepEqual(JSON.parse(f.sql.prepare("SELECT sync_cursor FROM external_accounts").get().sync_cursor), { uidValidity: 77, lastUid: 1 });
 });
 
+test("a late message insert is marked incomplete and retry completes deterministic attachments", async t => {
+ muteInboundLogs(t);
+ const raw = [
+  "From: sender@outside.test", "To: me@one.test", "Subject: delayed attachment", "Message-ID: <delayed-attachment@outside.test>",
+  'MIME-Version: 1.0', 'Content-Type: multipart/mixed; boundary="fence"', "", "--fence",
+  "Content-Type: text/plain; charset=utf-8", "", "Body", "--fence",
+  'Content-Type: text/plain; name="note.txt"', 'Content-Disposition: attachment; filename="note.txt"',
+  "Content-Transfer-Encoding: base64", "", "aGVsbG8=", "--fence--", "",
+ ].join("\r\n");
+ const f = await fixture(t, { messages: new Map([[1, raw]]) });
+ const originalPrepare = f.database.prepare.bind(f.database); let delayInsert = true; let delayCalls = 0;
+ f.database.prepare = query => {
+  const statement = originalPrepare(query);
+  if (!delayInsert || !/insert into ["`]?messages["`]?/i.test(query)) return statement;
+  delayInsert = false;
+  return new Proxy(statement, { get(target, property) {
+   if (["all", "run", "first", "raw"].includes(property)) return async (...args) => { delayCalls++; await new Promise(resolve => setTimeout(resolve, 6_200)); return target[property](...args); };
+   const value = Reflect.get(target, property, target);
+   if (property === "bind" && typeof value === "function") return (...args) => {
+    const bound = value.apply(target, args);
+    return new Proxy(bound, { get(inner, key) {
+     if (["all", "run", "first", "raw"].includes(key)) return async (...values) => { delayCalls++; await new Promise(resolve => setTimeout(resolve, 6_200)); return inner[key](...values); };
+     const method = Reflect.get(inner, key, inner);
+     return typeof method === "function" ? method.bind(inner) : method;
+    } });
+   };
+   return typeof value === "function" ? value.bind(target) : value;
+  } });
+ };
+ const firstAt = new Date(); await f.poll(firstAt);
+ assert.equal(delayInsert, false, "message insert delay was installed");
+ assert.ok(delayCalls > 0, `intercepted an execution method (${delayCalls})`);
+ assert.equal(f.sql.prepare("SELECT count(*) AS n FROM messages").get().n, 0, "insert is still pending after the bounded first attempt");
+ await new Promise(resolve => setTimeout(resolve, 4_000));
+ const incomplete = f.sql.prepare("SELECT intake_complete FROM messages").get();
+ assert.equal(incomplete.intake_complete, 0, "late commit carries an explicit incomplete marker");
+ f.database.prepare = originalPrepare;
+ await f.poll(new Date(firstAt.getTime() + 121_000));
+ const row = f.sql.prepare("SELECT id, intake_complete FROM messages").get();
+ assert.equal(row.intake_complete, 1);
+ const attachments = f.sql.prepare("SELECT filename, size, r2_key FROM message_attachments WHERE message_id = ?").all(row.id);
+ assert.equal(attachments.length, 1); assert.equal(attachments[0].filename, "note.txt"); assert.equal(attachments[0].size, 5);
+ assert.ok(f.objects.has(attachments[0].r2_key));
+});
+
 test("a timed-out replay PUT never deletes a content-addressed raw object already referenced by a message", async t => {
  muteInboundLogs(t); const f = await fixture(t); const at = new Date(); await f.poll(at);
  const referencedKey = f.sql.prepare("SELECT raw_r2_key FROM messages").get().raw_r2_key;

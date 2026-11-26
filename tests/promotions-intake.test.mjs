@@ -52,16 +52,20 @@ async function fixture(t) {
 	globalThis.__mailflareNodeEnv = env;
 	t.after(() => { delete globalThis.__mailflareNodeEnv; });
 	let n = 0;
-	const deliver = async (from, headers = "", payloadHeaders, body) => {
+	const deliverRaw = async (raw, payloadHeaders) => {
 		const key = `raw/${++n}`;
-		objects.set(key, new TextEncoder().encode(mime(from, headers, body)).buffer);
+		objects.set(key, new TextEncoder().encode(raw).buffer);
 		await m.processInboundMessage(env, { from: "bounce@x.test", to: "me@one.test", rawR2Key: key, headers: payloadHeaders });
+		return key;
+	};
+	const deliver = async (from, headers = "", payloadHeaders, body) => {
+		const key = await deliverRaw(mime(from, headers, body), payloadHeaders);
 		return database.db.prepare("SELECT category, sender_address FROM messages WHERE raw_r2_key = ?").get(key);
 	};
 	// Realtime hub stand-in: every body POSTed to a user's hub, in order.
 	const sent = [];
 	env.REALTIME = { getByName: (user) => ({ fetch: async (_url, init) => { sent.push({ user, body: JSON.parse(init.body) }); return new Response(null, { status: 204 }); } }) };
-	return { deliver, raw: database.db, sent };
+	return { deliver, deliverRaw, raw: database.db, database, sent };
 }
 
 test("intake stores the category and sender address of bulk mail", async (t) => {
@@ -83,6 +87,40 @@ test("intake reads headers from the raw message when the payload has none, and h
 	const { deliver } = await fixture(t);
 	assert.equal((await deliver("a@acme.com", "Precedence: bulk\r\n", undefined)).category, "promotions");
 	assert.equal((await deliver("b@acme.com", "", { "list-unsubscribe": "<https://b.test/u>" })).category, "promotions");
+});
+
+test("an ordinary contact dependency error named timeout preserves normal mail and calendar intake", async (t) => {
+	const { deliverRaw, raw, database } = await fixture(t);
+	const originalPrepare = database.prepare.bind(database);
+	let injected = false;
+	let exactContactSelects = 0;
+	const contactQueries = [];
+	database.prepare = query => {
+		if (/contacts/i.test(query)) contactQueries.push(query);
+		if (/select[\s\S]+from ["`]?contacts["`]?/i.test(query) && /["`]?user_id["`]?\s*=\s*\?/.test(query) && /["`]?email["`]?\s*=\s*\?/.test(query)) {
+			exactContactSelects++;
+			if (!injected && exactContactSelects === 2) {
+				injected = true;
+				throw new Error("timeout");
+			}
+		}
+		return originalPrepare(query);
+	};
+	const calendarMail = [
+		"From: organizer@outside.test", "To: me@one.test", "Subject: Valid invite", "Message-ID: <valid-invite@outside.test>",
+		'MIME-Version: 1.0', 'Content-Type: multipart/mixed; boundary="calendar"', "", "--calendar",
+		"Content-Type: text/plain; charset=utf-8", "", "Please join.", "--calendar",
+		'Content-Type: text/calendar; method=REQUEST; name="invite.ics"', 'Content-Disposition: attachment; filename="invite.ics"', "",
+		"BEGIN:VCALENDAR", "VERSION:2.0", "METHOD:REQUEST", "BEGIN:VEVENT", "UID:valid-invite@example.test",
+		"DTSTART:20271104T170000Z", "DTEND:20271104T180000Z", "SUMMARY:Valid meeting",
+		"ORGANIZER:mailto:organizer@outside.test", "ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:me@one.test", "END:VEVENT", "END:VCALENDAR",
+		"--calendar--", "",
+	].join("\r\n");
+	const key = await deliverRaw(calendarMail);
+	database.prepare = originalPrepare;
+	assert.equal(injected, true, `the contact lookup failure was exercised: ${JSON.stringify(contactQueries)}`);
+	assert.equal(raw.prepare("SELECT count(*) AS n FROM messages WHERE raw_r2_key = ?").get(key).n, 1);
+	assert.equal(raw.prepare("SELECT count(*) AS n FROM calendar_events").get().n, 1);
 });
 
 test("a sender override and a correspondent contact keep mail in Inbox", async (t) => {

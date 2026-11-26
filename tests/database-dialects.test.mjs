@@ -16,6 +16,7 @@ await build({
 		drivers: join(root, "src/db/drivers/types.ts"),
 		backups: join(root, "src/lib/backups/export.ts"),
 		inspect: join(root, "tests/fixtures/inspect-schema.ts"),
+		migrationService: join(root, "src/lib/migrations/service.ts"),
 	},
 	outdir: outDir,
 	outExtension: { ".js": ".mjs" },
@@ -23,7 +24,7 @@ await build({
 	platform: "node",
 	format: "esm",
 	target: "node22",
-	alias: { "@": join(root, "src") },
+	alias: { "@": join(root, "src"), "cloudflare:workers": join(root, "server/runtime/cloudflare-workers.ts") },
 	packages: "external",
 	logLevel: "silent",
 });
@@ -32,6 +33,7 @@ const load = (name) => import(pathToFileURL(join(outDir, `${name}.mjs`)).href);
 const { resolveDatabaseConfig, inferDriver, schemaDialect } = await load("dialect");
 const { numberPlaceholders, normalizeParam } = await load("drivers");
 const { BACKUP_TABLES, INTERNAL_TABLES, INTERNAL_TABLE_PATTERNS } = await load("backups");
+const { applyPendingMigrations } = await load("migrationService");
 
 test("no DATABASE_URL keeps D1", () => {
 	assert.deepEqual(resolveDatabaseConfig({}), { dialect: "sqlite", driver: "d1" });
@@ -185,6 +187,72 @@ test("MySQL external-account poll claims are added in one atomic ALTER with the 
 	assert.ok(statements[0].includes("ADD COLUMN `poll_claim_until` bigint"));
 	assert.ok(statements[0].includes("ADD INDEX `external_accounts_claim_idx`"));
 	assert.equal(schemas.mysql.external_accounts.columns.find((column) => column.name === "poll_claim_token")?.sqlType, "longtext");
+});
+
+function mysqlResumeFixture(initialColumns, initialIndex, claimsMigrationRecorded = false) {
+	const bundle = JSON.parse(readFileSync(join(root, "src/lib/migrations/bundle-mysql.json"), "utf8"));
+	const migrationName = "0036_external_account_poll_claims.sql";
+	const applied = new Set(bundle.migrations.filter((migration) => migration.name !== migrationName).map((migration) => migration.name));
+	if (claimsMigrationRecorded) applied.add(migrationName);
+	const state = { columns: [...initialColumns], index: [...initialIndex], alterations: 0 };
+	const db = {
+		config: { dialect: "mysql" },
+		createDrizzle() {},
+		prepare(query) {
+			return {
+				bind(value) { return { run: async () => { applied.add(value); return {}; } }; },
+				first: async () => ({ name: "mailflare_migrations" }),
+				all: async () => {
+					if (query.includes("information_schema.columns")) return { results: state.columns };
+					if (query.includes("information_schema.statistics")) return { results: state.index };
+					if (/select name from mailflare_migrations/i.test(query)) return { results: [...applied].map((name) => ({ name })) };
+					return { results: [] };
+				},
+				run: async () => {
+					if (/alter table [`"]external_accounts/i.test(query)) {
+						state.alterations++;
+						state.columns = [
+							{ column_name: "poll_claim_token", data_type: "longtext" },
+							{ column_name: "poll_claim_until", data_type: "bigint" },
+						];
+						state.index = ["enabled", "protocol", "poll_claim_until", "last_synced_at"].map((column_name, index) => ({ column_name, seq_in_index: index + 1 }));
+					}
+					return {};
+				},
+			};
+		},
+	};
+	return { db, state };
+}
+
+test("MySQL runner resumes 0036 from a partial token-column ALTER and repairs schema before ledgering", async () => {
+	const fixture = mysqlResumeFixture([{ column_name: "poll_claim_token", data_type: "text" }], []);
+	const result = await applyPendingMigrations(fixture.db);
+	assert.equal(result.ready, true);
+	assert.deepEqual(result.applied, ["0036_external_account_poll_claims.sql"]);
+	assert.equal(fixture.state.alterations, 1);
+	assert.equal(fixture.state.columns[0].data_type, "longtext");
+	assert.equal(fixture.state.index.length, 4);
+});
+
+test("MySQL runner reconciles the ledger when 0036 ALTER committed before a restart", async () => {
+	const fixture = mysqlResumeFixture(
+		[{ column_name: "poll_claim_token", data_type: "longtext" }, { column_name: "poll_claim_until", data_type: "bigint" }],
+		["enabled", "protocol", "poll_claim_until", "last_synced_at"].map((column_name, index) => ({ column_name, seq_in_index: index + 1 })),
+	);
+	const result = await applyPendingMigrations(fixture.db);
+	assert.equal(result.ready, true);
+	assert.deepEqual(result.applied, ["0036_external_account_poll_claims.sql"]);
+	assert.equal(fixture.state.alterations, 0, "an already-applied DDL statement is not replayed");
+});
+
+test("MySQL verifies a ledgered 0036 with the legacy TEXT token and converges it to LONGTEXT", async () => {
+	const fixture = mysqlResumeFixture([{ column_name: "poll_claim_token", data_type: "text" }], [], true);
+	const result = await applyPendingMigrations(fixture.db);
+	assert.equal(result.ready, true);
+	assert.deepEqual(result.applied, []);
+	assert.equal(fixture.state.alterations, 1);
+	assert.equal(fixture.state.columns[0].data_type, "longtext");
 });
 
 test("PostgreSQL and MySQL ship the triggers SQLite has", () => {

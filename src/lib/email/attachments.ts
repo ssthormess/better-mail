@@ -63,19 +63,24 @@ export function validateAttachments(attachments: AttachmentContent[], maxMb = DE
 	if (error) throw new Error(error);
 }
 
+async function inboundAttachmentId(messageId: string, index: number): Promise<string> {
+	const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`${messageId}\0${index}`));
+	return `att_${Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
+}
+
 export async function storeMessageAttachments(
 	env: CloudflareEnv,
 	messageId: string,
 	attachments: AttachmentContent[],
-	options?: { validate?: boolean },
+	options?: { validate?: boolean; retrySafe?: boolean },
 ): Promise<StoredAttachment[]> {
 	if (options?.validate !== false) validateAttachments(attachments, await getOutboundAttachmentMaxMb(env));
 	const db = getDb(env);
 	const stored: StoredAttachment[] = [];
 
 	try {
-		for (const attachment of attachments) {
-			const id = newId("att");
+		for (const [index, attachment] of attachments.entries()) {
+			const id = options?.retrySafe ? await inboundAttachmentId(messageId, index) : newId("att");
 			const filename = sanitizeFilename(attachment.filename);
 			const r2Key = `attachments/${messageId}/${id}/${filename}`;
 			const disposition = attachment.disposition ?? "attachment";
@@ -94,7 +99,7 @@ export async function storeMessageAttachments(
 				contentId: attachment.contentId ?? null,
 				r2Key,
 			});
-			await db.insert(messageAttachments).values({
+			const values = {
 				id,
 				messageId,
 				filename,
@@ -103,10 +108,15 @@ export async function storeMessageAttachments(
 				disposition,
 				contentId: attachment.contentId ?? null,
 				r2Key,
-			});
+			};
+			const insert = db.insert(messageAttachments).values(values);
+			if (options?.retrySafe) await insert.onConflictDoNothing();
+			else await insert;
 		}
 	} catch (error) {
-		await Promise.all(stored.map((attachment) => env.BUCKET.delete(attachment.r2Key)));
+		// A replay may be racing a timed-out attempt; never remove a deterministic key that another
+		// completion attempt can already have attached to the same message.
+		if (!options?.retrySafe) await Promise.all(stored.map((attachment) => env.BUCKET.delete(attachment.r2Key)));
 		throw error;
 	}
 

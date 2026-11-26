@@ -1,6 +1,7 @@
 import { and, asc, eq, gt, lte, notInArray, or, isNull, sql } from "drizzle-orm";
 import { getDb } from "@/db";
 import { domains, externalAccounts, mailboxes } from "@/db/schema";
+import { kit } from "@/db/schema/kits";
 import { decryptSecret } from "./crypto";
 import { isSyncCursorFormat, SYNC_CURSOR_MAX_SKIPPED_UIDS } from "./cursor";
 import { fetchImap, IMAP_MAX_BATCH_BYTES, IMAP_MAX_MESSAGE_BYTES, IMAP_MAX_MESSAGES_PER_POLL } from "./imap-client";
@@ -42,8 +43,7 @@ export async function pollExternalImapAccounts(env: CloudflareEnv, now = new Dat
   const activeIds = new Set(activeRows.map(row => row.id));
   for (const id of failures.keys()) if (!activeIds.has(id)) failures.delete(id);
   const retryIds = [...failures].filter(([, state]) => state.retryAt > now.getTime()).map(([id]) => id);
-  const nowDate = new Date();
-  const claimAvailable = or(isNull(externalAccounts.pollClaimUntil), lte(externalAccounts.pollClaimUntil, nowDate));
+  const claimAvailable = or(isNull(externalAccounts.pollClaimUntil), lte(externalAccounts.pollClaimUntil, kit.nowSeconds));
   const backoffAvailable = retryIds.length ? notInArray(externalAccounts.id, retryIds) : undefined;
   const rows = await awaitBefore(db.select({ account: externalAccounts, mailbox: mailboxes, domain: domains })
    .from(externalAccounts).innerJoin(mailboxes, eq(externalAccounts.mailboxId, mailboxes.id)).innerJoin(domains, eq(mailboxes.domainId, domains.id))
@@ -75,7 +75,7 @@ export async function pollExternalImapAccounts(env: CloudflareEnv, now = new Dat
    try {
     await awaitBefore(db.update(externalAccounts).set({ pollClaimToken: claimToken, pollClaimUntil: claimUntil })
      .where(and(eq(externalAccounts.id, account.id), eq(externalAccounts.enabled, true), sourceIdentity, originalCursor, cadenceDue,
-      or(isNull(externalAccounts.pollClaimUntil), lte(externalAccounts.pollClaimUntil, claimNow)))), deadlineAt);
+      or(isNull(externalAccounts.pollClaimUntil), lte(externalAccounts.pollClaimUntil, kit.nowSeconds)))), deadlineAt);
     [claim] = await awaitBefore(db.select({ token: externalAccounts.pollClaimToken }).from(externalAccounts)
      .where(and(eq(externalAccounts.id, account.id), eq(externalAccounts.pollClaimToken, claimToken))).limit(1), deadlineAt);
    } catch { continue; }
@@ -89,7 +89,7 @@ export async function pollExternalImapAccounts(env: CloudflareEnv, now = new Dat
      if (currentTime >= deadlineAt || currentTime >= claimUntil.getTime()) { claimLost = true; return; }
      const until = new Date(Math.min(currentTime + CLAIM_LEASE_MS, deadlineAt + CLAIM_EXPIRY_GRACE_MS));
      await awaitBefore(db.update(externalAccounts).set({ pollClaimUntil: until })
-      .where(and(eq(externalAccounts.id, account.id), eq(externalAccounts.pollClaimToken, claimToken), gt(externalAccounts.pollClaimUntil, new Date(currentTime)))), deadlineAt);
+      .where(and(eq(externalAccounts.id, account.id), eq(externalAccounts.pollClaimToken, claimToken), gt(externalAccounts.pollClaimUntil, kit.nowSeconds))), deadlineAt);
      const [owned] = await awaitBefore(db.select({ token: externalAccounts.pollClaimToken, until: externalAccounts.pollClaimUntil }).from(externalAccounts)
       .where(eq(externalAccounts.id, account.id)).limit(1), deadlineAt);
      if (owned?.token !== claimToken || !owned.until || owned.until.getTime() <= Date.now()) claimLost = true;
@@ -120,7 +120,7 @@ export async function pollExternalImapAccounts(env: CloudflareEnv, now = new Dat
      syncCursor: encoded, lastSyncedAt: now,
      lastError: cursor.skippedUids?.length ? SKIPPED_WARNING : null,
     }).where(and(eq(externalAccounts.id, account.id), eq(externalAccounts.enabled, true),
-     eq(externalAccounts.pollClaimToken, claimToken), gt(externalAccounts.pollClaimUntil, new Date()), sourceIdentity,
+     eq(externalAccounts.pollClaimToken, claimToken), gt(externalAccounts.pollClaimUntil, kit.nowSeconds), sourceIdentity,
      expectedCursorRaw === null ? isNull(externalAccounts.syncCursor) : eq(externalAccounts.syncCursor, expectedCursorRaw)))
      .returning({ id: externalAccounts.id }), deadlineAt);
     if (changed.length !== 1) throw new Error("account_changed");
@@ -171,7 +171,7 @@ export async function pollExternalImapAccounts(env: CloudflareEnv, now = new Dat
     if (JSON.stringify(completedCursor) !== expectedCursorRaw) await setState(completedCursor);
     else {
      const changed = await awaitBefore(db.update(externalAccounts).set({ lastSyncedAt: now, lastError: completedCursor.skippedUids?.length ? SKIPPED_WARNING : null })
-      .where(and(eq(externalAccounts.id, account.id), eq(externalAccounts.enabled, true), eq(externalAccounts.pollClaimToken, claimToken), gt(externalAccounts.pollClaimUntil, new Date()), sourceIdentity,
+      .where(and(eq(externalAccounts.id, account.id), eq(externalAccounts.enabled, true), eq(externalAccounts.pollClaimToken, claimToken), gt(externalAccounts.pollClaimUntil, kit.nowSeconds), sourceIdentity,
        expectedCursorRaw === null ? isNull(externalAccounts.syncCursor) : eq(externalAccounts.syncCursor, expectedCursorRaw)))
       .returning({ id: externalAccounts.id }), deadlineAt);
      if (changed.length !== 1) throw new Error("account_changed");
@@ -188,7 +188,7 @@ export async function pollExternalImapAccounts(env: CloudflareEnv, now = new Dat
      : committedCursor?.skippedUids?.length ? "IMAP poll failed; see skippedUids for previously skipped messages"
      : "IMAP poll failed; retry is backed off";
     await awaitBefore(db.update(externalAccounts).set({ lastError: message, lastSyncedAt: now })
-     .where(and(eq(externalAccounts.id, account.id), eq(externalAccounts.pollClaimToken, claimToken), gt(externalAccounts.pollClaimUntil, new Date()), sourceIdentity)), deadlineAt).catch(() => {});
+     .where(and(eq(externalAccounts.id, account.id), eq(externalAccounts.pollClaimToken, claimToken), gt(externalAccounts.pollClaimUntil, kit.nowSeconds), sourceIdentity)), deadlineAt).catch(() => {});
    } finally {
     if (heartbeat) clearInterval(heartbeat);
     await awaitBefore(renewalInFlight, tickDeadline, 1_000).catch(() => {});

@@ -1003,6 +1003,12 @@
         "ALTER TABLE `external_accounts` ADD `poll_claim_until` integer;",
         "CREATE INDEX `external_accounts_claim_idx` ON `external_accounts` (`enabled`,`protocol`,`poll_claim_until`,`last_synced_at`);"
       ]
+    },
+    {
+      "name": "0113_external_message_intake_completion.sql",
+      "statements": [
+        "ALTER TABLE `messages` ADD `intake_complete` integer DEFAULT true NOT NULL;"
+      ]
     }
   ]
 }

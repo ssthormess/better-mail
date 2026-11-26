@@ -1,0 +1,1 @@
+ALTER TABLE `messages` ADD `intake_complete` boolean DEFAULT true NOT NULL;

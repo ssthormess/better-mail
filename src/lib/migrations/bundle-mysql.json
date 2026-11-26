@@ -526,6 +526,12 @@
       "statements": [
         "ALTER TABLE `external_accounts`\n\tADD COLUMN `poll_claim_token` longtext,\n\tADD COLUMN `poll_claim_until` bigint,\n\tADD INDEX `external_accounts_claim_idx` (`enabled`,`protocol`,`poll_claim_until`,`last_synced_at`);"
       ]
+    },
+    {
+      "name": "0037_external_message_intake_completion.sql",
+      "statements": [
+        "ALTER TABLE `messages` ADD `intake_complete` boolean DEFAULT true NOT NULL;"
+      ]
     }
   ]
 }
