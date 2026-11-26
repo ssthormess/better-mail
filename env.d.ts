@@ -84,6 +84,8 @@ interface CloudflareEnv {
 	 * to store or read a password rather than falling back to plaintext.
 	 */
 	MAILFLARE_ENCRYPTION_KEY?: string;
+	/** Node IMAP fetch only: set to "1" to permit fetching from private/LAN destinations; defaults to public IPs only. */
+	EXTERNAL_FETCH_ALLOW_PRIVATE?: string;
 	/** "1" refuses relays that do not sign the header map with a timestamp (relay Worker v2). */
 	INBOUND_REQUIRE_SIGNED_HEADERS?: string;
 	/** Cloudflare account id, needed for the Email Sending REST API off Workers. */

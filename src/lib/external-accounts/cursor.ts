@@ -6,7 +6,8 @@ import type { ExternalAccountProtocol } from "./types";
  * and the backup restore enforce; the codec that writes a cursor belongs to the poller that owns it.
  *
  * Expected shapes (F37/F38):
- * - IMAP: `{"uidValidity":<int>,"lastUid":<int>}` — two small integers.
+ * - IMAP: `{"uidValidity":<positive uint32>,"lastUid":<uint32>,"skippedUids"?:[<positive uint32>, …]}`.
+ *   `skippedUids` is a bounded diagnostic for permanently oversized messages already passed by the contiguous cursor.
  * - POP3: `{"uidls":["<sha256 hex>", …],"lastCheckedAt":"<ISO-8601>"}` — a capped, hashed list of the UIDLs
  *   already imported.
  *
@@ -18,11 +19,12 @@ import type { ExternalAccountProtocol } from "./types";
 export const SYNC_CURSOR_MAX_BYTES = 64 * 1024;
 /** A POP3 row is re-written on every poll; this keeps one account's cursor well under the byte bound. */
 export const SYNC_CURSOR_MAX_UIDLS = 4096;
+export const SYNC_CURSOR_MAX_SKIPPED_UIDS = 128;
 const MAX_UIDL_LENGTH = 128;
 const MAX_TIMESTAMP_LENGTH = 64;
 
 const CURSOR_KEYS: Record<ExternalAccountProtocol, readonly string[]> = {
-	imap: ["uidValidity", "lastUid"],
+	imap: ["uidValidity", "lastUid", "skippedUids"],
 	pop3: ["uidls", "lastCheckedAt"],
 };
 
@@ -34,8 +36,14 @@ function isCursorShape(value: unknown, protocol: ExternalAccountProtocol): boole
 	if (!entries.every(([key]) => CURSOR_KEYS[protocol].includes(key))) return false;
 	for (const [key, item] of entries) {
 		if (protocol === "imap") {
-			// UIDVALIDITY and the last seen UID are unsigned 32-bit integers on the wire.
-			if (typeof item !== "number" || !isNonNegativeInteger(item) || item > 0xffffffff) return false;
+			if (key === "skippedUids") {
+				if (!Array.isArray(item) || item.length > SYNC_CURSOR_MAX_SKIPPED_UIDS) return false;
+				if (!item.every((uid) => typeof uid === "number" && Number.isInteger(uid) && uid > 0 && uid <= 0xffffffff)) return false;
+				if (new Set(item).size !== item.length) return false;
+				continue;
+			}
+			// UIDVALIDITY is positive; the empty lastUid sentinel is zero.
+			if (typeof item !== "number" || !isNonNegativeInteger(item) || item > 0xffffffff || (key === "uidValidity" && item === 0)) return false;
 			continue;
 		}
 		if (key === "uidls") {
@@ -44,6 +52,11 @@ function isCursorShape(value: unknown, protocol: ExternalAccountProtocol): boole
 		} else if (typeof item !== "string" || item.length > MAX_TIMESTAMP_LENGTH) {
 			return false;
 		}
+	}
+	if (protocol === "imap") {
+		const cursor = value as Record<string, unknown>;
+		const lastUid = cursor.lastUid;
+		if (Array.isArray(cursor.skippedUids) && (typeof lastUid !== "number" || cursor.skippedUids.some((uid) => typeof uid !== "number" || uid > lastUid))) return false;
 	}
 	return true;
 }

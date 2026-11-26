@@ -77,6 +77,8 @@ export function createNodeRuntime(): NodeRuntime {
 		// Key for credentials stored encrypted (src/lib/external-accounts/crypto.ts). Without it those routes
 		// refuse to store or read a password instead of falling back to plaintext.
 		MAILFLARE_ENCRYPTION_KEY: optional("MAILFLARE_ENCRYPTION_KEY"),
+		// Account managers can request arbitrary remote hosts; private-network dialing is an explicit operator opt-in.
+		EXTERNAL_FETCH_ALLOW_PRIVATE: optional("EXTERNAL_FETCH_ALLOW_PRIVATE"),
 		// Resend provider settings (src/lib/email/outbound-provider.ts, resend-api.ts): the key fallback and a
 		// Resend-compatible API, read from env on Workers and passed through here for the Node runtime.
 		RESEND_BASE_URL: optional("RESEND_BASE_URL"),

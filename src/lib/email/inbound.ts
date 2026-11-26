@@ -49,11 +49,15 @@ export type InboundQueueMessage = {
 	senderIp?: string;
 };
 
-/** True when the address is a mailbox or alias owned by the user, so their own mail never counts as unread. */
+/**
+ * True when the address is a mailbox or alias owned by the user, so their own mail never counts as unread.
+ * `suppressSideEffects` is for historical imports: it retains parsing and classification while avoiding replies,
+ * user notifications, webhooks, auto-drafts, DSN actions and avatar lookups for old messages.
+ */
 export async function processInboundMessage(
 	env: CloudflareEnv,
 	payload: InboundQueueMessage,
-	options: { reportBudget?: BatchBudget } = {},
+	options: { reportBudget?: BatchBudget; suppressSideEffects?: boolean } = {},
 ): Promise<void> {
 	const db = getDb(env);
 	// DMARC aggregate reports bypass mailboxes entirely (see report-address.ts); they are parsed into stats and discarded.
@@ -96,7 +100,7 @@ export async function processInboundMessage(
 	if (stored) {
 		try {
 			const [existing] = await db.select().from(messages).where(eq(messages.id, stored.id)).limit(1);
-			if (existing && Date.now() - existing.createdAt.getTime() < 30 * 60_000) await scheduleAutoDraft(env, { mailboxId: decision.mailbox.mailboxId, sourceMessageId: existing.id, ownerUserId: decision.mailbox.userId, sender: existing.fromAddr, headers: payload.headers, status: existing.status, folderId: existing.folderId, spamVerdict: existing.spamVerdict, spamAnalysisError: existing.spamAnalysisError });
+			if (!options.suppressSideEffects && existing && Date.now() - existing.createdAt.getTime() < 30 * 60_000) await scheduleAutoDraft(env, { mailboxId: decision.mailbox.mailboxId, sourceMessageId: existing.id, ownerUserId: decision.mailbox.userId, sender: existing.fromAddr, headers: payload.headers, status: existing.status, folderId: existing.folderId, spamVerdict: existing.spamVerdict, spamAnalysisError: existing.spamAnalysisError });
 		} catch (error) { console.error("Auto-draft recovery failed", error); }
 		return;
 	}
@@ -179,7 +183,7 @@ export async function processInboundMessage(
 		address: fromAddr,
 		source: "inbound",
 		// Spam senders are strangers at best; do not announce them to Gravatar.
-		lookupAvatar: status !== "spam" && status !== "trash",
+		lookupAvatar: !options.suppressSideEffects && status !== "spam" && status !== "trash",
 	}).catch((error) => {
 		console.error(`Contact upsert failed for ${messageId}`, error);
 		return null;
@@ -267,12 +271,12 @@ export async function processInboundMessage(
 
 	// A returned message is still delivered to the mailbox; recording its failed recipients is best effort.
 	try {
-		await recordDsnBounces(env, { mailboxId: decision.mailbox.mailboxId, raw: buffer });
+		if (!options.suppressSideEffects) await recordDsnBounces(env, { mailboxId: decision.mailbox.mailboxId, raw: buffer });
 	} catch (error) {
 		console.error(`Bounce recording failed for ${messageId}`, error);
 	}
 
-	if (status === "received") {
+	if (status === "received" && !options.suppressSideEffects) {
 		try {
 			await sendMailboxAutoReply(env, {
 				mailboxId: decision.mailbox.mailboxId,
@@ -287,7 +291,9 @@ export async function processInboundMessage(
 		}
 	}
 
-	if (status === "spam" || status === "trash") {
+	if (options.suppressSideEffects) {
+		// Historical external mail is imported without notifying people or replying to old senders.
+	} else if (status === "spam" || status === "trash") {
 		console.info(`No notification for ${messageId}: filed as ${status}`);
 	} else {
 		const notificationUserIds = await getMailboxNotificationUserIds(
@@ -309,7 +315,7 @@ export async function processInboundMessage(
 		}), { silent: isSilentPromotion(category, mode) });
 	}
 	// Spam and blocked mail carry an unauthenticated From; consumers acting on it would be fooled.
-	if (status !== "spam" && status !== "trash") {
+	if (!options.suppressSideEffects && status !== "spam" && status !== "trash") {
 		await dispatchWebhooks(env, decision.mailbox.userId, "message.inbound", {
 			messageId,
 			from: fromAddr,
@@ -323,7 +329,7 @@ export async function processInboundMessage(
 		});
 	}
 	try {
-		await scheduleAutoDraft(env, { mailboxId: decision.mailbox.mailboxId, sourceMessageId: messageId, ownerUserId: decision.mailbox.userId, sender: fromAddr, headers: payload.headers, status, folderId, spamVerdict: spamAnalysis?.verdict, spamAnalysisError });
+		if (!options.suppressSideEffects) await scheduleAutoDraft(env, { mailboxId: decision.mailbox.mailboxId, sourceMessageId: messageId, ownerUserId: decision.mailbox.userId, sender: fromAddr, headers: payload.headers, status, folderId, spamVerdict: spamAnalysis?.verdict, spamAnalysisError });
 	} catch (error) { console.error("Auto-draft scheduling failed", error); }
 }
 
