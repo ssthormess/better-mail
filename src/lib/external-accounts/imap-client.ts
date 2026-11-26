@@ -11,6 +11,7 @@ export async function fetchImap(account: { host: string; port: number; tlsMode: 
  let data = Buffer.alloc(0);
  let nextTag = 0;
  const waiters: Array<() => void> = [];
+ let detachSocket = () => {};
  const connectSocket = (tls: boolean) => new Promise<Socket>((resolve, reject) => {
   const s = tls ? tlsConnect({ host: account.host, port: account.port, servername: account.host, rejectUnauthorized: true }) : tcpConnect({ host: account.host, port: account.port });
   const timer = setTimeout(() => { s.destroy(); reject(new Error("timeout")); }, TIMEOUT_MS);
@@ -18,7 +19,14 @@ export async function fetchImap(account: { host: string; port: number; tlsMode: 
   s.once("connect", () => { if (!tls) { clearTimeout(timer); resolve(s); } });
   s.once("error", () => { clearTimeout(timer); reject(new Error("connection_failed")); });
  });
- const readGreeting = async (s: Socket) => { conn.socket = s; s.on("data", chunk => { data = Buffer.concat([data, chunk]); if (data.length > MAX_RESPONSE) s.destroy(new Error("response_too_large")); for (const w of waiters.splice(0)) w(); }); s.on("error", () => { for (const w of waiters.splice(0)) w(); }); await until(() => data.includes(Buffer.from("\r\n"))); const line = takeLine(); if (!/^\* OK\b/i.test(line)) throw new Error("server_unavailable"); };
+ const attachSocket = (s: Socket) => {
+  detachSocket(); conn.socket = s;
+  const onData = (chunk: Buffer) => { data = Buffer.concat([data, chunk]); if (data.length > MAX_RESPONSE) s.destroy(); for (const w of waiters.splice(0)) w(); };
+  const onError = () => { for (const w of waiters.splice(0)) w(); };
+  s.on("data", onData); s.on("error", onError);
+  detachSocket = () => { s.off("data", onData); s.off("error", onError); };
+ };
+ const readGreeting = async (s: Socket) => { attachSocket(s); await until(() => data.includes(Buffer.from("\r\n"))); const line = takeLine(); if (!/^\* OK\b/i.test(line)) throw new Error("server_unavailable"); };
  const until = async (condition: () => boolean) => { const end = Date.now() + TIMEOUT_MS; while (!condition()) { if (Date.now() > end || !conn.socket || conn.socket.destroyed) throw new Error("connection_failed"); await new Promise<void>(resolve => { const timer = setTimeout(resolve, 100); waiters.push(() => { clearTimeout(timer); resolve(); }); }); } };
  const takeLine = () => { const at = data.indexOf(Buffer.from("\r\n")); const line = data.subarray(0, at).toString("utf8"); data = data.subarray(at + 2); return line; };
  const command = async (text: string): Promise<Buffer> => {
@@ -34,7 +42,7 @@ export async function fetchImap(account: { host: string; port: number; tlsMode: 
  };
  try {
   const initial = await connectSocket(account.tlsMode === "implicit-tls"); await readGreeting(initial);
-  if (account.tlsMode === "starttls") { await command("STARTTLS"); const upgraded = await new Promise<Socket>((resolve, reject) => { const secure = tlsConnect({ socket: conn.socket!, servername: account.host, rejectUnauthorized: true }, () => resolve(secure)); secure.once("error", () => reject(new Error("tls_failed"))); }); await readGreetingAfterUpgrade(upgraded); }
+  if (account.tlsMode === "starttls") { await command("STARTTLS"); detachSocket(); data = Buffer.alloc(0); const upgraded = await new Promise<Socket>((resolve, reject) => { const secure = tlsConnect({ socket: conn.socket!, servername: account.host, rejectUnauthorized: true }, () => resolve(secure)); secure.once("error", () => reject(new Error("tls_failed"))); }); attachSocket(upgraded); }
   await command(`LOGIN ${quote(account.username)} ${quote(account.password)}`);
   const selected = await command('EXAMINE "INBOX"');
   const validity = Number(selected.toString().match(/\[UIDVALIDITY (\d+)\]/i)?.[1]); if (!Number.isSafeInteger(validity) || validity < 0) throw new Error("invalid_mailbox_state");
@@ -44,15 +52,18 @@ export async function fetchImap(account: { host: string; port: number; tlsMode: 
   const fetched: Array<{ uid: number; raw: Buffer }> = []; let maxUid = cursor?.uidValidity === validity ? cursor.lastUid : 0;
   for (const uid of uids) {
    const response = await command(`UID FETCH ${uid} (UID BODY.PEEK[])`);
-   const match = response.toString().match(/\* \d+ FETCH \(UID (\d+) BODY\[\] \{(\d+)\}\r\n/);
-   if (!match) throw new Error("invalid_fetch_response");
+   const match = response.toString().match(/\* \d+ FETCH \(([^\r\n]*)\{(\d+)\}\r\n/);
+   const fetchAttributes = match?.[1] ?? "";
+   if (!match || !/(?:BODY\[\]|RFC822)/i.test(fetchAttributes)) throw new Error("invalid_fetch_response");
    const marker = Buffer.from(match[0]); const offset = response.indexOf(marker) + marker.length;
-   const raw = response.subarray(offset, offset + Number(match[2]));
-   if (raw.length > maxBytes) throw new Error("message_too_large");
+   const literalLength = Number(match[2]);
+   const fetchedUid = Number(fetchAttributes.match(/\bUID (\d+)\b/i)?.[1] ?? response.subarray(offset + literalLength).toString().match(/\bUID (\d+)\b/i)?.[1]);
+   if (fetchedUid !== uid) throw new Error("invalid_fetch_response");
+   const raw = response.subarray(offset, offset + literalLength);
+   if (raw.length !== Number(match[2]) || raw.length > maxBytes) throw new Error("message_too_large");
    fetched.push({ uid, raw: Buffer.from(raw) }); maxUid = uid;
   }
   await command("LOGOUT"); conn.socket?.end(); return { uidValidity: validity, lastUid: maxUid, messages: fetched };
  } catch (error) { conn.socket?.destroy(); throw error; }
- async function readGreetingAfterUpgrade(s: Socket) { conn.socket = s; data = Buffer.alloc(0); s.on("data", chunk => { data = Buffer.concat([data, chunk]); for (const w of waiters.splice(0)) w(); }); await until(() => true); }
 }
 function quote(value: string) { return `"${value.replace(/[\\\"]/g, "\\$&")}"`; }
