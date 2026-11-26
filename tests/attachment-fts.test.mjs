@@ -248,3 +248,88 @@ test("search stays message-only until the attachment index migration is applied"
 	assert.deepEqual(await ids("quarterly"), ["m1"], "the applied migration makes attachment text searchable");
 	assert.deepEqual(await ids("quarterly -absentterm"), ["m1"], "and the negative path uses both indexes again");
 });
+
+test("a probe cached on one D1 session never makes a lagging session emit attachment SQL", async (t) => {
+	// Two databases behind one raw binding stand for two D1 read sessions with independent
+	// schema visibility: `current` has applied 0109, `lagging` has not. With read replication
+	// `env.DB` is each request's session, so the answer must be per connection — a positive
+	// cached on the current session was reused by the lagging one in the F52 gate's round-2
+	// workerd simulation, and its SQL then failed to prepare (`no such table`), a 500 on
+	// positive, negative and mixed searches.
+	const current = new m.SqliteDatabase(":memory:");
+	const lagging = new m.SqliteDatabase(":memory:");
+	t.after(() => { current.db.close(); lagging.db.close(); });
+	const beforeIndex = mkdtempSync(join(root, "node_modules", "mailflare-attachment-fts-lag-"));
+	t.after(() => rmSync(beforeIndex, { recursive: true, force: true }));
+	cpSync(join(root, "drizzle/migrations"), beforeIndex, { recursive: true });
+	rmSync(join(beforeIndex, "0109_attachment_search_index.sql"));
+	await m.applyMigrations(lagging, beforeIndex);
+	await m.applyMigrations(current, join(root, "drizzle/migrations"));
+	for (const database of [current, lagging]) {
+		database.db.exec(`
+			INSERT INTO users (id, email, password_hash, name, role, is_primary_admin, created_at) VALUES ('u', 'o@one.test', 'h', 'O', 'admin', 1, 1);
+			INSERT INTO messages (id, user_id, direction, from_addr, to_addr, subject, text_body, status, created_at) VALUES
+				('m1', 'u', 'inbound', 'maya@acme.test', 'o@one.test', 'weekly status', 'confidential planning', 'received', 1),
+				('m2', 'u', 'inbound', 'sam@other.test', 'o@one.test', 'another note', 'invoice in body', 'received', 2);
+			INSERT INTO message_attachments (id, message_id, filename, content_type, size, r2_key, extract_status, extracted_text, created_at) VALUES
+				('a1', 'm1', 'q3.pdf', 'application/pdf', 10, 'attachments/m1/a1/q3.pdf', 'done', 'quarterly invoice', 1);
+		`);
+	}
+	// The raw binding both sessions were opened from: the positive cache key under the round-1
+	// design, deliberately still passed so the test would fail if it became the key again.
+	const rawBinding = {};
+
+	// A search request on an up-to-date session caches "the index exists".
+	assert.equal(await m.hasAttachmentSearchIndex({ DB: current, DB_PRIMARY: rawBinding }), true);
+	assert.equal(await m.hasAttachmentSearchIndex({ DB: current, DB_PRIMARY: rawBinding }), true);
+
+	// The next request lands on a replica that has not applied 0109. Its own session says no,
+	// so it serves message-only results instead of the 500 the cached positive produced.
+	const db = m.getDb({ DB: lagging });
+	const search = async (query) => {
+		const attachmentText = await m.hasAttachmentSearchIndex({ DB: lagging, DB_PRIMARY: rawBinding });
+		const statement = db.select({ id: m.messages.id }).from(m.messages).where(...m.buildSearchConditions(query, "UTC", { attachmentText }));
+		return { attachmentText, sql: statement.toSQL().sql, rows: (await statement).map((row) => row.id).sort() };
+	};
+	for (const [query, expected] of [["invoice", ["m2"]], ["-confidential", ["m2"]], ["invoice -confidential", ["m2"]]]) {
+		const result = await search(query);
+		assert.equal(result.attachmentText, false, "the lagging session must not inherit the other session's answer");
+		assert.doesNotMatch(result.sql, /attachments_fts/, "no attachment SQL is emitted for a session that cannot prepare it");
+		// m1's attachment says "quarterly invoice", which this session cannot see yet.
+		assert.deepEqual(result.rows, expected, `${query} answers from message text only`);
+	}
+
+	// For the record: had the cached positive been used, the same session throws exactly the
+	// error that made the request a 500, so this is the failure the per-connection answer avoids.
+	await assert.rejects(
+		db.select({ id: m.messages.id }).from(m.messages).where(...m.buildSearchConditions("invoice", "UTC", { attachmentText: true })),
+		(error) => /no such table: attachments_fts/.test(String(error.cause ?? error)),
+	);
+	// The up-to-date session keeps working, attachment text included.
+	const currentDb = m.getDb({ DB: current });
+	const currentIds = async (query) =>
+		(await currentDb.select({ id: m.messages.id }).from(m.messages).where(...m.buildSearchConditions(query, "UTC", { attachmentText: await m.hasAttachmentSearchIndex({ DB: current }) }))).map((row) => row.id).sort();
+	assert.deepEqual(await currentIds("quarterly"), ["m1"]);
+});
+
+test("a probe still in flight cannot republish an answer past a cache clear", async () => {
+	// The gate's round-2 harness: a pre-clear probe that resolves after clearAttachmentIndexProbe()
+	// used to write its stale answer into the replacement cache, so the next 30 seconds served
+	// "no index" to a connection that could see it.
+	let release;
+	let probes = 0;
+	const connection = { prepare: () => ({ first: () => { probes += 1; return new Promise((resolve) => { release = resolve; }); } }) };
+	const inFlight = m.hasAttachmentSearchIndex({ DB: connection });
+	m.clearAttachmentIndexProbe(connection);
+	release({ name: "attachments_fts" });
+	assert.equal(await inFlight, true, "the probe still reports what it saw");
+	// The answer was not published: the same connection is probed again, not served the
+	// result that the clear discarded.
+	const answer = null;
+	connection.prepare = () => ({ first: () => { probes += 1; return Promise.resolve(answer); } });
+	assert.equal(await m.hasAttachmentSearchIndex({ DB: connection }), false);
+	assert.equal(probes, 2);
+	// The post-clear answer is cached normally.
+	assert.equal(await m.hasAttachmentSearchIndex({ DB: connection }), false);
+	assert.equal(probes, 2, "a miss is cached for a later call on the same connection");
+});
