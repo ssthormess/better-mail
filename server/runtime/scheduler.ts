@@ -1,4 +1,5 @@
 import { dailyJobs, frequentJobs, runScheduledJob } from "@/lib/scheduled/jobs";
+import { pollExternalImapAccounts } from "@/lib/external-accounts/poller";
 
 /** Jobs marked `everyFiveMinutes` assume the Worker cron's cadence; this loop ticks every minute. */
 const FIVE_MINUTES_MS = 5 * 60_000;
@@ -14,6 +15,8 @@ export function startScheduler(env: CloudflareEnv) {
 		for (const job of frequentJobs(env, now)) {
 			if (!job.everyFiveMinutes || spacedDue) void runScheduledJob(job);
 		}
+		// IMAP polling needs node:net/tls, so it lives here rather than in the shared jobs.ts registry that Workers import.
+		void runScheduledJob({ name: "External IMAP polling", run: () => pollExternalImapAccounts(env) });
 		const day = now.toISOString().slice(0, 10);
 		if (now.getUTCHours() !== 2 || lastRunDay === day) return;
 		lastRunDay = day;
