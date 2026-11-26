@@ -55,6 +55,15 @@ export type InboundQueueMessage = {
  * reputation, ingesting DMARC reports, replying, notifying, dispatching webhooks, auto-drafting or avatar lookup.
  * MIME parsing, routing, spam classification and message storage still run.
  */
+function awaitOperation<T>(work: Promise<T>, deadlineAt?: number, maxWaitMs = 5_000): Promise<T> {
+	if (deadlineAt === undefined) return work;
+	const end = Math.min(deadlineAt, Date.now() + maxWaitMs);
+	if (end <= Date.now()) { void work.catch(() => {}); return Promise.reject(new Error("timeout")); }
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	return Promise.race([work, new Promise<T>((_resolve, reject) => { timer = setTimeout(() => reject(new Error("timeout")), end - Date.now()); })])
+		.finally(() => { if (timer) clearTimeout(timer); });
+}
+
 export async function processInboundMessage(
 	env: CloudflareEnv,
 	payload: InboundQueueMessage,
@@ -65,21 +74,21 @@ export async function processInboundMessage(
 	const historicalImport = options.intakeMode === "historical_import";
 	const db = getDb(env);
 	// DMARC aggregate reports bypass mailboxes entirely (see report-address.ts); historical imports do not ingest them.
-	const reportTarget = await matchReportAddress(env, payload.to);
+	const reportTarget = await awaitOperation(matchReportAddress(env, payload.to), options.deadlineAt);
 	if (reportTarget) {
-		if (historicalImport) { await env.BUCKET.delete(payload.rawR2Key); return; }
+		if (historicalImport) { await awaitOperation(env.BUCKET.delete(payload.rawR2Key), options.deadlineAt); return; }
 		// The From header, not the envelope sender: it is what the DMARC verdict aligned to.
 		const from = Object.entries(payload.headers ?? {}).find(([name]) => name.toLowerCase() === "from")?.[1] ?? null;
-		await ingestReportMail(env, reportTarget, { rawR2Key: payload.rawR2Key, authenticated: readTrustedDmarcResult(payload.headers, payload.verdicts) === "pass", from }, { batchBudget: options.reportBudget });
+		await awaitOperation(ingestReportMail(env, reportTarget, { rawR2Key: payload.rawR2Key, authenticated: readTrustedDmarcResult(payload.headers, payload.verdicts) === "pass", from }, { batchBudget: options.reportBudget }), options.deadlineAt);
 		return;
 	}
 	// The sender is passed so that sender-based block rules resolve the same way here as they
 	// do in the Worker email handler.
 	assertBeforeDeadline();
-	const decision = await resolveInboundAddress(db, payload.to, payload.from, { headers: payload.headers });
+	const decision = await awaitOperation(resolveInboundAddress(db, payload.to, payload.from, { headers: payload.headers }), options.deadlineAt);
 
 	// Nothing references the raw object on these paths, so keep it from piling up in storage.
-	const dropRaw = () => env.BUCKET.delete(payload.rawR2Key).catch((error) => console.error(`Raw cleanup failed for ${payload.rawR2Key}`, error));
+	const dropRaw = () => awaitOperation(env.BUCKET.delete(payload.rawR2Key), options.deadlineAt).catch((error) => console.error(`Raw cleanup failed for ${payload.rawR2Key}`, error));
 
 	if (!decision) {
 		console.warn(`No routing for inbound address: ${payload.to}`);
@@ -99,44 +108,47 @@ export async function processInboundMessage(
 		await dropRaw();
 		return;
 	}
-	const [stored] = await db.select({ id: messages.id }).from(messages).where(and(
+	const [stored] = await awaitOperation(db.select({ id: messages.id }).from(messages).where(and(
 		eq(messages.mailboxId, decision.mailbox.mailboxId),
 		eq(messages.rawR2Key, payload.rawR2Key),
-	)).limit(1);
+	)).limit(1), options.deadlineAt);
 	if (stored) {
-		try {
-			const [existing] = await db.select().from(messages).where(eq(messages.id, stored.id)).limit(1);
-			if (!historicalImport && existing && Date.now() - existing.createdAt.getTime() < 30 * 60_000) await scheduleAutoDraft(env, { mailboxId: decision.mailbox.mailboxId, sourceMessageId: existing.id, ownerUserId: decision.mailbox.userId, sender: existing.fromAddr, headers: payload.headers, status: existing.status, folderId: existing.folderId, spamVerdict: existing.spamVerdict, spamAnalysisError: existing.spamAnalysisError });
-		} catch (error) { console.error("Auto-draft recovery failed", error); }
+		if (!historicalImport) {
+			try {
+				const [existing] = await awaitOperation(db.select().from(messages).where(eq(messages.id, stored.id)).limit(1), options.deadlineAt);
+				if (existing && Date.now() - existing.createdAt.getTime() < 30 * 60_000) await scheduleAutoDraft(env, { mailboxId: decision.mailbox.mailboxId, sourceMessageId: existing.id, ownerUserId: decision.mailbox.userId, sender: existing.fromAddr, headers: payload.headers, status: existing.status, folderId: existing.folderId, spamVerdict: existing.spamVerdict, spamAnalysisError: existing.spamAnalysisError });
+			} catch (error) { console.error("Auto-draft recovery failed", error); }
+		}
 		return;
 	}
 
 	assertBeforeDeadline();
-	const raw = await env.BUCKET.get(payload.rawR2Key);
+	const raw = await awaitOperation(env.BUCKET.get(payload.rawR2Key), options.deadlineAt);
 	if (!raw) {
 		console.error(`Missing R2 object: ${payload.rawR2Key}`);
 		return;
 	}
 
-	const buffer = await raw.arrayBuffer();
+	const buffer = await awaitOperation(raw.arrayBuffer(), options.deadlineAt);
 	assertBeforeDeadline();
 	let parsed: Awaited<ReturnType<typeof parseRawMime>>;
 	try {
-		parsed = boundParsedEmail(await parseRawMime(buffer));
+		parsed = boundParsedEmail(await awaitOperation(parseRawMime(buffer), options.deadlineAt));
 	} catch (error) {
+		if (error instanceof Error && error.message === "timeout") throw error;
 		// Deterministic: a retry would repeat the same expensive parse, so drop the message.
 		console.warn(`Inbound MIME rejected for ${payload.to}`, error);
-		await env.BUCKET.delete(payload.rawR2Key);
+		await awaitOperation(env.BUCKET.delete(payload.rawR2Key), options.deadlineAt);
 		return;
 	}
 	assertBeforeDeadline();
 	const attachmentLimitReason = inboundAttachmentLimitReason(parsed.attachments);
 	if (attachmentLimitReason) {
 		console.warn(`Inbound attachment limit reached for ${payload.to}: ${attachmentLimitReason}`);
-		await env.BUCKET.delete(payload.rawR2Key);
+		await awaitOperation(env.BUCKET.delete(payload.rawR2Key), options.deadlineAt);
 		return;
 	}
-	const messageId = await inboundMessageId(payload.rawR2Key);
+	const messageId = await awaitOperation(inboundMessageId(payload.rawR2Key), options.deadlineAt);
 	const snippet = buildSnippet(parsed.text, parsed.html);
 	const deliveredAddress = getEmailAddress(payload.to) || `${decision.mailbox.localPart}@${decision.mailbox.hostname}`;
 	// Keep the whole To header so reply-all can address everyone; rules and
@@ -144,24 +156,24 @@ export async function processInboundMessage(
 	const toAddr = parsed.toAddr ?? payload.to;
 	const fromAddr = parsed.fromAddr ?? payload.from;
 	assertBeforeDeadline();
-	const destination = await resolveInboxRuleDestination(db, {
+	const destination = await awaitOperation(resolveInboxRuleDestination(db, {
 		mailboxId: decision.mailbox.mailboxId,
 		toAddress: payload.to,
 		fromAddress: fromAddr,
 		subject: parsed.subject,
 		content: [parsed.text, parsed.html, snippet].filter(Boolean).join(" "),
 		headers: payload.headers,
-	});
+	}), options.deadlineAt);
 	assertBeforeDeadline();
 	let spamAnalysis: Awaited<ReturnType<typeof analyzeSpam>> | null = null;
 	let spamAnalysisError: string | null = null;
-	const [owner] = await db.select({ enabled: users.spamProtectionEnabled, strictness: users.spamStrictness }).from(users).where(eq(users.id, decision.mailbox.userId)).limit(1);
+	const [owner] = await awaitOperation(db.select({ enabled: users.spamProtectionEnabled, strictness: users.spamStrictness }).from(users).where(eq(users.id, decision.mailbox.userId)).limit(1), options.deadlineAt);
 	assertBeforeDeadline();
 	if (owner?.enabled !== false) {
 		try {
 			assertBeforeDeadline();
-			const intelligence = await getSpamIntelligenceConfig(env);
-			spamAnalysis = await analyzeSpam(db, {
+			const intelligence = await awaitOperation(getSpamIntelligenceConfig(env), options.deadlineAt);
+			spamAnalysis = await awaitOperation(analyzeSpam(db, {
 				mailboxId: decision.mailbox.mailboxId,
 				userId: decision.mailbox.userId,
 				envelopeFrom: payload.from,
@@ -172,9 +184,10 @@ export async function processInboundMessage(
 				strictness: owner?.strictness,
 				message: parsed,
 				intelligenceProvider: new ExternalSpamIntelligenceProvider(intelligence, env.BUCKET),
-			});
+			}), options.deadlineAt);
 			assertBeforeDeadline();
 		} catch (error) {
+			if (error instanceof Error && error.message === "timeout") throw error;
 			spamAnalysisError = error instanceof Error ? error.message.slice(0, 300) : "Spam analysis failed";
 			console.error(`Spam analysis failed for ${messageId}`, error);
 		}
@@ -194,34 +207,36 @@ export async function processInboundMessage(
 	const folderId = status === "spam" ? null : destination.folderId;
 	// A contact the database cannot hold (e.g. an over-long address) must not lose the mail.
 	assertBeforeDeadline();
-	const contact = await upsertContactFromAddress(env, {
+	const contact = await awaitOperation(upsertContactFromAddress(env, {
 		userId: decision.mailbox.userId,
 		address: fromAddr,
 		source: "inbound",
 		// Spam senders are strangers at best; do not announce them to Gravatar.
 		lookupAvatar: !historicalImport && status !== "spam" && status !== "trash",
-	}).catch((error) => {
+	}), options.deadlineAt).catch((error) => {
+		if (error instanceof Error && error.message === "timeout") throw error;
 		console.error(`Contact upsert failed for ${messageId}`, error);
 		return null;
 	});
 	assertBeforeDeadline();
-	const { category, senderAddress } = await classifyInboundCategory(db, {
+	const { category, senderAddress } = await awaitOperation(classifyInboundCategory(db, {
 		mailboxId: decision.mailbox.mailboxId,
 		from: fromAddr,
 		headers: payload.headers ?? readHeaderMap(buffer),
 		contactSource: contact?.source,
-	});
+	}), options.deadlineAt);
 	let threadId: string;
 	try {
 		assertBeforeDeadline();
-		threadId = await resolveThreadId(db, {
+		threadId = await awaitOperation(resolveThreadId(db, {
 			mailboxId: decision.mailbox.mailboxId,
 			messageId: parsed.messageId,
 			inReplyTo: parsed.inReplyTo,
 			references: parsed.references,
 			senderAddress: getEmailAddress(fromAddr) || null,
-		});
+		}), options.deadlineAt);
 	} catch (error) {
+		if (error instanceof Error && error.message === "timeout") throw error;
 		console.error("Inbound thread lookup failed", {
 			rawR2Key: payload.rawR2Key,
 			recipient: payload.to,
@@ -234,7 +249,7 @@ export async function processInboundMessage(
 
 	try {
 		assertBeforeDeadline();
-		const inserted = await db.insert(messages).values({
+		const inserted = await awaitOperation(db.insert(messages).values({
 			id: messageId,
 			userId: decision.mailbox.userId,
 			mailboxId: decision.mailbox.mailboxId,
@@ -264,11 +279,11 @@ export async function processInboundMessage(
 			spamSignals: spamAnalysis ? JSON.stringify(spamAnalysis.signals) : null,
 			spamAnalyzedAt: spamAnalysis ? new Date() : null,
 			spamAnalysisError,
-		}).onConflictDoNothing().returning({ id: messages.id });
+		}).onConflictDoNothing().returning({ id: messages.id }), options.deadlineAt);
 		if (!inserted.length) return;
 		// Finish the post-commit write set once the message row exists. Aborting here would make a retry
 		// mistake a partially stored message for a complete duplicate and skip its attachments.
-		await storeMessageAttachments(env, messageId, parsed.attachments);
+		await awaitOperation(storeMessageAttachments(env, messageId, parsed.attachments), options.deadlineAt);
 		if (!historicalImport && status !== "spam" && status !== "trash") {
 			await registerInboundInvite(env, { userId: decision.mailbox.userId, mailboxId: decision.mailbox.mailboxId, messageId, senderAddress: fromAddr, attachments: parsed.attachments });
 		}
@@ -286,7 +301,7 @@ export async function processInboundMessage(
 			}));
 		}
 	} catch (error) {
-		await db.delete(messages).where(eq(messages.id, messageId));
+		await awaitOperation(db.delete(messages).where(eq(messages.id, messageId)), options.deadlineAt).catch(() => {});
 		throw error;
 	}
 

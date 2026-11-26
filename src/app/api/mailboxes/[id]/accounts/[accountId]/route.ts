@@ -30,7 +30,7 @@ export async function PATCH(request: Request, { params }: MailboxAccountRoutePar
 	if (access.error) return access.error;
 
 	const [existing] = await db
-		.select({ id: externalAccounts.id, protocol: externalAccounts.protocol, host: externalAccounts.host, port: externalAccounts.port, tlsMode: externalAccounts.tlsMode, username: externalAccounts.username })
+		.select({ id: externalAccounts.id, protocol: externalAccounts.protocol, host: externalAccounts.host, port: externalAccounts.port, tlsMode: externalAccounts.tlsMode, username: externalAccounts.username, passwordEncrypted: externalAccounts.passwordEncrypted })
 		.from(externalAccounts)
 		.where(and(eq(externalAccounts.id, accountId), eq(externalAccounts.mailboxId, id)))
 		.limit(1);
@@ -68,6 +68,9 @@ export async function PATCH(request: Request, { params }: MailboxAccountRoutePar
 				.set({ ...values, pollClaimToken: null, pollClaimUntil: null })
 				.where(and(
 					eq(externalAccounts.id, accountId), eq(externalAccounts.mailboxId, id),
+					eq(externalAccounts.protocol, existing.protocol), eq(externalAccounts.host, existing.host),
+					eq(externalAccounts.port, existing.port), eq(externalAccounts.tlsMode, existing.tlsMode),
+					eq(externalAccounts.username, existing.username), eq(externalAccounts.passwordEncrypted, existing.passwordEncrypted),
 					or(isNull(externalAccounts.pollClaimUntil), lte(externalAccounts.pollClaimUntil, new Date())),
 				))
 				.returning({ id: externalAccounts.id }),

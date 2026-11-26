@@ -176,6 +176,17 @@ for (const [dialect, directory] of [["postgres", "drizzle/migrations-pg"], ["mys
 	});
 }
 
+test("MySQL external-account poll claims are added in one atomic ALTER with the schema's LONGTEXT token", () => {
+	const migration = readFileSync(join(root, "drizzle/migrations-mysql/0036_external_account_poll_claims.sql"), "utf8");
+	const statements = migration.split("--> statement-breakpoint").map((statement) => statement.trim()).filter(Boolean);
+	assert.equal(statements.length, 1);
+	assert.ok(statements[0].startsWith("ALTER TABLE `external_accounts`"));
+	assert.ok(statements[0].includes("ADD COLUMN `poll_claim_token` longtext"));
+	assert.ok(statements[0].includes("ADD COLUMN `poll_claim_until` bigint"));
+	assert.ok(statements[0].includes("ADD INDEX `external_accounts_claim_idx`"));
+	assert.equal(schemas.mysql.external_accounts.columns.find((column) => column.name === "poll_claim_token")?.sqlType, "longtext");
+});
+
 test("PostgreSQL and MySQL ship the triggers SQLite has", () => {
 	for (const directory of ["drizzle/migrations-pg", "drizzle/migrations-mysql"]) {
 		const sql = readFileSync(join(root, directory, "0001_triggers_and_seeds.sql"), "utf8");

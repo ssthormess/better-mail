@@ -158,6 +158,24 @@ test("a crash after canonical store but before cursor commit is idempotent on re
  assert.deepEqual(JSON.parse(f.sql.prepare("SELECT sync_cursor FROM external_accounts").get().sync_cursor), { uidValidity: 77, lastUid: 1 });
 });
 
+test("a timed-out replay PUT never deletes a content-addressed raw object already referenced by a message", async t => {
+ muteInboundLogs(t); const f = await fixture(t); const at = new Date(); await f.poll(at);
+ const referencedKey = f.sql.prepare("SELECT raw_r2_key FROM messages").get().raw_r2_key;
+ assert.ok(f.objects.has(referencedKey));
+ f.sql.prepare("UPDATE external_accounts SET id = 'timeout-replay-account', sync_cursor = NULL, last_synced_at = NULL WHERE id = 'account'").run();
+ f.sql.prepare("INSERT INTO mailboxes (id,user_id,domain_id,local_part,created_at) VALUES ('mailbox2','owner','domain','alt',1)").run();
+ f.sql.prepare(`INSERT INTO external_accounts (id,mailbox_id,user_id,protocol,host,port,tls_mode,username,password_encrypted,enabled,last_synced_at,last_error,sync_cursor,created_at,updated_at)
+  SELECT 'healthy','mailbox2',user_id,protocol,host,port,tls_mode,'healthy',password_encrypted,enabled,?,NULL,NULL,created_at,updated_at FROM external_accounts WHERE id='timeout-replay-account'`).run(Math.floor(at.getTime() / 1000));
+ const originalPut = f.env.BUCKET.put; let putCalls = 0;
+ f.env.BUCKET.put = async (key, value, options) => putCalls++ === 0 ? new Promise(() => {}) : originalPut(key, value, options);
+ const started = Date.now(); const result = await f.poll(new Date(at.getTime() + 61_000));
+ assert.ok(Date.now() - started < 7_000, "a stalled PUT must not hold the poll tick indefinitely");
+ assert.deepEqual(result, { accounts: 1 }, "the next account in the tick must still be polled");
+ assert.equal(f.objects.has(referencedKey), true, "timeout cleanup must not delete an already-referenced object");
+ assert.equal(f.sql.prepare("SELECT count(*) AS n FROM messages WHERE raw_r2_key = ?").get(referencedKey).n, 1);
+ assert.deepEqual(JSON.parse(f.sql.prepare("SELECT sync_cursor FROM external_accounts WHERE id='healthy'").get().sync_cursor), { uidValidity: 77, lastUid: 1 });
+});
+
 test("UIDVALIDITY reset re-fetches old UIDs but mailbox-scoped raw hash deduplicates stored mail", async t => {
  muteInboundLogs(t); const first = await fixture(t); const at = new Date(); await first.poll(at);
  first.server.state.uidValidity = 78; await first.poll(new Date(at.getTime() + 61_000));
@@ -194,6 +212,20 @@ test("overlapping scheduler ticks are skipped across a slow in-flight poll", asy
  assert.equal(f.server.state.connections, 1);
  f.server.state.resumeFetch();
  await first;
+});
+
+test("an expired claim cannot store fetched mail or advance the cursor", async t => {
+ muteInboundLogs(t); const f = await fixture(t, { pauseFetch: true });
+ f.sql.prepare("UPDATE external_accounts SET id = 'expired-lease-account'").run();
+ const polling = f.poll(new Date());
+ const deadline = Date.now() + 2_000;
+ while (!f.server.state.resumeFetch && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 5));
+ assert.ok(f.server.state.resumeFetch, "poll reached the paused body FETCH");
+ f.sql.prepare("UPDATE external_accounts SET poll_claim_until = ? WHERE id = 'expired-lease-account'").run(Math.floor(Date.now() / 1000) - 1);
+ f.server.state.resumeFetch(); await polling;
+ assert.equal(f.sql.prepare("SELECT count(*) AS n FROM messages").get().n, 0);
+ const row = f.sql.prepare("SELECT sync_cursor, poll_claim_token FROM external_accounts").get();
+ assert.equal(row.sync_cursor, null); assert.equal(row.poll_claim_token, null);
 });
 
 test("two independent Node processes acquire only one database-backed account lease", async t => {

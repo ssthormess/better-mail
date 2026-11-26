@@ -16,7 +16,8 @@ export function checkServerIdentity(_host, _cert) { return undefined; }
 export function connect(options, callback) {
  globalThis.__tlsCalls.push({ rejectUnauthorized: options.rejectUnauthorized, servername: options.servername, starttls: !!options.socket, checkServerIdentity: typeof options.checkServerIdentity });
  const socket = options.socket ?? netConnect({ host: options.host === "imap.example.test" ? "127.0.0.1" : options.host, port: options.port });
- if (options.socket && !globalThis.__tlsHang) queueMicrotask(() => { socket.emit("secureConnect"); callback?.(); });
+ if (options.socket && globalThis.__tlsFailFirstStarttls && !globalThis.__tlsFailedOnce) { globalThis.__tlsFailedOnce = true; queueMicrotask(() => socket.emit("error", new Error("mock TLS failure"))); }
+ else if (options.socket && !globalThis.__tlsHang) queueMicrotask(() => { socket.emit("secureConnect"); callback?.(); });
  else socket.once("connect", () => { socket.emit("secureConnect"); callback?.(); });
  return socket;
 }\n`);
@@ -27,10 +28,11 @@ await build({
 });
 const { fetchImap } = await import(pathToFileURL(join(out, "client.mjs")));
 
-function fakeServer({ authFailure = false, uids = [3], uidValidity = 42, style = "body", malformedTag = false, malformedFetch = false, hugeLiteral = false, sizeMismatch = false, wrongSizeUid = false, extraFetch = false, noBody = false, expungeUid = null, malformedSearch = false, uidNextOverride, missingUidNext = false, bodyWrongUid = false } = {}) {
+function fakeServer({ authFailure = false, uids = [3], uidValidity = 42, style = "body", malformedTag = false, malformedFetch = false, hugeLiteral = false, sizeMismatch = false, wrongSizeUid = false, extraFetch = false, noBody = false, expungeUid = null, malformedSearch = false, uidNextOverride, missingUidNext = false, bodyWrongUid = false, bodyLengthMismatch = false, nestedBodyLiteral = false, listenHost = "127.0.0.1" } = {}) {
  const uidNext = uidNextOverride ?? Math.min(0xffff_ffff, Math.max(0, ...uids) + 1); const activeUids = [...uids];
- const commands = [];
+ const commands = []; let connections = 0;
  const server = createServer((socket) => {
+  connections++;
   socket.write("* OK test server ready\r\n");
   let pending = "";
   socket.on("data", chunk => {
@@ -51,9 +53,10 @@ function fakeServer({ authFailure = false, uids = [3], uidValidity = 42, style =
      const raw = Buffer.from(`From: sender@example.net\r\nSubject: hi${uid}\r\n\r\n${body}`, "utf8");
      if (command.includes("RFC822.SIZE")) {
       if (expungeUid === uid) { activeUids.splice(activeUids.indexOf(uid), 1); socket.write(`${tag} OK expunged\r\n`); continue; }
-      socket.write(`* 1 FETCH (UID ${wrongSizeUid ? 999 : uid} RFC822.SIZE ${hugeLiteral ? 20000000 : raw.length})\r\n${extraFetch ? "* 2 FETCH (UID 999 FLAGS (\\Seen))\r\n" : ""}${tag} OK size\r\n`); continue;
+      socket.write(`* 1 FETCH (UID ${wrongSizeUid ? 999 : uid} RFC822.SIZE ${hugeLiteral ? 20000000 : raw.length + (bodyLengthMismatch ? 1 : 0)})\r\n${extraFetch ? "* 2 FETCH (UID 999 FLAGS (\\Seen))\r\n" : ""}${tag} OK size\r\n`); continue;
      }
      if (noBody) { socket.write(`${tag} OK no fetch record\r\n`); continue; }
+     if (nestedBodyLiteral) { socket.write(Buffer.concat([Buffer.from(`* 1 FETCH (UID ${uid} FLAGS (BODY[] {${raw.length}}\r\n`), raw, Buffer.from(`))\r\n${tag} OK fetched\r\n`)])); continue; }
      if (hugeLiteral || sizeMismatch) { socket.write(`* 1 FETCH (UID ${uid} BODY[] {20000000}\r\n`); continue; }
      const attr = style === "rfc822" ? "RFC822" : "BODY[]";
      const prefix = style === "uid-after-literal" ? `* 1 FETCH (${attr} {${raw.length}}\r\n` : `* 1 FETCH (UID ${bodyWrongUid ? 999 : uid} ${attr} {${raw.length}}\r\n`;
@@ -63,7 +66,7 @@ function fakeServer({ authFailure = false, uids = [3], uidValidity = 42, style =
    }
   });
  });
- return new Promise(resolve => server.listen(0, "127.0.0.1", () => resolve({ server, commands, port: server.address().port })));
+ return new Promise(resolve => server.listen(0, listenHost, () => resolve({ server, commands, get connections() { return connections; }, port: server.address().port })));
 }
 const input = (fixture, tlsMode = "none", allowPrivate = true) => ({ host: "127.0.0.1", port: fixture.port, tlsMode, username: "u", password: "secret", allowPrivate });
 const run = (fixture, cursor = null, maxMessages = 50, maxBytes = 1024, tlsMode = "none", allowPrivate = true) => fetchImap(input(fixture, tlsMode, allowPrivate), cursor, maxMessages, maxBytes);
@@ -99,6 +102,16 @@ test("a stalled STARTTLS handshake times out and never reaches LOGIN", async t =
  await assert.rejects(run(fixture, null, 50, 1024, "starttls"), { message: "timeout" });
  assert.ok(fixture.commands.some(line => line.endsWith("STARTTLS")));
  assert.ok(!fixture.commands.some(line => line.includes(" LOGIN ")));
+});
+
+test("STARTTLS retries another checked resolver candidate when the first TLS upgrade fails", async t => {
+ const fixture = await fakeServer({ uids: [], listenHost: "::" }); t.after(() => fixture.server.close());
+ globalThis.__tlsCalls = []; globalThis.__tlsFailFirstStarttls = true; delete globalThis.__tlsFailedOnce;
+ t.after(() => { delete globalThis.__tlsFailFirstStarttls; delete globalThis.__tlsFailedOnce; });
+ const result = await fetchImap({ host: "localhost", port: fixture.port, tlsMode: "starttls", username: "u", password: "secret", allowPrivate: true }, null, 50, 1024);
+ assert.equal(result.uidValidity, 42); assert.equal(fixture.connections, 2);
+ assert.equal(fixture.commands.filter(command => command.endsWith(" STARTTLS")).length, 2);
+ assert.ok(fixture.commands.some(command => command.includes(" LOGIN ")));
 });
 
 test("STARTTLS is sent before LOGIN and requests verified TLS", async t => {
@@ -159,6 +172,16 @@ test("size confirmation is required before a permanent oversized skip", async t 
  const fixture = await fakeServer({ sizeMismatch: true }); t.after(() => fixture.server.close());
  await assert.rejects(run(fixture), { message: "message_size_unverified" });
  assert.ok(!fixture.commands.some(line => line.endsWith("LOGOUT")));
+});
+
+test("body octet count must match the confirmed RFC822.SIZE", async t => {
+ const fixture = await fakeServer({ bodyLengthMismatch: true }); t.after(() => fixture.server.close());
+ await assert.rejects(run(fixture), { message: "body_size_mismatch" });
+});
+
+test("a literal nested inside another FETCH attribute is not bound as the requested body", async t => {
+ const fixture = await fakeServer({ nestedBodyLiteral: true }); t.after(() => fixture.server.close());
+ await assert.rejects(run(fixture), { message: "invalid_literal" });
 });
 
 test("size and body FETCH records must bind to the requested UID", async t => {
