@@ -538,6 +538,22 @@
       "statements": [
         "ALTER TABLE `app_settings` ADD `raw_mail_sweep_cursor` longtext;"
       ]
+    },
+    {
+      "name": "0039_raw_sweep_fence.sql",
+      "statements": [
+        "CREATE TABLE `raw_sweep_pending_deletes` (\n\t`raw_r2_key` varchar(512) NOT NULL,\n\t`claim_token` longtext NOT NULL,\n\t`claimed_at` bigint NOT NULL,\n\tCONSTRAINT `raw_sweep_pending_deletes_raw_r2_key` PRIMARY KEY(`raw_r2_key`)\n);",
+        "ALTER TABLE `app_settings` ADD `raw_mail_sweep_fence` bigint DEFAULT 0 NOT NULL;",
+        "CREATE TRIGGER `raw_sweep_pending_bi` BEFORE INSERT ON `raw_sweep_pending_deletes` FOR EACH ROW\nBEGIN\n\tUPDATE `app_settings` SET `raw_mail_sweep_fence` = `raw_mail_sweep_fence` + 1 WHERE `id` = 'default';\n\tIF EXISTS (SELECT 1 FROM `messages` WHERE `raw_r2_key` = NEW.`raw_r2_key`) THEN\n\t\tSIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'raw_sweep_referenced';\n\tEND IF;\nEND;",
+        "CREATE TRIGGER `raw_sweep_messages_bi` BEFORE INSERT ON `messages` FOR EACH ROW\nBEGIN\n\tIF NEW.`raw_r2_key` LIKE 'inbound/%' THEN\n\t\tUPDATE `app_settings` SET `raw_mail_sweep_fence` = `raw_mail_sweep_fence` + 1 WHERE `id` = 'default';\n\t\tIF EXISTS (SELECT 1 FROM `raw_sweep_pending_deletes` WHERE `raw_r2_key` = NEW.`raw_r2_key`) THEN\n\t\t\tSIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'raw_sweep_in_progress';\n\t\tEND IF;\n\tEND IF;\nEND;",
+        "CREATE TRIGGER `raw_sweep_messages_bu` BEFORE UPDATE ON `messages` FOR EACH ROW\nBEGIN\n\tIF NOT (NEW.`raw_r2_key` <=> OLD.`raw_r2_key`) AND NEW.`raw_r2_key` LIKE 'inbound/%' THEN\n\t\tUPDATE `app_settings` SET `raw_mail_sweep_fence` = `raw_mail_sweep_fence` + 1 WHERE `id` = 'default';\n\t\tIF EXISTS (SELECT 1 FROM `raw_sweep_pending_deletes` WHERE `raw_r2_key` = NEW.`raw_r2_key`) THEN\n\t\t\tSIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'raw_sweep_in_progress';\n\t\tEND IF;\n\tEND IF;\nEND;"
+      ]
+    },
+    {
+      "name": "0040_raw_sweep_delete_complete.sql",
+      "statements": [
+        "ALTER TABLE `raw_sweep_pending_deletes` ADD `delete_complete` boolean DEFAULT false NOT NULL;"
+      ]
     }
   ]
 }

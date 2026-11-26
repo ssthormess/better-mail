@@ -1,6 +1,9 @@
-import { and, eq, inArray, isNull } from "drizzle-orm";
+import { and, eq, isNull, lt } from "drizzle-orm";
 import { getDb } from "@/db";
-import { appSettings, messages } from "@/db/schema";
+import { appSettings, messages, rawSweepPendingDeletes } from "@/db/schema";
+import { isExternalDatabase } from "@/db/external";
+import { newId } from "@/lib/ids";
+import { lockRawSweepFence, withRawSweepTransaction } from "@/lib/email/raw-object-fence";
 import { INBOUND_SIGNATURE_MAX_AGE_SECONDS } from "@/lib/email/intake-signature";
 import { SNS_MAX_AGE_MS } from "@/lib/aws/sns-signature";
 import { UPLOAD_PREFIX } from "@/lib/jmap/blobs";
@@ -26,8 +29,9 @@ const STALE_PREFIXES: Array<{ prefix: string; maxAgeMs: number }> = [
 	{ prefix: `${REQUEST_UPLOAD_PREFIX}/`, maxAgeMs: 24 * HOUR_MS },
 ];
 /** D1 allows 100 bound parameters per statement. */
-const LOOKUP_BATCH = 50;
 const SWEEP_CURSOR_SETTINGS_ID = "default";
+const STALE_PENDING_DELETE_MS = 60 * 60 * 1000;
+const PENDING_RECOVERY_LIMIT = 100;
 
 async function readSweepCursor(db: ReturnType<typeof getDb>): Promise<string | null> {
 	await db.insert(appSettings).values({ id: SWEEP_CURSOR_SETTINGS_ID }).onConflictDoNothing();
@@ -44,6 +48,68 @@ async function advanceSweepCursor(db: ReturnType<typeof getDb>, previous: string
 	return !!updated;
 }
 
+function isInvalidSweepCursorError(error: unknown): boolean {
+	if (!error || typeof error !== "object") return false;
+	const value = error as { name?: unknown; code?: unknown; status?: unknown; statusCode?: unknown; $metadata?: { httpStatusCode?: unknown }; message?: unknown };
+	const code = [value.name, value.code].find((item) => typeof item === "string");
+	const status = value.statusCode ?? value.status ?? value.$metadata?.httpStatusCode;
+	const message = typeof value.message === "string" ? value.message : "";
+	return (typeof code === "string" && ["InvalidArgument", "InvalidContinuationToken", "InvalidToken"].includes(code)
+		&& /continuation|cursor|token/i.test(message))
+		|| (Number(status) === 400 && /invalid|incorrect|malformed/i.test(message) && /continuation token|cursor/i.test(message));
+}
+
+async function deleteCandidate(env: CloudflareEnv, db: ReturnType<typeof getDb>, key: string, now: Date): Promise<boolean> {
+	const atomic = await withRawSweepTransaction(env, async (tx) => {
+		await lockRawSweepFence(tx);
+		const [reference] = await tx.select({ id: messages.id }).from(messages).where(eq(messages.rawR2Key, key)).limit(1);
+		if (reference) return false;
+		await env.BUCKET.delete(key);
+		return true;
+	});
+	if (atomic.supported) return atomic.value;
+	// External HTTP drivers without transactions are fail-closed: they cannot hold the SQL fence
+	// across the object-store delete. D1 uses a SQLite trigger/marker to make this two-phase path safe.
+	if (isExternalDatabase(env.DB)) return false;
+
+	const claimToken = newId();
+	let claim: { rawR2Key: string } | undefined;
+	try {
+		[claim] = await db.insert(rawSweepPendingDeletes).values({ rawR2Key: key, claimToken, claimedAt: now })
+			.onConflictDoNothing().returning({ rawR2Key: rawSweepPendingDeletes.rawR2Key });
+	} catch (error) {
+		if (error instanceof Error && error.message.includes("raw_sweep_referenced")) return false;
+		throw error;
+	}
+	if (!claim) return false;
+	await env.BUCKET.delete(key);
+	const [completed] = await db.update(rawSweepPendingDeletes).set({ deleteComplete: true }).where(and(
+		eq(rawSweepPendingDeletes.rawR2Key, key), eq(rawSweepPendingDeletes.claimToken, claimToken),
+	)).returning({ rawR2Key: rawSweepPendingDeletes.rawR2Key });
+	if (!completed) throw new Error("Raw object delete claim changed before completion was recorded");
+	await db.delete(rawSweepPendingDeletes).where(and(
+		eq(rawSweepPendingDeletes.rawR2Key, key), eq(rawSweepPendingDeletes.claimToken, claimToken),
+	));
+	return true;
+}
+
+async function recoverStalePendingDeletes(env: CloudflareEnv, db: ReturnType<typeof getDb>, now: Date): Promise<void> {
+	if (isExternalDatabase(env.DB)) return;
+	const cutoff = new Date(now.getTime() - STALE_PENDING_DELETE_MS);
+	// An unfinished marker may still have an R2 DELETE in flight after its worker died. Never retry that
+	// delete or release the marker: only markers whose successful delete was durably recorded are safe to clear.
+	const stale = await db.select().from(rawSweepPendingDeletes).where(and(
+		lt(rawSweepPendingDeletes.claimedAt, cutoff), eq(rawSweepPendingDeletes.deleteComplete, true),
+	)).limit(PENDING_RECOVERY_LIMIT);
+	for (const row of stale) {
+		await db.delete(rawSweepPendingDeletes).where(and(
+			eq(rawSweepPendingDeletes.rawR2Key, row.rawR2Key),
+			eq(rawSweepPendingDeletes.claimToken, row.claimToken),
+			eq(rawSweepPendingDeletes.deleteComplete, true),
+		));
+	}
+}
+
 /**
  * Deletes raw MIME under `inbound/` that no stored message refers to and that is old enough
  * that its queue message is long finished. Its bounded listing cursor is persisted after each page,
@@ -54,22 +120,22 @@ async function advanceSweepCursor(db: ReturnType<typeof getDb>, previous: string
 export async function sweepOrphanedRawMail(env: CloudflareEnv, now = new Date()): Promise<number> {
 	const db = getDb(env);
 	let removed = 0;
+	await recoverStalePendingDeletes(env, db, now);
 	let cursor = await readSweepCursor(db);
 	for (let page = 0; page < MAX_PAGES; page += 1) {
-		const previousCursor = cursor;
-		const listing = await env.BUCKET.list({ prefix: PREFIX, ...(cursor ? { cursor } : {}), limit: PAGE });
+		let previousCursor = cursor;
+		let listing: Awaited<ReturnType<CloudflareEnv["BUCKET"]["list"]>>;
+		try {
+			listing = await env.BUCKET.list({ prefix: PREFIX, ...(cursor ? { cursor } : {}), limit: PAGE });
+		} catch (error) {
+			if (!cursor || !isInvalidSweepCursorError(error)) throw error;
+			if (!await advanceSweepCursor(db, cursor, null)) break;
+			cursor = null;
+			previousCursor = null;
+			listing = await env.BUCKET.list({ prefix: PREFIX, limit: PAGE });
+		}
 		const old = listing.objects.filter((object) => now.getTime() - object.uploaded.getTime() > MIN_AGE_MS).map((object) => object.key);
-		const orphans: string[] = [];
-		for (let index = 0; index < old.length; index += LOOKUP_BATCH) {
-			const batch = old.slice(index, index + LOOKUP_BATCH);
-			const referenced = await db.select({ key: messages.rawR2Key }).from(messages).where(inArray(messages.rawR2Key, batch));
-			const kept = new Set(referenced.map((row) => row.key));
-			orphans.push(...batch.filter((key) => !kept.has(key)));
-		}
-		if (orphans.length) {
-			await env.BUCKET.delete(orphans);
-			removed += orphans.length;
-		}
+		for (const key of old) if (await deleteCandidate(env, db, key, now)) removed += 1;
 		if (listing.truncated && !listing.cursor) throw new Error("Raw mail listing was truncated without a continuation cursor");
 		const nextCursor = listing.truncated ? listing.cursor! : null;
 		if (listing.truncated && nextCursor === previousCursor) throw new Error("Raw mail listing did not advance its continuation cursor");

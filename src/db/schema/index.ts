@@ -1644,11 +1644,25 @@ export const appSettings = sqliteTable("app_settings", {
 	resendEventsWebhookSecret: text("resend_events_webhook_secret"),
 	/** JSON: the SNS topic, URL token and SES identities that feed bounces and complaints (see src/lib/deliverability/ses-feed.ts). */
 	sesFeedback: text("ses_feedback"),
-	/** Continuation token for the bounded inbound-raw orphan sweep. */
+	/** Bucket-local continuation token for the bounded inbound-raw orphan sweep; excluded from backups. */
 	rawMailSweepCursor: text("raw_mail_sweep_cursor"),
+	/** Database fence serialized with inbound raw references and the orphan sweep. */
+	rawMailSweepFence: integer("raw_mail_sweep_fence").notNull().default(0),
 	updatedAt: timestamp("updated_at")
 		.notNull()
 		.$defaultFn(() => new Date()),
+});
+
+/**
+ * Transient D1 fallback claims for the interval between claiming and deleting a raw object.
+ * The message/raw-key triggers fence inserts against these claims; never backup this state. An uncertain
+ * delete remains claimed indefinitely; only a durably recorded successful delete may be recovered.
+ */
+export const rawSweepPendingDeletes = sqliteTable("raw_sweep_pending_deletes", {
+	rawR2Key: text("raw_r2_key").primaryKey(),
+	claimToken: text("claim_token").notNull(),
+	claimedAt: timestamp("claimed_at").notNull(),
+	deleteComplete: bool("delete_complete").notNull().default(false),
 });
 
 export const licenseSettings = sqliteTable("license_settings", {
@@ -1903,6 +1917,7 @@ export const schema = {
 	backupSettings,
 	backups,
 	appSettings,
+	rawSweepPendingDeletes,
 	licenseSettings,
 	mailboxAgentSettings,
 	aiUsage,

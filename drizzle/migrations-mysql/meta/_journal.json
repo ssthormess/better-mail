@@ -218,6 +218,20 @@
       "when": 1795727505399,
       "tag": "0038_raw_mail_sweep_cursor",
       "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "5",
+      "when": 1795730079640,
+      "tag": "0039_raw_sweep_fence",
+      "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "5",
+      "when": 1795732061519,
+      "tag": "0040_raw_sweep_delete_complete",
+      "breakpoints": true
     }
   ]
 }

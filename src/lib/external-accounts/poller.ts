@@ -157,7 +157,7 @@ export async function pollExternalImapAccounts(env: CloudflareEnv, now = new Dat
        await awaitBefore(env.BUCKET.put(rawR2Key, rawBuffer, { httpMetadata: { contentType: "message/rfc822" } }), deadlineAt);
        const headers = readHeaderMap(rawBuffer);
        await assertOwned();
-       await awaitBefore(processInboundMessage(env, { from: headers.from ?? "", to: `${mailbox.localPart}@${domain.hostname}`, rawR2Key, headers }, { intakeMode: "historical_import", deadlineAt }), deadlineAt);
+       await awaitBefore(processInboundMessage(env, { from: headers.from ?? "", to: `${mailbox.localPart}@${domain.hostname}`, rawR2Key, headers }, { intakeMode: "historical_import", deadlineAt, rawBytes: rawBuffer }), deadlineAt);
        await assertOwned();
       }
       const lastUid = Math.max(committedCursor?.uidValidity === event.uidValidity ? committedCursor.lastUid : 0, event.uid);

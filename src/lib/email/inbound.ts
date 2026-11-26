@@ -1,6 +1,7 @@
 import { and, eq, isNotNull } from "drizzle-orm";
 import { getDb } from "@/db";
 import { messages, outboundJobs, users } from "@/db/schema";
+import { insertWithRawObjectFence } from "@/lib/email/raw-object-fence";
 import { newId } from "@/lib/ids";
 import { buildSnippet, parseRawMime } from "@/lib/email/parse";
 import { matchReportAddress } from "@/lib/deliverability/report-address";
@@ -75,16 +76,16 @@ function awaitOperation<T>(work: Promise<T>, deadlineAt?: number, maxWaitMs = 5_
 export async function processInboundMessage(
 	env: CloudflareEnv,
 	payload: InboundQueueMessage,
-	options: { reportBudget?: BatchBudget; intakeMode?: "realtime" | "historical_import"; deadlineAt?: number } = {},
+	options: { reportBudget?: BatchBudget; intakeMode?: "realtime" | "historical_import"; deadlineAt?: number; rawBytes?: ArrayBuffer } = {},
 ): Promise<void> {
 	const assertBeforeDeadline = () => { if (options.deadlineAt !== undefined && Date.now() >= options.deadlineAt) throw new InboundDeadlineExceeded(); };
 	assertBeforeDeadline();
 	const historicalImport = options.intakeMode === "historical_import";
 	const db = getDb(env);
-	const historicalRawObject = historicalImport
+	const historicalRawObject = historicalImport && !options.rawBytes
 		? await awaitOperation(env.BUCKET.get(payload.rawR2Key), options.deadlineAt)
 		: null;
-	if (historicalImport && !historicalRawObject) throw new Error("Missing raw object for historical inbound message");
+	if (historicalImport && !options.rawBytes && !historicalRawObject) throw new Error("Missing raw object for historical inbound message");
 	// DMARC aggregate reports bypass mailboxes entirely (see report-address.ts); historical imports do not ingest them.
 	const reportTarget = await awaitOperation(matchReportAddress(env, payload.to), options.deadlineAt);
 	if (reportTarget) {
@@ -129,13 +130,13 @@ export async function processInboundMessage(
 	}
 
 	assertBeforeDeadline();
-	const raw = historicalRawObject ?? await awaitOperation(env.BUCKET.get(payload.rawR2Key), options.deadlineAt);
-	if (!raw) {
+	const raw = options.rawBytes ? null : historicalRawObject ?? await awaitOperation(env.BUCKET.get(payload.rawR2Key), options.deadlineAt);
+	if (!options.rawBytes && !raw) {
 		console.error(`Missing R2 object: ${payload.rawR2Key}`);
 		return;
 	}
 
-	const buffer = await awaitOperation(raw.arrayBuffer(), options.deadlineAt);
+	const buffer = options.rawBytes ?? await awaitOperation(raw!.arrayBuffer(), options.deadlineAt);
 	assertBeforeDeadline();
 	let parsed: Awaited<ReturnType<typeof parseRawMime>>;
 	try {
@@ -251,14 +252,15 @@ export async function processInboundMessage(
 	}
 	assertBeforeDeadline();
 
+	const storedMailbox = decision.mailbox;
 	let insertedNewRow = false;
 	let effectsWinner = false;
 	try {
 		assertBeforeDeadline();
-		const inserted = await awaitOperation(db.insert(messages).values({
+		const inserted = await awaitOperation(insertWithRawObjectFence(env, db, payload.rawR2Key, buffer, options.deadlineAt, (operation) => awaitOperation(operation, options.deadlineAt), (writeDb) => writeDb.insert(messages).values({
 			id: messageId,
-			userId: decision.mailbox.userId,
-			mailboxId: decision.mailbox.mailboxId,
+			userId: storedMailbox.userId,
+			mailboxId: storedMailbox.mailboxId,
 			folderId,
 			direction: "inbound",
 			providerMessageId: parsed.messageId,
@@ -286,7 +288,7 @@ export async function processInboundMessage(
 			spamSignals: spamAnalysis ? JSON.stringify(spamAnalysis.signals) : null,
 			spamAnalyzedAt: spamAnalysis ? new Date() : null,
 			spamAnalysisError,
-		}).onConflictDoNothing().returning({ id: messages.id }), options.deadlineAt);
+		}).onConflictDoNothing().returning({ id: messages.id })), options.deadlineAt);
 		insertedNewRow = inserted.length > 0;
 		// Attachment IDs and object keys are deterministic for this message. If a timed-out attempt is still
 		// finishing, a retry can safely repeat the same writes without duplicating or deleting its objects.

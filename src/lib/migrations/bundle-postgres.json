@@ -583,6 +583,24 @@
       "statements": [
         "ALTER TABLE \"app_settings\" ADD COLUMN \"raw_mail_sweep_cursor\" text;"
       ]
+    },
+    {
+      "name": "0039_raw_sweep_fence.sql",
+      "statements": [
+        "CREATE TABLE \"raw_sweep_pending_deletes\" (\n\t\"raw_r2_key\" text PRIMARY KEY NOT NULL,\n\t\"claim_token\" text NOT NULL,\n\t\"claimed_at\" bigint NOT NULL\n);",
+        "ALTER TABLE \"app_settings\" ADD COLUMN \"raw_mail_sweep_fence\" bigint DEFAULT 0 NOT NULL;",
+        "CREATE OR REPLACE FUNCTION raw_sweep_guard_message_reference() RETURNS trigger LANGUAGE plpgsql AS $$\nBEGIN\n\tIF NEW.raw_r2_key LIKE 'inbound/%' THEN\n\t\tUPDATE app_settings SET raw_mail_sweep_fence = raw_mail_sweep_fence + 1 WHERE id = 'default';\n\t\tIF EXISTS (SELECT 1 FROM raw_sweep_pending_deletes WHERE raw_r2_key = NEW.raw_r2_key) THEN\n\t\t\tRAISE EXCEPTION 'raw_sweep_in_progress';\n\t\tEND IF;\n\tEND IF;\n\tRETURN NEW;\nEND;\n$$;",
+        "CREATE TRIGGER raw_sweep_messages_bi BEFORE INSERT ON messages FOR EACH ROW EXECUTE FUNCTION raw_sweep_guard_message_reference();",
+        "CREATE TRIGGER raw_sweep_messages_bu BEFORE UPDATE OF raw_r2_key ON messages FOR EACH ROW EXECUTE FUNCTION raw_sweep_guard_message_reference();",
+        "CREATE OR REPLACE FUNCTION raw_sweep_guard_pending_delete() RETURNS trigger LANGUAGE plpgsql AS $$\nBEGIN\n\tUPDATE app_settings SET raw_mail_sweep_fence = raw_mail_sweep_fence + 1 WHERE id = 'default';\n\tIF EXISTS (SELECT 1 FROM messages WHERE raw_r2_key = NEW.raw_r2_key) THEN\n\t\tRAISE EXCEPTION 'raw_sweep_referenced';\n\tEND IF;\n\tRETURN NEW;\nEND;\n$$;",
+        "CREATE TRIGGER raw_sweep_pending_bi BEFORE INSERT ON raw_sweep_pending_deletes FOR EACH ROW EXECUTE FUNCTION raw_sweep_guard_pending_delete();"
+      ]
+    },
+    {
+      "name": "0040_raw_sweep_delete_complete.sql",
+      "statements": [
+        "ALTER TABLE \"raw_sweep_pending_deletes\" ADD COLUMN \"delete_complete\" boolean DEFAULT false NOT NULL;"
+      ]
     }
   ]
 }

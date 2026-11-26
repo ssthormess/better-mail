@@ -1015,6 +1015,22 @@
       "statements": [
         "ALTER TABLE `app_settings` ADD `raw_mail_sweep_cursor` text;"
       ]
+    },
+    {
+      "name": "0115_raw_sweep_fence.sql",
+      "statements": [
+        "CREATE TABLE `raw_sweep_pending_deletes` (\n\t`raw_r2_key` text PRIMARY KEY NOT NULL,\n\t`claim_token` text NOT NULL,\n\t`claimed_at` integer NOT NULL\n);",
+        "ALTER TABLE `app_settings` ADD `raw_mail_sweep_fence` integer DEFAULT 0 NOT NULL;",
+        "CREATE TRIGGER `raw_sweep_pending_bi` BEFORE INSERT ON `raw_sweep_pending_deletes` BEGIN\n\tUPDATE `app_settings` SET `raw_mail_sweep_fence` = `raw_mail_sweep_fence` + 1 WHERE `id` = 'default';\n\tSELECT CASE WHEN EXISTS (SELECT 1 FROM `messages` WHERE `raw_r2_key` = NEW.`raw_r2_key`) THEN RAISE(ABORT, 'raw_sweep_referenced') END;\nEND;",
+        "CREATE TRIGGER `raw_sweep_messages_bi` BEFORE INSERT ON `messages` WHEN NEW.`raw_r2_key` LIKE 'inbound/%' BEGIN\n\tUPDATE `app_settings` SET `raw_mail_sweep_fence` = `raw_mail_sweep_fence` + 1 WHERE `id` = 'default';\n\tSELECT CASE WHEN EXISTS (SELECT 1 FROM `raw_sweep_pending_deletes` WHERE `raw_r2_key` = NEW.`raw_r2_key`) THEN RAISE(ABORT, 'raw_sweep_in_progress') END;\nEND;",
+        "CREATE TRIGGER `raw_sweep_messages_bu` BEFORE UPDATE OF `raw_r2_key` ON `messages` WHEN NEW.`raw_r2_key` LIKE 'inbound/%' BEGIN\n\tUPDATE `app_settings` SET `raw_mail_sweep_fence` = `raw_mail_sweep_fence` + 1 WHERE `id` = 'default';\n\tSELECT CASE WHEN EXISTS (SELECT 1 FROM `raw_sweep_pending_deletes` WHERE `raw_r2_key` = NEW.`raw_r2_key`) THEN RAISE(ABORT, 'raw_sweep_in_progress') END;\nEND;"
+      ]
+    },
+    {
+      "name": "0116_raw_sweep_delete_complete.sql",
+      "statements": [
+        "ALTER TABLE `raw_sweep_pending_deletes` ADD `delete_complete` integer DEFAULT false NOT NULL;"
+      ]
     }
   ]
 }

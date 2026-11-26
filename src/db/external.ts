@@ -17,7 +17,7 @@ import type { OpenOptions, SqlExecutor } from "./drivers/types";
 export interface ExternalDatabase extends CompatDatabase {
 	readonly config: DatabaseConfig;
 	readonly sqlExecutor: SqlExecutor;
-	createDrizzle(schema: Record<string, unknown>): unknown;
+	createDrizzle(schema: Record<string, unknown>, executor?: SqlExecutor): unknown;
 }
 
 export function openExecutor(config: DatabaseConfig, shared: boolean): SqlExecutor {
@@ -105,7 +105,7 @@ export function openExternalDatabase(config: DatabaseConfig, shared: boolean): E
 		config: { value: config },
 		sqlExecutor: { value: base },
 		createDrizzle: {
-			value: (schema: Record<string, unknown>) => buildDrizzle(config, { base, tx: null }, schema),
+			value: (schema: Record<string, unknown>, executor: SqlExecutor = base) => buildDrizzle(config, { base: executor, tx: null }, schema),
 		},
 	});
 	return compat;

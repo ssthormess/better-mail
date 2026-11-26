@@ -211,6 +211,8 @@ function mysqlResumeFixture({ columns = [], index = [], claimsRecorded = false, 
 		tables: {
 			external_accounts: [mysqlColumn("id", "varchar", "varchar(191)"), ...columns],
 			messages: [mysqlColumn("id", "varchar", "varchar(191)"), ...(intakeRecorded ? [mysqlColumn("intake_complete", "tinyint", "tinyint(1)", "NO", "1")] : [])],
+			app_settings: [mysqlColumn("id", "varchar", "varchar(191)"), mysqlColumn("raw_mail_sweep_cursor", "longtext"), mysqlColumn("raw_mail_sweep_fence", "bigint", "bigint", "NO", "0")],
+			raw_sweep_pending_deletes: [mysqlColumn("raw_r2_key", "varchar", "varchar(512)", "NO"), mysqlColumn("claim_token", "longtext", "longtext", "NO"), mysqlColumn("claimed_at", "bigint", "bigint", "NO"), mysqlColumn("delete_complete", "tinyint", "tinyint(1)", "NO", "0")],
 		},
 		index: [...index], alterations: 0, failIntakeAfterCommit,
 	};
@@ -225,10 +227,21 @@ function mysqlResumeFixture({ columns = [], index = [], claimsRecorded = false, 
 				all: async () => {
 					if (query.includes("information_schema.columns")) {
 						const table = params[0] ?? "external_accounts";
-					const columnsForTable = state.tables[table] ?? [];
+						const columnsForTable = state.tables[table] ?? [];
 						return { results: params.length > 1 ? columnsForTable.filter((column) => column.column_name === params[1]) : columnsForTable };
 					}
+					if (query.includes("information_schema.tables")) return { results: state.tables[params[0]] ? [{ table_name: params[0] }] : [] };
 					if (/show index from `external_accounts`/i.test(query)) return { results: state.index };
+					if (/show index from `raw_sweep_pending_deletes`/i.test(query)) return { results: [{ Column_name: "raw_r2_key", Seq_in_index: 1, Non_unique: 0, Sub_part: null, Index_type: "BTREE" }] };
+					if (query.includes("information_schema.triggers")) {
+						const triggers = {
+							raw_sweep_pending_bi: ["INSERT", "raw_sweep_pending_deletes", "BEGIN UPDATE `app_settings` SET `raw_mail_sweep_fence` = `raw_mail_sweep_fence` + 1 WHERE `id` = 'default'; IF EXISTS (SELECT 1 FROM `messages` WHERE `raw_r2_key` = NEW.`raw_r2_key`) THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'raw_sweep_referenced'; END IF; END"],
+							raw_sweep_messages_bi: ["INSERT", "messages", "BEGIN IF NEW.`raw_r2_key` LIKE 'inbound/%' THEN UPDATE `app_settings` SET `raw_mail_sweep_fence` = `raw_mail_sweep_fence` + 1 WHERE `id` = 'default'; IF EXISTS (SELECT 1 FROM `raw_sweep_pending_deletes` WHERE `raw_r2_key` = NEW.`raw_r2_key`) THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'raw_sweep_in_progress'; END IF; END IF; END"],
+							raw_sweep_messages_bu: ["UPDATE", "messages", "BEGIN IF NOT (NEW.`raw_r2_key` <=> OLD.`raw_r2_key`) AND NEW.`raw_r2_key` LIKE 'inbound/%' THEN UPDATE `app_settings` SET `raw_mail_sweep_fence` = `raw_mail_sweep_fence` + 1 WHERE `id` = 'default'; IF EXISTS (SELECT 1 FROM `raw_sweep_pending_deletes` WHERE `raw_r2_key` = NEW.`raw_r2_key`) THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'raw_sweep_in_progress'; END IF; END IF; END"],
+						};
+						const trigger = triggers[params[0]];
+						return { results: trigger ? [{ trigger_name: params[0], event_manipulation: trigger[0], event_object_table: trigger[1], action_timing: "BEFORE", action_statement: trigger[2] }] : [] };
+					}
 					if (/select name from mailflare_migrations/i.test(query)) return { results: [...applied].map((name) => ({ name })) };
 					return { results: [] };
 				},
@@ -341,9 +354,26 @@ test("MySQL 0037 recovery rechecks metadata after a competing duplicate-column e
 
 test("MySQL does not falsely adopt an unledgered migration with a case-drifted string default", async () => {
 	const fixture = mysqlResumeFixture({ claimsRecorded: true, intakeRecorded: true, pendingNames: ["0013_auto_update.sql"] });
-	fixture.state.tables.app_settings = [mysqlColumn("auto_update_channel", "varchar", "varchar(16)", "NO", "RELEASE")];
+	fixture.state.tables.app_settings = [mysqlColumn("auto_update_channel", "varchar", "varchar(16)", "NO", "RELEASE"), mysqlColumn("raw_mail_sweep_cursor", "longtext"), mysqlColumn("raw_mail_sweep_fence", "bigint", "bigint", "NO", "0")];
 	await assert.rejects(applyPendingMigrations(fixture.db), /Migration 0013_auto_update.sql failed: Duplicate column name/);
 	assert.equal(fixture.hasLedger("0013_auto_update.sql"), false);
+});
+
+test("MySQL verifies the exact 0038/0039 raw-sweep shapes before accepting their ledger entries", async () => {
+	const valid = mysqlResumeFixture();
+	assert.equal((await applyPendingMigrations(valid.db)).ready, true);
+	const badCursor = mysqlResumeFixture();
+	badCursor.state.tables.app_settings[1] = mysqlColumn("raw_mail_sweep_cursor", "text", "text");
+	await assert.rejects(applyPendingMigrations(badCursor.db), /0038_raw_mail_sweep_cursor.sql verification failed: Migration 0038 found an incompatible app_settings.raw_mail_sweep_cursor shape/);
+	const badFence = mysqlResumeFixture();
+	badFence.state.tables.app_settings[2] = mysqlColumn("raw_mail_sweep_fence", "bigint", "bigint unsigned", "NO", "0");
+	await assert.rejects(applyPendingMigrations(badFence.db), /0039_raw_sweep_fence.sql verification failed: Migration 0039 found an incompatible app_settings.raw_mail_sweep_fence shape/);
+	const badCompletion = mysqlResumeFixture();
+	badCompletion.state.tables.raw_sweep_pending_deletes[3] = mysqlColumn("delete_complete", "tinyint", "tinyint(1)", "NO", "1");
+	await assert.rejects(applyPendingMigrations(badCompletion.db), /0039_raw_sweep_fence.sql verification failed: Migration 0039 found an incompatible raw_sweep_pending_deletes.delete_complete shape/);
+	const extraColumn = mysqlResumeFixture();
+	extraColumn.state.tables.raw_sweep_pending_deletes.push(mysqlColumn("unexpected", "int", "int"));
+	await assert.rejects(applyPendingMigrations(extraColumn.db), /0039_raw_sweep_fence.sql verification failed: Migration 0039 found an incompatible raw_sweep_pending_deletes column set/);
 });
 
 test("PostgreSQL and MySQL ship the triggers SQLite has", () => {

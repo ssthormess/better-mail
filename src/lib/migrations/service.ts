@@ -63,6 +63,12 @@ async function getMysqlColumn(db: D1Database, table: string, column: string): Pr
 	return results[0];
 }
 
+async function getMysqlColumnNames(db: D1Database, table: string): Promise<string[]> {
+	const { results } = await db.prepare(`SELECT column_name AS column_name FROM information_schema.columns
+		WHERE table_schema = database() AND table_name = ?`).bind(table).all<{ column_name: string }>();
+	return results.map((row) => row.column_name.toLowerCase()).sort();
+}
+
 function mysqlColumnMatches(actual: MysqlColumnInfo | undefined, expected: MysqlColumnExpectation): boolean {
 	if (!actual) return false;
 	const type = expected.type.toLowerCase().replace(/\s+/g, " ").trim();
@@ -186,6 +192,155 @@ async function resumeMysqlIntakeCompletion(db: D1Database, recordMigration = tru
 	if (recordMigration) await recordMysqlMigration(db, name);
 }
 
+async function requireMysqlTable(db: D1Database, table: string, migration: string): Promise<void> {
+	const { results } = await db.prepare("SELECT table_name AS table_name FROM information_schema.tables WHERE table_schema = database() AND table_name = ?")
+		.bind(table).all<{ table_name: string }>();
+	if (!results.length) throw new Error(`Migration ${migration} cannot find ${table}`);
+}
+
+/** Recover only the exact nullable LONGTEXT cursor column added by 0038. */
+async function resumeMysqlRawMailSweepCursor(db: D1Database, recordMigration = true): Promise<void> {
+	const name = "0038_raw_mail_sweep_cursor.sql";
+	await requireMysqlTable(db, "app_settings", "0038");
+	const reconcile = async () => {
+		let column = await getMysqlColumn(db, "app_settings", "raw_mail_sweep_cursor");
+		if (!column) {
+			await db.prepare("ALTER TABLE `app_settings` ADD `raw_mail_sweep_cursor` longtext").run();
+			column = await getMysqlColumn(db, "app_settings", "raw_mail_sweep_cursor");
+		}
+		if (!mysqlColumnMatches(column, { type: "longtext", nullable: true, defaultValue: null })) {
+			throw new Error("Migration 0038 found an incompatible app_settings.raw_mail_sweep_cursor shape");
+		}
+	};
+	try { await reconcile(); }
+	catch (error) {
+		try { await reconcile(); }
+		catch { throw error; }
+	}
+	if (recordMigration) await recordMysqlMigration(db, name);
+}
+
+const MYSQL_RAW_SWEEP_PENDING_TABLE = `CREATE TABLE \`raw_sweep_pending_deletes\` (
+\t\`raw_r2_key\` varchar(512) NOT NULL,
+\t\`claim_token\` longtext NOT NULL,
+\t\`claimed_at\` bigint NOT NULL,
+\tCONSTRAINT \`raw_sweep_pending_deletes_raw_r2_key\` PRIMARY KEY(\`raw_r2_key\`)
+)`;
+const MYSQL_RAW_SWEEP_TRIGGERS = [
+	{
+		name: "raw_sweep_pending_bi", table: "raw_sweep_pending_deletes", event: "INSERT",
+		body: "BEGIN UPDATE `app_settings` SET `raw_mail_sweep_fence` = `raw_mail_sweep_fence` + 1 WHERE `id` = 'default'; IF EXISTS (SELECT 1 FROM `messages` WHERE `raw_r2_key` = NEW.`raw_r2_key`) THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'raw_sweep_referenced'; END IF; END",
+	},
+	{
+		name: "raw_sweep_messages_bi", table: "messages", event: "INSERT",
+		body: "BEGIN IF NEW.`raw_r2_key` LIKE 'inbound/%' THEN UPDATE `app_settings` SET `raw_mail_sweep_fence` = `raw_mail_sweep_fence` + 1 WHERE `id` = 'default'; IF EXISTS (SELECT 1 FROM `raw_sweep_pending_deletes` WHERE `raw_r2_key` = NEW.`raw_r2_key`) THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'raw_sweep_in_progress'; END IF; END IF; END",
+	},
+	{
+		name: "raw_sweep_messages_bu", table: "messages", event: "UPDATE",
+		body: "BEGIN IF NOT (NEW.`raw_r2_key` <=> OLD.`raw_r2_key`) AND NEW.`raw_r2_key` LIKE 'inbound/%' THEN UPDATE `app_settings` SET `raw_mail_sweep_fence` = `raw_mail_sweep_fence` + 1 WHERE `id` = 'default'; IF EXISTS (SELECT 1 FROM `raw_sweep_pending_deletes` WHERE `raw_r2_key` = NEW.`raw_r2_key`) THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'raw_sweep_in_progress'; END IF; END IF; END",
+	},
+];
+
+function normalizeMysqlTriggerBody(value: string): string {
+	return value.toLowerCase().replaceAll("`", "").replace(/\s+/g, " ").replace(/\s*([(),;=<>])\s*/g, "$1").trim();
+}
+
+async function mysqlRawSweepTrigger(db: D1Database, name: string) {
+	const { results } = await db.prepare(`SELECT trigger_name AS trigger_name, event_manipulation AS event_manipulation,
+		event_object_table AS event_object_table, action_timing AS action_timing, action_statement AS action_statement
+		FROM information_schema.triggers WHERE trigger_schema = database() AND trigger_name = ?`).bind(name).all<{
+		trigger_name: string; event_manipulation: string; event_object_table: string; action_timing: string; action_statement: string;
+	}>();
+	return results[0];
+}
+
+function mysqlRawSweepIndexMatches(rows: MysqlIndexInfo[]): boolean {
+	return rows.length === 1 && rows[0].Column_name?.toLowerCase() === "raw_r2_key"
+		&& Number(rows[0].Seq_in_index) === 1 && Number(rows[0].Non_unique) === 0
+		&& rows[0].Sub_part === null && rows[0].Index_type?.toUpperCase() === "BTREE";
+}
+
+/** Reconcile only the reviewed 0039 fence column, pending-key table, and three trigger bodies. */
+async function resumeMysqlRawSweepFence(db: D1Database, recordMigration = true): Promise<void> {
+	const name = "0039_raw_sweep_fence.sql";
+	await requireMysqlTable(db, "app_settings", "0039");
+	const reconcile = async () => {
+		let fence = await getMysqlColumn(db, "app_settings", "raw_mail_sweep_fence");
+		if (!fence) {
+			await db.prepare("ALTER TABLE `app_settings` ADD `raw_mail_sweep_fence` bigint DEFAULT 0 NOT NULL").run();
+			fence = await getMysqlColumn(db, "app_settings", "raw_mail_sweep_fence");
+		}
+		if (!mysqlColumnMatches(fence, { type: "bigint", nullable: false, defaultValue: "0" })) {
+			throw new Error("Migration 0039 found an incompatible app_settings.raw_mail_sweep_fence shape");
+		}
+
+		const table = await db.prepare("SELECT table_name AS table_name FROM information_schema.tables WHERE table_schema = database() AND table_name = 'raw_sweep_pending_deletes'").first<{ table_name: string }>();
+		if (!table) await db.prepare(MYSQL_RAW_SWEEP_PENDING_TABLE).run();
+		const pendingColumns = await getMysqlColumnNames(db, "raw_sweep_pending_deletes");
+		const baseColumns = ["claim_token", "claimed_at", "raw_r2_key"];
+		const completedColumns = [...baseColumns, "delete_complete"].sort();
+		if (JSON.stringify(pendingColumns) !== JSON.stringify(baseColumns) && JSON.stringify(pendingColumns) !== JSON.stringify(completedColumns)) {
+			throw new Error("Migration 0039 found an incompatible raw_sweep_pending_deletes column set");
+		}
+		if (pendingColumns.includes("delete_complete") && !mysqlColumnMatches(
+			await getMysqlColumn(db, "raw_sweep_pending_deletes", "delete_complete"),
+			{ type: "boolean", nullable: false, defaultValue: "0" },
+		)) throw new Error("Migration 0039 found an incompatible raw_sweep_pending_deletes.delete_complete shape");
+		for (const [column, expected] of [
+			["raw_r2_key", { type: "varchar(512)", nullable: false, defaultValue: null }],
+			["claim_token", { type: "longtext", nullable: false, defaultValue: null }],
+			["claimed_at", { type: "bigint", nullable: false, defaultValue: null }],
+		] as const) {
+			if (!mysqlColumnMatches(await getMysqlColumn(db, "raw_sweep_pending_deletes", column), expected)) {
+				throw new Error(`Migration 0039 found an incompatible raw_sweep_pending_deletes.${column} shape`);
+			}
+		}
+		const { results: indexes } = await db.prepare("SHOW INDEX FROM `raw_sweep_pending_deletes`").all<MysqlIndexInfo>();
+		if (!mysqlRawSweepIndexMatches(indexes)) throw new Error("Migration 0039 found an incompatible raw_sweep_pending_deletes primary key");
+
+		for (const expected of MYSQL_RAW_SWEEP_TRIGGERS) {
+			let actual = await mysqlRawSweepTrigger(db, expected.name);
+			if (!actual) {
+				await db.prepare(`CREATE TRIGGER \`${expected.name}\` BEFORE ${expected.event} ON \`${expected.table}\` FOR EACH ROW ${expected.body}`).run();
+				actual = await mysqlRawSweepTrigger(db, expected.name);
+			}
+			if (!actual || actual.event_manipulation.toUpperCase() !== expected.event || actual.event_object_table !== expected.table
+				|| actual.action_timing.toUpperCase() !== "BEFORE"
+				|| normalizeMysqlTriggerBody(actual.action_statement) !== normalizeMysqlTriggerBody(expected.body)) {
+				throw new Error(`Migration 0039 found an incompatible ${expected.name} trigger`);
+			}
+		}
+	};
+	try { await reconcile(); }
+	catch (error) {
+		try { await reconcile(); }
+		catch { throw error; }
+	}
+	if (recordMigration) await recordMysqlMigration(db, name);
+}
+
+async function resumeMysqlRawSweepDeleteComplete(db: D1Database, recordMigration = true): Promise<void> {
+	const name = "0040_raw_sweep_delete_complete.sql";
+	await requireMysqlTable(db, "raw_sweep_pending_deletes", "0040");
+	const reconcile = async () => {
+		let column = await getMysqlColumn(db, "raw_sweep_pending_deletes", "delete_complete");
+		if (!column) {
+			await db.prepare("ALTER TABLE `raw_sweep_pending_deletes` ADD `delete_complete` boolean DEFAULT false NOT NULL").run();
+			column = await getMysqlColumn(db, "raw_sweep_pending_deletes", "delete_complete");
+		}
+		if (!mysqlColumnMatches(column, { type: "boolean", nullable: false, defaultValue: "0" })
+			|| JSON.stringify(await getMysqlColumnNames(db, "raw_sweep_pending_deletes")) !== JSON.stringify(["claim_token", "claimed_at", "delete_complete", "raw_r2_key"])) {
+			throw new Error("Migration 0040 found an incompatible raw_sweep_pending_deletes.delete_complete shape");
+		}
+	};
+	try { await reconcile(); }
+	catch (error) {
+		try { await reconcile(); }
+		catch { throw error; }
+	}
+	if (recordMigration) await recordMysqlMigration(db, name);
+}
+
 export async function getMigrationStatus(db: D1Database): Promise<MigrationStatus> {
 	const migrations = BUNDLES[migrationDialect(db)];
 	const applied = new Set(await getAppliedMigrationNames(db));
@@ -209,6 +364,9 @@ export async function applyPendingMigrations(db: D1Database): Promise<MigrationR
 	const applied: string[] = [];
 	const mysqlPollClaimMigration = "0036_external_account_poll_claims.sql";
 	const mysqlIntakeMigration = "0037_external_message_intake_completion.sql";
+	const mysqlSweepCursorMigration = "0038_raw_mail_sweep_cursor.sql";
+	const mysqlSweepFenceMigration = "0039_raw_sweep_fence.sql";
+	const mysqlSweepDeleteCompleteMigration = "0040_raw_sweep_delete_complete.sql";
 	// Verify already-ledgered feature migrations too, so prior drafts converge only from known exact shapes.
 	if (dialect === "mysql" && !initial.pending.includes(mysqlPollClaimMigration)) {
 		try {
@@ -224,6 +382,18 @@ export async function applyPendingMigrations(db: D1Database): Promise<MigrationR
 			throw new Error(`Migration ${mysqlIntakeMigration} verification failed: ${error instanceof Error ? error.message : "Database error"}`);
 		}
 	}
+	if (dialect === "mysql" && !initial.pending.includes(mysqlSweepCursorMigration)) {
+		try { await resumeMysqlRawMailSweepCursor(db, false); }
+		catch (error) { throw new Error(`Migration ${mysqlSweepCursorMigration} verification failed: ${error instanceof Error ? error.message : "Database error"}`); }
+	}
+	if (dialect === "mysql" && !initial.pending.includes(mysqlSweepFenceMigration)) {
+		try { await resumeMysqlRawSweepFence(db, false); }
+		catch (error) { throw new Error(`Migration ${mysqlSweepFenceMigration} verification failed: ${error instanceof Error ? error.message : "Database error"}`); }
+	}
+	if (dialect === "mysql" && !initial.pending.includes(mysqlSweepDeleteCompleteMigration)) {
+		try { await resumeMysqlRawSweepDeleteComplete(db, false); }
+		catch (error) { throw new Error(`Migration ${mysqlSweepDeleteCompleteMigration} verification failed: ${error instanceof Error ? error.message : "Database error"}`); }
+	}
 
 	for (const name of initial.pending) {
 		const migration = migrations.find((candidate) => candidate.name === name);
@@ -234,6 +404,12 @@ export async function applyPendingMigrations(db: D1Database): Promise<MigrationR
 				await resumeMysqlExternalAccountPollClaims(db);
 			} else if (dialect === "mysql" && name === mysqlIntakeMigration) {
 				await resumeMysqlIntakeCompletion(db);
+			} else if (dialect === "mysql" && name === mysqlSweepCursorMigration) {
+				await resumeMysqlRawMailSweepCursor(db);
+			} else if (dialect === "mysql" && name === mysqlSweepFenceMigration) {
+				await resumeMysqlRawSweepFence(db);
+			} else if (dialect === "mysql" && name === mysqlSweepDeleteCompleteMigration) {
+				await resumeMysqlRawSweepDeleteComplete(db);
 			} else if (dialect === "mysql") {
 				// MySQL commits DDL implicitly, so a transaction cannot make a migration atomic. Record it last.
 				for (const statement of migration.statements) await db.prepare(statement).run();

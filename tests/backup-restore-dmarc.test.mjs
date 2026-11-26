@@ -58,6 +58,18 @@ test("dmarc_daily_stats is backed up without its serial id, so a PostgreSQL rest
 	assert.equal(document.tables.dmarc_daily_stats[0].message_count, 9);
 });
 
+test("bucket-local sweep progress is omitted from backups and reset on restore", async () => {
+	const sqlite = database();
+	sqlite.prepare("UPDATE app_settings SET raw_mail_sweep_cursor = 'bucket-local-cursor', raw_mail_sweep_fence = 99 WHERE id = 'default'").run();
+	const document = JSON.parse(new TextDecoder().decode(await exportDatabaseRecords(d1(sqlite))));
+	assert.equal("raw_mail_sweep_cursor" in document.tables.app_settings[0], false);
+	assert.equal("raw_mail_sweep_fence" in document.tables.app_settings[0], false);
+	await restoreDatabaseRecords(d1(sqlite), buffer(new TextEncoder().encode(JSON.stringify(document))));
+	const settings = sqlite.prepare("SELECT raw_mail_sweep_cursor, raw_mail_sweep_fence FROM app_settings WHERE id = 'default'").get();
+	assert.equal(settings.raw_mail_sweep_cursor, null);
+	assert.equal(settings.raw_mail_sweep_fence, 0);
+});
+
 test("restoring ignores an id in the stats rows (older documents) and keeps the data", async () => {
 	const sqlite = database();
 	const document = JSON.parse(new TextDecoder().decode(await exportDatabaseRecords(d1(sqlite))));

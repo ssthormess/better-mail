@@ -14,6 +14,7 @@ await build({
 			export { SqliteDatabase } from "./server/runtime/sqlite-database.ts";
 			export { applyMigrations } from "./server/runtime/migrate.ts";
 			export { processInboundMessage } from "./src/lib/email/inbound.ts";
+			export { sweepOrphanedRawMail } from "./src/lib/email/raw-sweeper.ts";
 		`,
 		resolveDir: root,
 		sourcefile: "promotions-intake-entry.ts",
@@ -44,11 +45,23 @@ async function fixture(t) {
 		INSERT INTO mailboxes (id, user_id, domain_id, local_part, created_at) VALUES ('box', 'admin', 'one', 'me', 1);
 	`);
 	const objects = new Map();
-	let bucketPut = async () => {};
+	let bucketPut = async (key, value) => { objects.set(key, value); };
+	let bucketDelete = async key => { objects.delete(key); };
 	const env = {
 		DB: database,
 		MAILFLARE_RUNTIME: "node",
-		BUCKET: { get: async (key) => (objects.has(key) ? { arrayBuffer: async () => objects.get(key) } : null), put: async (...args) => bucketPut(...args), delete: async (key) => { objects.delete(key); } },
+		BUCKET: {
+			get: async (key) => (objects.has(key) ? { arrayBuffer: async () => objects.get(key) } : null),
+			put: async (...args) => bucketPut(...args),
+			delete: async key => bucketDelete(key),
+			list: async ({ prefix, cursor, limit }) => {
+				const keys = [...objects.keys()].filter(key => key.startsWith(prefix)).sort();
+				const start = cursor ? Math.max(0, keys.findIndex(key => key > cursor)) : 0;
+				const page = keys.slice(start, start + limit);
+				const truncated = start + page.length < keys.length;
+				return { objects: page.map(key => ({ key, uploaded: new Date(0) })), truncated, cursor: truncated ? page.at(-1) : undefined };
+			},
+		},
 	};
 	globalThis.__mailflareNodeEnv = env;
 	t.after(() => { delete globalThis.__mailflareNodeEnv; });
@@ -70,7 +83,7 @@ async function fixture(t) {
 	// Realtime hub stand-in: every body POSTed to a user's hub, in order.
 	const sent = [];
 	env.REALTIME = { getByName: (user) => ({ fetch: async (_url, init) => { sent.push({ user, body: JSON.parse(init.body) }); return new Response(null, { status: 204 }); } }) };
-	return { deliver, deliverRaw, storeRaw, raw: database.db, database, env, sent, setBucketPut: put => { bucketPut = put; } };
+	return { deliver, deliverRaw, storeRaw, raw: database.db, database, env, sent, objects, setBucketPut: put => { bucketPut = put; }, setBucketDelete: remove => { bucketDelete = remove; } };
 }
 
 test("intake stores the category and sender address of bulk mail", async (t) => {
@@ -234,6 +247,40 @@ test("a failed attachment writer preserves a completed replay and never acknowle
 			assert.equal(raw.prepare("SELECT count(*) AS n FROM message_attachments").get().n, 0);
 			assert.equal(sent.filter(entry => entry.body.type === "new_message").length, 0);
 		}
+	}
+});
+
+test("raw-object sweeping cannot delete a raw object racing with inbound reference insertion", async (t) => {
+	const quiet = console.info; console.info = () => {};
+	t.after(() => { console.info = quiet; });
+	for (const nonTransactionalBinding of [false, true]) {
+		const { env, raw, objects, database, setBucketDelete } = await fixture(t);
+		if (nonTransactionalBinding) {
+			// Exercise the D1 protocol: the binding exposes only prepare/batch, not an interactive transaction.
+			env.DB = { prepare: query => database.prepare(query), batch: statements => database.batch(statements) };
+		}
+		const key = `inbound/fence-race-${nonTransactionalBinding ? "d1" : "tx"}`;
+		const bytes = new TextEncoder().encode(mime("friend@outside.test", "", "race body")).buffer;
+		objects.set(key, bytes);
+		let deleteStarted;
+		const started = new Promise(resolve => { deleteStarted = resolve; });
+		let releaseDelete;
+		const blocked = new Promise(resolve => { releaseDelete = resolve; });
+		setBucketDelete(async objectKey => {
+			deleteStarted();
+			await blocked;
+			objects.delete(objectKey);
+		});
+		const sweep = m.sweepOrphanedRawMail(env, new Date(Date.now() + 60_000));
+		await started;
+		const intake = m.processInboundMessage(env, { from: "bounce@x.test", to: "me@one.test", rawR2Key: key }, {
+			intakeMode: "historical_import", rawBytes: bytes,
+		});
+		await new Promise(resolve => setTimeout(resolve, 25));
+		releaseDelete();
+		await Promise.all([sweep, intake]);
+		assert.equal(raw.prepare("SELECT count(*) AS n FROM messages WHERE raw_r2_key = ?").get(key).n, 1);
+		assert.deepEqual(new Uint8Array(objects.get(key)), new Uint8Array(bytes));
 	}
 });
 

@@ -168,33 +168,31 @@ test("a late message insert is marked incomplete and retry completes determinist
   "Content-Transfer-Encoding: base64", "", "aGVsbG8=", "--fence--", "",
  ].join("\r\n");
  const f = await fixture(t, { messages: new Map([[1, raw]]) });
- const originalPrepare = f.database.prepare.bind(f.database); let delayInsert = true; let delayCalls = 0;
- f.database.prepare = query => {
-  const statement = originalPrepare(query);
-  if (!delayInsert || !/insert into ["`]?messages["`]?/i.test(query)) return statement;
-  delayInsert = false;
-  return new Proxy(statement, { get(target, property) {
-   if (["all", "run", "first", "raw"].includes(property)) return async (...args) => { delayCalls++; await new Promise(resolve => setTimeout(resolve, 6_200)); return target[property](...args); };
-   const value = Reflect.get(target, property, target);
-   if (property === "bind" && typeof value === "function") return (...args) => {
-    const bound = value.apply(target, args);
-    return new Proxy(bound, { get(inner, key) {
-     if (["all", "run", "first", "raw"].includes(key)) return async (...values) => { delayCalls++; await new Promise(resolve => setTimeout(resolve, 6_200)); return inner[key](...values); };
-     const method = Reflect.get(inner, key, inner);
-     return typeof method === "function" ? method.bind(inner) : method;
-    } });
-   };
-   return typeof value === "function" ? value.bind(target) : value;
-  } });
- };
+ const originalTransaction = f.database.transaction.bind(f.database); let delayInsert = true; let delayCalls = 0;
+ f.database.transaction = work => originalTransaction(tx => work(new Proxy(tx, { get(target, property) {
+  if (property === "prepare") return query => {
+   const wrap = statement => new Proxy(statement, { get(inner, method) {
+    if (delayInsert && /insert into ["`]?messages["`]?/i.test(query) && ["all", "run", "first", "raw"].includes(method)) {
+     delayInsert = false;
+     return async (...args) => { delayCalls++; await new Promise(resolve => setTimeout(resolve, 12_000)); return inner[method](...args); };
+    }
+    if (method === "bind") return (...args) => wrap(inner.bind(...args));
+    const value = Reflect.get(inner, method, inner);
+    return typeof value === "function" ? value.bind(inner) : value;
+   } });
+   return wrap(target.prepare(query));
+  };
+  const value = Reflect.get(target, property, target);
+  return typeof value === "function" ? value.bind(target) : value;
+ } })));
  const firstAt = new Date(); await f.poll(firstAt);
  assert.equal(delayInsert, false, "message insert delay was installed");
- assert.ok(delayCalls > 0, `intercepted an execution method (${delayCalls})`);
+ assert.ok(delayCalls > 0, `intercepted the message insert (${delayCalls})`);
  assert.equal(f.sql.prepare("SELECT count(*) AS n FROM messages").get().n, 0, "insert is still pending after the bounded first attempt");
  await new Promise(resolve => setTimeout(resolve, 4_000));
  const incomplete = f.sql.prepare("SELECT intake_complete FROM messages").get();
  assert.equal(incomplete.intake_complete, 0, "late commit carries an explicit incomplete marker");
- f.database.prepare = originalPrepare;
+ f.database.transaction = originalTransaction;
  await f.poll(new Date(firstAt.getTime() + 121_000));
  const row = f.sql.prepare("SELECT id, intake_complete FROM messages").get();
  assert.equal(row.intake_complete, 1);

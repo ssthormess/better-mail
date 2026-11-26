@@ -40,6 +40,8 @@ const OMITTED_COLUMNS: Partial<Record<DatabaseBackupTable, string[]>> = {
 	tls_daily_stats: ["id"],
 	// A lease is process coordination, never durable account configuration; restoring it could strand or replay a poll.
 	external_accounts: ["poll_claim_token", "poll_claim_until"],
+	// The raw sweep cursor and fence are local operational state, not portable across buckets or restores.
+	app_settings: ["raw_mail_sweep_cursor", "raw_mail_sweep_fence"],
 };
 
 export function getBackupConfigurationStatus(_env?: CloudflareEnv) {
@@ -75,6 +77,8 @@ export const INTERNAL_TABLES = [
 	"dav_sync_state",
 	// Push registrations are re-sent by each app on launch.
 	"push_devices",
+	// A transient lock used only while an unreferenced raw object is deleted; writers re-create bytes before reference.
+	"raw_sweep_pending_deletes",
 	// Web-push subscriptions are saved again by each client whenever it resolves
 	// its push state, and they reference sessions whose rows a restore replaces.
 	"push_subscriptions",

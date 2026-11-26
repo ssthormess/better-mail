@@ -1,0 +1,1 @@
+ALTER TABLE "raw_sweep_pending_deletes" ADD COLUMN "delete_complete" boolean DEFAULT false NOT NULL;
