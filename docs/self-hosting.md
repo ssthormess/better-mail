@@ -134,36 +134,45 @@ and the DNS page shows what to set by hand.
 
 ## Mail apps (IMAP)
 
-The container also serves a partial IMAP endpoint for mail apps and scripts,
-**off until an administrator turns on Admin → General → "Allow mail apps to
-connect over IMAP"**. It serves no message bodies and no `STORE`/`COPY`/`EXPUNGE`:
-a client can list mailboxes, counts and flags, search, manage folders, append
-mail and move it to Trash, but it cannot download, flag or expunge a message.
-[IMAP bridge](imap-bridge.md) has the command list and every limitation.
+The container also serves a partial IMAP endpoint for mail apps and scripts.
+**Authentication is off until an administrator turns on Admin → General →
+"Allow mail apps to connect over IMAP"**; the listener itself binds
+regardless. It serves no message bodies, and there is no `STORE`, `COPY` or
+`EXPUNGE`: a client can list mailboxes, counts and flags, search, manage
+folders, append mail and move it to Trash, but it cannot download a message,
+set a flag directly or expunge one. [IMAP bridge](imap-bridge.md) has the
+command list and every limitation.
 
 The bundled Compose files publish ports 3000 and 25 only, so add a mapping for
 the IMAP port. Giving the container a high port and the host the standard one
 avoids the privileged-port threshold (the container runs as an unprivileged
-user); keep the certificate files readable by that user, outside the `/data`
-backup set:
+user). The certificate pair lives on a read-only mount outside `/data`, the
+volume this guide tells you to back up, so a full volume backup never contains
+the private key:
 
 ```yaml
     ports:
       - "3000:3000"   # web app and JMAP
       - "25:25"       # inbound SMTP
-      - "993:1143"    # IMAP over TLS
+      - "993:1143"    # IMAP over TLS: host 993 -> container 1143
     environment:
       - IMAP_PORT=1143
-      - IMAP_TLS_KEY=/data/tls/imap.key
-      - IMAP_TLS_CERT=/data/tls/imap.crt
+      - IMAP_TLS_KEY=/etc/mailflare/tls/imap.key
+      - IMAP_TLS_CERT=/etc/mailflare/tls/imap.crt
+    volumes:
+      - mailflare-data:/data
+      - /srv/mailflare-tls:/etc/mailflare/tls:ro
 ```
 
-`IMAP_TLS_KEY` and `IMAP_TLS_CERT` (paths inside the container, both or
-neither) enable implicit TLS — the default port becomes 993 and clients must
-be set to SSL/TLS, since `STARTTLS` is not offered. Without them the default
-is 143 and the listener, app password included, is plaintext; map `143:1143`
-instead and expose it only on a trusted network. `IMAP_PORT=0` disables the
-listener.
+These are edits to the `mailflare` service in your compose file, so keep its
+existing `mailflare-data:/data` volume line; the three values can live in
+`.env.docker` instead if you prefer. `IMAP_PORT` is the port inside the
+container; mail apps dial the **host** side of the mapping, 993 above. `IMAP_TLS_KEY` and `IMAP_TLS_CERT` (paths inside the
+container, both or neither) enable implicit TLS — the default internal port
+becomes 993 and clients must be set to SSL/TLS, since `STARTTLS` is not
+offered. Without them the default is 143 and the listener, app password
+included, is plaintext; map `143:1143` instead and expose it only on a trusted
+network. `IMAP_PORT=0` disables the listener.
 
 Clients sign in with an app password created under **Settings → App
 passwords** with **Read mail over IMAP** ticked; the username is not checked.
