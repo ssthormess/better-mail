@@ -125,16 +125,9 @@ function ftsTextParts(text: string): { positives: string[]; negatives: string[] 
 	return { positives, negatives };
 }
 
-/**
- * Fold the parts into one MATCH expression. `exclude` is set only when nothing is
- * positive, because FTS5 has no unary NOT and a MATCH made only of negations is a
- * syntax error: callers then select every row except those matching `exclude`.
- */
-function combineFtsParts(positives: string[], negatives: string[]): { match: string | null; exclude: string | null } {
-	const exclude = negatives.length > 0 ? negatives.join(" OR ") : null;
-	if (positives.length === 0) return { match: null, exclude };
-	const base = positives.join(" AND ");
-	return { match: exclude ? `(${base}) NOT (${exclude})` : base, exclude: null };
+/** FTS5 has no unary NOT, so a MATCH made only of negations is a syntax error; negations are a separate expression. */
+function combined(expressions: string[], operator: "AND" | "OR"): string | null {
+	return expressions.length > 0 ? expressions.join(` ${operator} `) : null;
 }
 
 /** Column filters as FTS5 expressions (`subject : (...) AND from_addr : (...)`), in query order. */
@@ -155,47 +148,42 @@ function ftsColumnParts(parsed: ParsedSearchQuery): string[] {
 }
 
 /**
- * Build the FTS5 expressions for a search. Column filters restrict a term to
- * one column; free text is ANDed across the whole row. `match` holds the
- * positive terms (with any negations folded in as FTS5's binary NOT) and
- * `exclude` holds negations when there is no positive term, because FTS5 has no
- * unary NOT and a MATCH made only of negations is a syntax error: callers
- * select every row except those matching `exclude`. Both are null when there is
- * nothing to match, so callers skip the index entirely.
- */
-export function buildFtsMatch(parsed: ParsedSearchQuery): { match: string | null; exclude: string | null } {
-	const { positives, negatives } = ftsTextParts(parsed.text);
-	return combineFtsParts([...positives, ...ftsColumnParts(parsed)], negatives);
-}
-
-/**
- * The column-filter half of `buildFtsMatch`, on its own. A second index that has no
- * columns of its own still has to be scoped by the message's columns, which is what
- * this expression is for: it is always required, while free text may be satisfied by
- * the message or by one of its attachments (attachment text, F52).
+ * The column-filter half of a query (`subject : (…) AND from_addr : (…)`), on its own.
+ * A second index that has no columns of its own still has to be scoped by the message's
+ * columns, which is what this expression is for: it is always required, while free text
+ * may be satisfied by the message or by one of its attachments (attachment text, F52).
+ *
+ * The three expressions below are what a search turns into. FTS5 has no unary NOT and a
+ * MATCH made only of negations is a syntax error, so negations are never folded into the
+ * positive expression: a caller matches `buildFtsColumnMatch` + `buildFtsFreeTextMatch`
+ * and separately rejects `buildFtsNegation` with a `NOT IN` subquery, against every index
+ * whose rows can satisfy the search. Each is null when there is nothing of that kind.
  */
 export function buildFtsColumnMatch(parsed: ParsedSearchQuery): string | null {
-	const parts = ftsColumnParts(parsed);
-	return parts.length > 0 ? parts.join(" AND ") : null;
+	return combined(ftsColumnParts(parsed), "AND");
 }
 
 /**
  * The negated free-text terms as one expression (`"a"* OR "b"*`), or null when the
- * query negates nothing. A second index has to reject rows matching it even where
- * the indexed row is not the message itself, which `buildFtsMatch` cannot express.
+ * query negates nothing. The caller rejects it against every index, not only the one
+ * that names the message: a negated term must not be excused by a hit in another
+ * source (F52 gate, `invoice -confidential`).
  */
 export function buildFtsNegation(parsed: ParsedSearchQuery): string | null {
 	const { negatives } = ftsTextParts(parsed.text);
-	return negatives.length > 0 ? negatives.join(" OR ") : null;
+	return combined(negatives, "OR");
 }
 
 /**
- * The free-text-only half of `buildFtsMatch`: the same tokens, without the column
- * filters, for an index that has no subject, sender or recipient of its own
- * (attachment text, F52). A query whose only terms are column filters therefore
- * returns `{ match: null, exclude: null }` and searches no attachment text.
+ * The positive free-text terms without the column filters, for an index that has no
+ * subject, sender or recipient of its own (attachment text, F52). It is ORed with the
+ * message match, so a query whose only terms are column filters returns null and
+ * searches no attachment text.
+ *
+ * Negations are deliberately absent here too: an attachment hit could otherwise
+ * satisfy the positive side of a `NOT` the message index had rejected.
  */
-export function buildFtsFreeTextMatch(parsed: ParsedSearchQuery): { match: string | null; exclude: string | null } {
-	const { positives, negatives } = ftsTextParts(parsed.text);
-	return combineFtsParts(positives, negatives);
+export function buildFtsFreeTextMatch(parsed: ParsedSearchQuery): string | null {
+	const { positives } = ftsTextParts(parsed.text);
+	return combined(positives, "AND");
 }

@@ -1,5 +1,6 @@
 import { isExternalDatabase } from "@/db/external";
 import type { DatabaseDialect } from "@/db/dialect";
+import { clearAttachmentIndexProbe } from "@/lib/search/attachment-index";
 import sqliteBundle from "./bundle.json";
 import mysqlBundle from "./bundle-mysql.json";
 import postgresBundle from "./bundle-postgres.json";
@@ -91,5 +92,11 @@ export async function applyPendingMigrations(db: D1Database): Promise<MigrationR
 		}
 	}
 
+	// A fresh migration can create an index that this isolate's cached capability probes
+	// (search's attachment index, F52) answered "no" for a moment ago. Re-asking is one
+	// query, and the alternative is a database that stays unsearchable until deployment.
+	// Every entry, because the cache is keyed by the raw binding while a caller may hold a
+	// read-replication session over it.
+	clearAttachmentIndexProbe();
 	return { ...(await getMigrationStatus(db)), applied };
 }

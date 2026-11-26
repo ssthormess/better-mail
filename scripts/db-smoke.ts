@@ -10,6 +10,7 @@ import { getDatabaseConfig } from "@/db/with-database";
 import { openExternalDatabase } from "@/db/external";
 import { applyPendingMigrations, getMigrationStatus } from "@/lib/migrations/service";
 import { buildSearchConditions } from "@/lib/search/conditions";
+import { hasAttachmentSearchIndex } from "@/lib/search/attachment-index";
 import { createBookedCalendarEvents } from "@/lib/booking/create";
 import { importCalendarGroups } from "@/lib/calendar/import-store";
 import { importContacts } from "@/lib/contacts/import-store";
@@ -105,8 +106,9 @@ const batchResults = await d1.batch([d1.prepare("SELECT 1 AS one"), d1.prepare("
 check("D1-compatible batch()", batchResults.length === 2);
 
 await db.update(messages).set({ subject: "Quarterly Report" }).where(eq(messages.id, `msg_${stamp}`));
+const searchOptions = { attachmentText: await hasAttachmentSearchIndex({ DB: d1 }) };
 for (const [query, expected] of [["quarterly", 1], ["subject:report", 1], ["from:x@y.z numbers", 1], ["absent-term", 0], ["-quarterly", 0]] as const) {
-	const found = await db.select({ id: messages.id }).from(messages).where(and(eq(messages.mailboxId, `mbx_${stamp}`), ...buildSearchConditions(query)));
+	const found = await db.select({ id: messages.id }).from(messages).where(and(eq(messages.mailboxId, `mbx_${stamp}`), ...buildSearchConditions(query, "UTC", searchOptions)));
 	check(`search "${query}"`, found.length === expected);
 }
 

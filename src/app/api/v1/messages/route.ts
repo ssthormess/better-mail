@@ -7,6 +7,7 @@ import { getDb } from "@/db";
 import { messages, users } from "@/db/schema";
 import { getMailboxAccessLevel, listAccessibleMailboxIds } from "@/lib/mailboxes/access";
 import { buildSearchConditions } from "@/lib/search/conditions";
+import { hasAttachmentSearchIndex } from "@/lib/search/attachment-index";
 import { draftsVisibleTo } from "@/lib/email/draft-access";
 import { getRequestTimeZone } from "@/lib/time/utils";
 import { parseLimit } from "@/lib/api/query-params";
@@ -54,7 +55,10 @@ export async function GET(request: Request) {
 	if (direction === "inbound" || direction === "outbound") {
 		conditions.push(eq(messages.direction, direction));
 	}
-	if (query) conditions.push(...buildSearchConditions(query, getRequestTimeZone(request, user.timeZone)));
+	if (query) {
+		// Search degrades to message-only until 0109 has been applied (docs/deployment.md).
+		conditions.push(...buildSearchConditions(query, getRequestTimeZone(request, user.timeZone), { attachmentText: await hasAttachmentSearchIndex(env) }));
+	}
 
 	const rows = await db
 		.select()

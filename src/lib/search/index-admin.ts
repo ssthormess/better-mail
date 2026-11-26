@@ -12,6 +12,9 @@ export async function rebuildSearchIndex(env: CloudflareEnv): Promise<void> {
 	await env.DB.prepare("INSERT INTO messages_fts(messages_fts) VALUES ('rebuild')").run();
 	// `attachments_fts` (attachment text, F52) is rebuilt separately and tolerates a database that has not
 	// applied its migration yet, so a rebuild request still repairs the message index on such a database.
+	// Its external content is the `attachments_fts_source` view (only rows with `extract_status = 'done'` and
+	// text), so a rebuild re-creates exactly the postings the triggers maintain — it cannot revive text that
+	// is not eligible any more, and it clears orphan postings left by an older index shape.
 	try {
 		await env.DB.prepare("INSERT INTO attachments_fts(attachments_fts) VALUES ('rebuild')").run();
 	} catch (error) {

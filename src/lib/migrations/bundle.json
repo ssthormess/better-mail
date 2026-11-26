@@ -999,7 +999,8 @@
       "name": "0109_attachment_search_index.sql",
       "statements": [
         "CREATE INDEX `message_attachments_extract_status_idx` ON `message_attachments` (`extract_status`,`created_at`);",
-        "CREATE VIRTUAL TABLE `attachments_fts` USING fts5(\n\t`extracted_text`,\n\tcontent='message_attachments',\n\tcontent_rowid='rowid',\n\ttokenize='unicode61 remove_diacritics 2'\n);",
+        "CREATE VIEW `attachments_fts_source` AS\nSELECT `rowid` AS `rowid`, `extracted_text` AS `extracted_text`\nFROM `message_attachments`\nWHERE `extract_status` = 'done' AND `extracted_text` IS NOT NULL;",
+        "CREATE VIRTUAL TABLE `attachments_fts` USING fts5(\n\t`extracted_text`,\n\tcontent='attachments_fts_source',\n\tcontent_rowid='rowid',\n\ttokenize='unicode61 remove_diacritics 2'\n);",
         "CREATE TRIGGER `attachments_fts_ai` AFTER INSERT ON `message_attachments`\nWHEN new.`extract_status` = 'done' AND new.`extracted_text` IS NOT NULL BEGIN\n\tINSERT INTO `attachments_fts`(`rowid`, `extracted_text`) VALUES (new.`rowid`, new.`extracted_text`);\nEND;",
         "CREATE TRIGGER `attachments_fts_ad` AFTER DELETE ON `message_attachments`\nWHEN old.`extract_status` = 'done' AND old.`extracted_text` IS NOT NULL BEGIN\n\tINSERT INTO `attachments_fts`(`attachments_fts`, `rowid`, `extracted_text`) VALUES ('delete', old.`rowid`, old.`extracted_text`);\nEND;",
         "CREATE TRIGGER `attachments_fts_au` AFTER UPDATE OF `extracted_text`, `extract_status` ON `message_attachments` BEGIN\n\tINSERT INTO `attachments_fts`(`attachments_fts`, `rowid`, `extracted_text`)\n\t\tSELECT 'delete', old.`rowid`, old.`extracted_text`\n\t\tWHERE old.`extract_status` = 'done' AND old.`extracted_text` IS NOT NULL;\n\tINSERT INTO `attachments_fts`(`rowid`, `extracted_text`)\n\t\tSELECT new.`rowid`, new.`extracted_text`\n\t\tWHERE new.`extract_status` = 'done' AND new.`extracted_text` IS NOT NULL;\nEND;",

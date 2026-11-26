@@ -38,6 +38,11 @@ function buildLikeConditions(parsed: ParsedSearchQuery): SQL[] {
 	return conditions;
 }
 
+export type SearchConditionOptions = {
+	/** Whether `attachments_fts` exists; see `hasAttachmentSearchIndex` in ./attachment-index. */
+	attachmentText?: boolean;
+};
+
 /**
  * Translate a search string into WHERE conditions on `messages`. Text goes to
  * the FTS5 index by rowid; everything else is a plain column predicate, so the
@@ -50,21 +55,32 @@ function buildLikeConditions(parsed: ParsedSearchQuery): SQL[] {
  * a word in a body finds it in an attachment's extracted text.
  *
  * Column filters stay message conditions: `from:maya invoice` requires the message
- * to be from maya and finds "invoice" in its body or in one of its attachments. A
- * negation must hold everywhere, so `-revenue` also rejects a message whose
- * attachment mentions it.
+ * to be from maya and finds "invoice" in its body or in one of its attachments.
+ *
+ * A negated term has to hold for the whole message, so it is applied outside the OR:
+ * the message is rejected if `messages_fts` matches it *or* if one of its attachments
+ * does. Folding it into the positive expression would let an attachment hit satisfy
+ * the `NOT` that the message index rejected (`invoice -confidential` returned a
+ * message whose body says confidential, F52 gate).
  *
  * Two things to know about that text. It exists only for rows the extraction
  * sweep has reached: a row still at `extract_status = 'none'` is invisible to
  * search until then (see src/lib/email/attachment-sweep.ts). And none of this runs
  * on PostgreSQL or MySQL, where the branch below stays the LIKE scan it always
  * was; those dialects get attachment parity in F53.
+ *
+ * `attachments_fts` is checked first: the Worker is deployed before its migrations are
+ * applied (docs/deployment.md), so a SQLite database can be one release behind the code,
+ * and naming a table that does not exist fails the whole statement — `no such table`
+ * turns every free-text search, message-only ones included, into a 500. With
+ * `attachmentText: false` the query is exactly the pre-F52 message-only search.
  */
-export function buildSearchConditions(raw: string, timeZone = "UTC"): SQL[] {
+export function buildSearchConditions(raw: string, timeZone = "UTC", options: SearchConditionOptions = {}): SQL[] {
 	const parsed = parseSearchQuery(raw, timeZone);
 	const conditions: SQL[] = [];
 
 	if (schemaDialect() === "sqlite") {
+		const attachmentText = options.attachmentText === true;
 		const inMessages = (expression: string) =>
 			sql`${messages}.rowid IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ${expression})`;
 		const notInMessages = (expression: string) =>
@@ -81,15 +97,15 @@ export function buildSearchConditions(raw: string, timeZone = "UTC"): SQL[] {
 		// Free text may be in the message or in one of its attachments, but every
 		// positive term has to appear in that same row of either index.
 		const freeText = buildFtsFreeTextMatch(parsed);
-		if (freeText.match) {
-			conditions.push(or(inMessages(freeText.match), attachmentMatches(freeText.match))!);
-		} else if (freeText.exclude) {
-			conditions.push(notInMessages(freeText.exclude));
+		if (freeText) {
+			conditions.push(attachmentText ? or(inMessages(freeText), attachmentMatches(freeText))! : inMessages(freeText));
 		}
-		// A negated term is excluded wherever it appears, so it cannot be folded into
-		// the union above: the message must have no attachment matching it either.
+		// Negations are not part of that union: they have to hold in both indexes.
 		const negation = buildFtsNegation(parsed);
-		if (negation) conditions.push(attachmentMisses(negation));
+		if (negation) {
+			conditions.push(notInMessages(negation));
+			if (attachmentText) conditions.push(attachmentMisses(negation));
+		}
 	} else {
 		conditions.push(...buildLikeConditions(parsed));
 	}

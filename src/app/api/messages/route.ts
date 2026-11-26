@@ -12,6 +12,7 @@ import { getFirstEmailAddressEntry, normalizeEmailAddress } from "@/lib/email/ad
 import { getMailboxAccessLevel, hasMailboxPermission, listAccessibleMailboxes } from "@/lib/mailboxes/access";
 import { tracksAccountIdentity } from "@/lib/profile/identity-utils";
 import { buildSearchConditions } from "@/lib/search/conditions";
+import { hasAttachmentSearchIndex } from "@/lib/search/attachment-index";
 import { getRequestTimeZone } from "@/lib/time/utils";
 import { scheduledMessageCondition } from "@/lib/email/scheduled";
 import { selectInBatches } from "@/lib/db-params";
@@ -115,7 +116,13 @@ export async function GET(request: Request) {
 	if (query || title) {
 		// Operators (from:, has:attachment, before:) and free text go through the
 		// full-text index; `title` is the legacy subject filter and is folded in.
-		conditions.push(...buildSearchConditions(title ? `${query ?? ""} subject:"${title}"` : query ?? "", getRequestTimeZone(request, user.timeZone)));
+		// The attachment index may not exist yet on a database whose migrations are
+		// still pending (docs/deployment.md), so it is probed instead of assumed.
+		conditions.push(
+			...buildSearchConditions(title ? `${query ?? ""} subject:"${title}"` : query ?? "", getRequestTimeZone(request, user.timeZone), {
+				attachmentText: await hasAttachmentSearchIndex(env),
+			}),
+		);
 	}
 	const where = and(...conditions);
 	// Messages that were never threaded (older rows, drafts) stand alone.

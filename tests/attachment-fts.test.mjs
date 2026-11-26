@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { cpSync, mkdtempSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import test, { after } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -17,6 +17,8 @@ await build({
 			export { getDb } from "./src/db/index.ts";
 			export { messages } from "./src/db/schema/index.ts";
 			export { buildSearchConditions } from "./src/lib/search/conditions.ts";
+			export { hasAttachmentSearchIndex, clearAttachmentIndexProbe } from "./src/lib/search/attachment-index.ts";
+			export { applyPendingMigrations } from "./src/lib/migrations/service.ts";
 			export { rebuildSearchIndex } from "./src/lib/search/index-admin.ts";
 		`,
 		resolveDir: root,
@@ -50,8 +52,9 @@ async function fixture(t) {
 	`);
 	const env = { DB: database };
 	const db = m.getDb(env);
-	/** Search results as sorted message ids. */
-	const ids = async (query) => (await db.select({ id: m.messages.id }).from(m.messages).where(...m.buildSearchConditions(query))).map((row) => row.id).sort();
+	/** Search results as sorted message ids, with the attachment index as F52 leaves it. */
+	const ids = async (query) =>
+		(await db.select({ id: m.messages.id }).from(m.messages).where(...m.buildSearchConditions(query, "UTC", { attachmentText: true }))).map((row) => row.id).sort();
 	/** Mark an attachment extracted, the way the extraction writer does. */
 	const extracted = (id, text, status = "done") =>
 		database.db.prepare("UPDATE message_attachments SET extracted_text = ?, extract_status = ?, extracted_at = 3 WHERE id = ?").run(text, status, id);
@@ -154,4 +157,94 @@ test("a rebuild repopulates the attachment index from the stored text", async (t
 
 	await m.rebuildSearchIndex(env);
 	assert.deepEqual(await ids("rebuildable"), ["m1"], "the rebuild reads the stored text back into the index");
+});
+
+test("a negated message term is not excused by an attachment hit", async (t) => {
+	const { database, ids, extracted } = await fixture(t);
+	// m1's body carries the negated term; its attachment carries the positive one. The
+	// F52 gate found this returned m1 because the negation was folded into the positive
+	// expression, which the attachment then satisfied on its own.
+	database.db.prepare("UPDATE messages SET text_body = 'confidential planning' WHERE id = 'm1'").run();
+	extracted("a1", "quarterly invoice");
+	extracted("a2", "invoice for the audit");
+	assert.deepEqual(await ids("invoice"), ["m1", "m2"]);
+	assert.deepEqual(await ids("invoice -confidential"), ["m2"], "the message index match cannot be replaced by an attachment match");
+	assert.deepEqual(await ids("invoice -quarterly"), ["m2"], "the attachment's own text still excludes it");
+});
+
+test("a rebuild indexes only eligible rows, so neither delete leaves an orphan posting", async (t) => {
+	const { database, env, ids, extracted, matched } = await fixture(t);
+	extracted("a1", "rebuildable wording");
+
+	// A required lifecycle case: only the status changes, so the update trigger removes
+	// the posting without a rebuild.
+	database.db.prepare("UPDATE message_attachments SET extract_status = 'failed' WHERE id = 'a1'").run();
+	assert.deepEqual(matched('"rebuildable"*'), []);
+
+	// A rebuild must not read the text back in, and must not index a row the triggers skip
+	// just because it holds text (a2 is at "none" with text, as a failed write can leave it).
+	database.db.prepare("UPDATE message_attachments SET extracted_text = 'pendingmarker', extract_status = 'none' WHERE id = 'a2'").run();
+	await m.rebuildSearchIndex(env);
+	assert.deepEqual(matched('"rebuildable"*'), [], "a rebuild only reads rows the triggers would index");
+	assert.deepEqual(matched('"pendingmarker"*'), [], "a row at none with stored text is not indexed by a rebuild");
+	assert.deepEqual(await ids("rebuildable"), []);
+
+	// A done row that exists when the rebuild runs: deleting it afterwards must remove
+	// its posting, whichever way the row leaves. This is the gate's orphan case.
+	database.db.exec(`
+		INSERT INTO message_attachments (id, message_id, filename, content_type, size, r2_key, extract_status, extracted_text, created_at)
+			VALUES ('a3', 'm1', 'later.txt', 'text/plain', 10, 'attachments/m1/a3/later.txt', 'done', 'later wording', 3),
+			('a4', 'm1', 'pending.txt', 'text/plain', 10, 'attachments/m1/a4/pending.txt', 'none', NULL, 4);
+	`);
+	await m.rebuildSearchIndex(env);
+	assert.equal(matched('"later"*').length, 1, "the eligible row is indexed");
+	database.db.prepare("DELETE FROM message_attachments WHERE id = 'a3'").run();
+	assert.deepEqual(matched('"later"*'), [], "the delete trigger removes a posting the rebuild created");
+
+	// And a row that stops being eligible by status alone, after the rebuild that indexed it.
+	await m.rebuildSearchIndex(env);
+	database.db.prepare("UPDATE message_attachments SET extract_status = 'skipped' WHERE id = 'a1'").run();
+	assert.deepEqual(matched('"rebuildable"*'), []);
+
+	// A pending insert must leave the index agreeing with its content. With the attachment
+	// table as external content it did not: it has no posting but the content has a row.
+	database.db.exec("INSERT INTO attachments_fts(attachments_fts, rank) VALUES ('integrity-check', 1)");
+});
+
+test("search stays message-only until the attachment index migration is applied", async (t) => {
+	const database = new m.SqliteDatabase(":memory:");
+	t.after(() => database.db.close());
+	// The deployment window docs/deployment.md describes: the application is live, 0109 is
+	// not applied yet. Naming attachments_fts there fails the whole statement.
+	const beforeIndex = mkdtempSync(join(root, "node_modules", "mailflare-attachment-fts-before-"));
+	t.after(() => rmSync(beforeIndex, { recursive: true, force: true }));
+	cpSync(join(root, "drizzle/migrations"), beforeIndex, { recursive: true });
+	rmSync(join(beforeIndex, "0109_attachment_search_index.sql"));
+	await m.applyMigrations(database, beforeIndex);
+	database.db.exec(`
+		INSERT INTO users (id, email, password_hash, name, role, is_primary_admin, created_at) VALUES ('u', 'o@one.test', 'h', 'O', 'admin', 1, 1);
+		INSERT INTO messages (id, user_id, direction, from_addr, to_addr, subject, text_body, status, created_at) VALUES
+			('m1', 'u', 'inbound', 'maya@acme.test', 'o@one.test', 'weekly status', 'nothing relevant here', 'received', 1),
+			('m2', 'u', 'inbound', 'sam@other.test', 'o@one.test', 'another note', 'nothing relevant either', 'received', 2);
+		INSERT INTO message_attachments (id, message_id, filename, content_type, size, r2_key, extract_status, extracted_text, created_at) VALUES
+			('a1', 'm1', 'q3.pdf', 'application/pdf', 10, 'attachments/m1/a1/q3.pdf', 'done', 'quarterly invoice', 1);
+	`);
+	const db = m.getDb({ DB: database });
+	const ids = async (query) =>
+		(await db
+			.select({ id: m.messages.id })
+			.from(m.messages)
+			.where(...m.buildSearchConditions(query, "UTC", { attachmentText: await m.hasAttachmentSearchIndex({ DB: database }) }))).map((row) => row.id).sort();
+
+	assert.equal(await m.hasAttachmentSearchIndex({ DB: database }), false, "the index is not there yet");
+	assert.deepEqual(await ids("weekly"), ["m1"], "a message-only search still answers");
+	assert.deepEqual(await ids("quarterly"), [], "attachment text is not searchable yet");
+	assert.deepEqual(await ids("-quarterly"), ["m1", "m2"], "the negative path degrades too");
+
+	// The admin "Update database" path, which clears the cached miss itself.
+	const applied = await m.applyPendingMigrations(database);
+	assert.ok(applied.applied.includes("0109_attachment_search_index.sql"));
+	assert.equal(await m.hasAttachmentSearchIndex({ DB: database }), true, "applying the migration invalidates the cached probe");
+	assert.deepEqual(await ids("quarterly"), ["m1"], "the applied migration makes attachment text searchable");
+	assert.deepEqual(await ids("quarterly -absentterm"), ["m1"], "and the negative path uses both indexes again");
 });

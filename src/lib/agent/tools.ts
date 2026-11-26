@@ -9,6 +9,7 @@ import { getAuthorizedSenderAddress } from "@/lib/email/sender";
 import { buildReplyReferences, formatMessageIdHeader, parseMessageIdList } from "@/lib/email/threading";
 import { getMailboxAccessLevel } from "@/lib/mailboxes/access";
 import { buildSearchConditions } from "@/lib/search/conditions";
+import { hasAttachmentSearchIndex } from "@/lib/search/attachment-index";
 import { newId } from "@/lib/ids";
 import { deleteMessageWithObjects } from "@/lib/email/message-cleanup";
 import { listMessageAttachments } from "@/lib/email/attachments";
@@ -132,7 +133,10 @@ export async function runEmailTool(context: AgentToolContext, name: EmailToolNam
 		else if (folder === "inbox") conditions.push(eq(messages.status, "received"), isNull(messages.folderId));
 		else if (folder === "archived" || folder === "trash" || folder === "spam") conditions.push(eq(messages.status, folder));
 		else conditions.push(or(eq(messages.userId, context.user.id), eq(messages.direction, "inbound"))!);
-		if (name === "search_emails") conditions.push(...buildSearchConditions(input.query as string, context.timeZone));
+		if (name === "search_emails") {
+			// Search degrades to message-only until 0109 has been applied (docs/deployment.md).
+			conditions.push(...buildSearchConditions(input.query as string, context.timeZone, { attachmentText: await hasAttachmentSearchIndex(context.env) }));
+		}
 		if (input.cursor) {
 			const cursor = await ownMessage(context, input.cursor as string, "Invalid pagination cursor. To start from the first page, omit cursor or set it to null. For subsequent pages, use only the nextCursor returned by list_emails for this mailbox and folder; never invent a cursor or use a page number or offset.");
 			conditions.push(or(lt(messages.createdAt, cursor.createdAt), and(eq(messages.createdAt, cursor.createdAt), lt(messages.id, cursor.id)))!);
