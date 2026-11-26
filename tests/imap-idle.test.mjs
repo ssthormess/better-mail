@@ -495,53 +495,63 @@ test("an IDLE never pushes a total below the one the client was told", async (t)
 	await client.closed;
 });
 
-test("a session MOVE lowers the baseline, so a following IDLE does not re-report the pre-move total", async (t) => {
+test("a session MOVE applies only its emitted EXPUNGEs, so unseen deletions cannot be re-announced there", async (t) => {
 	resetMailbox();
 	mailbox.messages = 7;
 	const port = await startListener(t, { idlePollMs: 20 });
 	const client = openClient(port);
 	await selectInbox(client, "N");
 
-	// MOVE answers with the EXPUNGEs, which is how the client learns the mailbox shrank: after `* 2 EXPUNGE` and
-	// `* 1 EXPUNGE` its total is 5, and the IDLE baseline has to be 5 too, not the 7 SELECT reported.
-	client.send("N3 MOVE 1:2 Trash\r\n");
-	const moved = await client.waitFor("N3 OK MOVE completed\r\n");
-	assert.match(moved, /^\* 2 EXPUNGE\r\n\* 1 EXPUNGE\r\nN3 OK MOVE completed\r\n$/);
-	assert.equal(mailbox.messages, 5);
+	// Two deletions happen outside this session: the real total is 5, but the client was told 7 and nothing has
+	// announced the loss yet.
+	mailbox.messages = 5;
 
+	// MOVE answers with one EXPUNGE, which is the only reduction the client witnesses: its total is 7 - 1 = 6, even
+	// though the mailbox really holds 4 after the move. The baseline must follow the wire total, not the real one.
+	client.send("N3 MOVE 1 Trash\r\n");
+	const moved = await client.waitFor("N3 OK MOVE completed\r\n");
+	assert.match(moved, /^\* 1 EXPUNGE\r\nN3 OK MOVE completed\r\n$/);
+	assert.equal(mailbox.messages, 4);
+
+	// Another session files one: the real total is 5, still below the 6 the client holds. An EXISTS for it would be a
+	// reduction relative to what the client knows, which RFC 3501 §5.2 forbids, so the IDLE says nothing.
+	mailbox.messages = 5;
 	client.send("N4 IDLE\r\n");
 	assert.equal(await client.waitFor("+ idling\r\n"), "+ idling\r\n");
-	// Nothing is pushed: re-announcing 5 would be an EXISTS the client already knows, and 7 is below the baseline.
 	await delay(120);
 	assert.equal(client.received(), "");
 
-	// And mail after the move is still announced against the moved total.
-	mailbox.messages = 6;
-	assert.equal(await client.waitFor("* 6 EXISTS\r\n"), "* 6 EXISTS\r\n");
+	// Growth past the wire baseline is what can be announced, and it is announced as the real total.
+	mailbox.messages = 7;
+	assert.equal(await client.waitFor("* 7 EXISTS\r\n"), "* 7 EXISTS\r\n");
 	client.send("DONE\r\n");
 	assert.equal(await client.waitFor("N4 OK Idle terminated\r\n"), "N4 OK Idle terminated\r\n");
 	client.socket.destroy();
 	await client.closed;
 });
 
-test("a stored APPEND into the selected mailbox lowers the next IDLE's redundant report", async (t) => {
+test("a stored APPEND leaves the baseline alone, so the next IDLE reports the real growth", async (t) => {
 	resetMailbox();
+	mailbox.messages = 0;
 	const port = await startListener(t, { idlePollMs: 20 });
 	const client = openClient(port);
-	await selectInbox(client, "O");
+	await selectInbox(client, "O"); // * 0 EXISTS: the client now knows an empty mailbox
+
+	// Another session files one message, then this session appends one: the real total is 2, the client was told 0.
+	mailbox.messages = 1;
 	const raw = Buffer.from("From: a@b.test\r\nSubject: One\r\n\r\nhi\r\n", "utf8");
-	// LITERAL+ keeps the test one write for the payload; APPEND itself is not what this test pins.
 	client.send(`O3 APPEND INBOX {${raw.length}+}\r\n`);
 	client.send(raw);
 	client.send("\r\n");
 	await client.waitFor("O3 OK APPEND completed\r\n");
-	assert.equal(mailbox.messages, 4);
+	assert.equal(mailbox.messages, 2);
 
-	// The append re-read the selected mailbox's count, so the client's 4 and the baseline agree: IDLE says nothing.
+	// APPEND's tagged OK says nothing about the count, so the baseline stays 0 — the next IDLE reports the real
+	// total, including the message the other session filed. A recount installed here could sit below what the
+	// client knows after an unseen deletion and would then suppress real growth forever.
 	client.send("O4 IDLE\r\n");
 	assert.equal(await client.waitFor("+ idling\r\n"), "+ idling\r\n");
-	await delay(120);
-	assert.equal(client.received(), "");
+	assert.equal(await client.waitFor("* 2 EXISTS\r\n"), "* 2 EXISTS\r\n");
 	client.send("DONE\r\n");
 	assert.equal(await client.waitFor("O4 OK Idle terminated\r\n"), "O4 OK Idle terminated\r\n");
 	client.socket.destroy();
@@ -626,4 +636,42 @@ test("a socket that closes while its IDLE count is pending arms no timers", asyn
 	assert.equal(await other.waitFor("R4 OK NOOP completed\r\n"), "R4 OK NOOP completed\r\n");
 	other.socket.destroy();
 	await other.closed;
+});
+
+test("a pipelined IDLE, refused literal and DONE are answered in arrival order", async (t) => {
+	resetMailbox();
+	const port = await startListener(t, { idlePollMs: 20 });
+	const client = openClient(port);
+	await selectInbox(client, "PI");
+	// One write: the IDLE, then a LITERAL+ command that has to be refused before literal mode (its 4-byte payload is
+	// the text "DONE" and must be drained with the CRLF that ends its line), then the real DONE. The replies have to
+	// come back in that arrival order — continuation, refusal, completion — not refuse-after-completion because the
+	// refusal was chained onto the command queue while the DONE was replayed synchronously.
+	client.send("PI3 IDLE\r\nPB APPEND INBOX {4+}\r\nDONE\r\nDONE\r\n");
+	assert.equal(
+		await client.waitFor("PB BAD Only DONE ends IDLE\r\n"),
+		"+ idling\r\nPB BAD Only DONE ends IDLE\r\n",
+	);
+	assert.equal(await client.waitFor("PI3 OK Idle terminated\r\n"), "PI3 OK Idle terminated\r\n");
+	assert.equal(client.received(), "");
+	assert.equal(mailbox.messages, 3);
+	client.socket.destroy();
+	await client.closed;
+});
+
+test("a zero-length LITERAL+ terminator is drained while idling, not answered as an empty command", async (t) => {
+	resetMailbox();
+	const port = await startListener(t, { idlePollMs: 20 });
+	const client = openClient(port);
+	await selectInbox(client, "Z");
+	client.send("Z3 IDLE\r\n");
+	assert.equal(await client.waitFor("+ idling\r\n"), "+ idling\r\n");
+	// `{0+}` sends no payload, but the CRLF that ends its command line is still on the wire: it is drained with the
+	// refusal, or it would frame an empty line and earn a second, spurious untagged BAD.
+	client.send("Z4 APPEND INBOX {0+}\r\n\r\nDONE\r\n");
+	assert.equal(await client.waitFor("Z4 BAD Only DONE ends IDLE\r\n"), "Z4 BAD Only DONE ends IDLE\r\n");
+	assert.equal(await client.waitFor("Z3 OK Idle terminated\r\n"), "Z3 OK Idle terminated\r\n");
+	assert.equal(client.received(), "");
+	client.socket.destroy();
+	await client.closed;
 });

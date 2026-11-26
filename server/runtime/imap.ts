@@ -129,10 +129,15 @@ export function startImapListener(env: CloudflareEnv, options: ImapOptions) {
 			deadline: ReturnType<typeof setTimeout>;
 		};
 		let idle: ConnectionIdle | null = null;
-		// A client may pipeline DONE straight behind IDLE, before this connection has answered the IDLE: those lines
-		// wait here until the IDLE is accepted or refused, then go to the idle line handler or back through the queue.
+		// A client may pipeline lines behind IDLE, before this connection has answered it. They wait here in arrival
+		// order until the IDLE is accepted or refused, then replay through the idle handler or back through the queue.
+		// A refused literal is its own frame — the line it answers has no command to queue — so it replays in the same
+		// order as the lines around it instead of racing them.
+		type IdlePreludeItem =
+			| { kind: "line"; line: string; literal: Buffer | null; reserved: number }
+			| { kind: "refusal"; response: string };
 		let idleEntering = false;
-		let idlePrelude: Array<{ line: string; literal: Buffer | null; reserved: number }> = [];
+		let idlePrelude: IdlePreludeItem[] = [];
 
 		/** Claim room for one literal, or say no: over the per-command limit, or the server-wide budget is full. */
 		const reserveLiteral = (size: number) => {
@@ -249,7 +254,7 @@ export function startImapListener(env: CloudflareEnv, options: ImapOptions) {
 				handleIdleLine(line, command);
 				return;
 			}
-			if (idleEntering) { idlePrelude.push({ line, literal, reserved }); return; }
+			if (idleEntering) { idlePrelude.push({ kind: "line", line, literal, reserved }); return; }
 			if (command?.verb === "IDLE") idleEntering = true;
 			commandQueue = commandQueue
 				.then(() => handleLine(command, literal))
@@ -265,13 +270,24 @@ export function startImapListener(env: CloudflareEnv, options: ImapOptions) {
 					if (reserved > 0) releaseLiteral(reserved);
 				});
 		};
+		/**
+		 * Replay the lines that arrived behind an unanswered IDLE, in arrival order. An accepted IDLE makes every frame
+		 * synchronous (the idle handler writes as it reads); a refused IDLE sends lines back through the command queue
+		 * and chains its refusals there too, so either way one frame produces its reply before the next frame does.
+		 */
 		const settleIdlePrelude = () => {
 			idleEntering = false;
 			const prelude = idlePrelude;
 			idlePrelude = [];
-			// Replaying through enqueueLine is what routes each line: to the idle handler when the IDLE was accepted,
-			// back through the queue when it was refused (a refused IDLE leaves this connection not idling).
-			for (const item of prelude) enqueueLine(item.line, item.literal, item.reserved);
+			for (const item of prelude) {
+				if (item.kind === "refusal") answerInOrder(item.response);
+				else enqueueLine(item.line, item.literal, item.reserved);
+			}
+		};
+		/** Answer a frame that carries no command: now while idling, or behind the commands already queued otherwise. */
+		const answerInOrder = (response: string) => {
+			if (idle) { socket.write(response); return; }
+			commandQueue = commandQueue.then(() => { if (!socket.destroyed) socket.write(response); });
 		};
 		const handleLine = async (command: ImapCommand | null, literal: Buffer | null) => {
 			if (!command) { socket.write("* BAD Invalid command syntax\r\n"); return; }
@@ -306,6 +322,10 @@ export function startImapListener(env: CloudflareEnv, options: ImapOptions) {
 				if (action.selected === null) reportedMessages = null;
 			}
 			if (action.messages !== undefined) reportedMessages = action.messages;
+			// MOVE's EXPUNGEs are the client's only witness to a shrink: each one decrements the count it holds. Applying
+			// that delta to the total the client was told — never the mailbox's real total, which other sessions may have
+			// changed unannounced — is what keeps a later IDLE's baseline a wire total rather than a database count.
+			if (action.expunged && reportedMessages !== null) reportedMessages = Math.max(0, reportedMessages - action.expunged);
 			socket.write(action.response);
 			if (action.idle && mailboxBackend) startIdle(action.idle, mailboxBackend);
 			if (session.state === "logged-out") { auth = null; backend = null; socket.end(); }
@@ -341,15 +361,23 @@ export function startImapListener(env: CloudflareEnv, options: ImapOptions) {
 		 * no bytes: whatever follows frames as its next command line (each answers BAD while the IDLE is open), which
 		 * keeps a legitimately pipelined `DONE` working instead of swallowing it as a payload nobody asked for.
 		 *
-		 * Draining is byte-level and has to happen now; the answer keeps its place in the command order behind the
-		 * IDLE. An answered IDLE has nothing queued, so its refusal can be written straight away, while one that is
-		 * still being decided owns the next reply and the BAD waits for it.
+		 * The refusal is a prelude frame while the IDLE that owns the next reply is still being decided, so it is answered
+		 * in arrival order with the lines that followed it; an open IDLE has nothing in flight and is answered at once.
 		 */
 		const refuseLiteralWhileIdle = (prefix: string, declared: number, nonSynchronizing: boolean) => {
-			if (declared > 0 && nonSynchronizing) pendingDrainBytes = declared;
+			if (nonSynchronizing) drainLiteralPayload(declared);
 			const response = idleBusyResponse(parseImapCommand(prefix));
 			if (idle) { socket.write(response); return; }
-			commandQueue = commandQueue.then(() => { if (!socket.destroyed) socket.write(response); });
+			idlePrelude.push({ kind: "refusal", response });
+		};
+
+		/**
+		 * Throw away a LITERAL+ payload already on the wire, and the CRLF that ends its command line (RFC 3501 §4.3). A
+		 * zero-length payload has only that CRLF, and leaving it would frame an empty line and answer it a spurious BAD.
+		 */
+		const drainLiteralPayload = (declared: number) => {
+			if (declared > 0) pendingDrainBytes = declared;
+			else pendingDrainTerminator = true;
 		};
 
 		const consume = () => {

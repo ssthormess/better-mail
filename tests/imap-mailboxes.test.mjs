@@ -619,8 +619,12 @@ test("APPEND resolves its destination, flags and internal date, then hands the b
 	await runLiteral("C APPEND Drafts (\\Draft)", LITERAL, client);
 	assert.equal(calls.append[2].entry.ref, "mbx1~drafts");
 	assert.deepEqual(calls.append[2].flags, ["\\Draft"]);
-	// An empty flag list and a date-time are both legal.
-	await runLiteral('D APPEND INBOX () "22-Nov-2026 18:00:00 +0000"', LITERAL, client);
+	// An empty flag list and a date-time are both legal. APPEND's tagged OK says nothing about the mailbox count, so
+	// it reports none: the socket layer must leave the total the client holds alone rather than installing the real
+	// one, which can sit below it after an unseen delete.
+	const dated = await runLiteral('D APPEND INBOX () "22-Nov-2026 18:00:00 +0000"', LITERAL, client);
+	assert.equal(dated.messages, undefined);
+	assert.equal(dated.expunged, undefined);
 	assert.deepEqual(calls.append[3].flags, []);
 	assert.equal(calls.append[3].internalDate.toISOString(), "2026-11-22T18:00:00.000Z");
 	// Keywords and \Recent have no column: they are dropped rather than reported as flags nothing holds.
@@ -664,19 +668,28 @@ test("MOVE re-files the sequence set and expunges what left the mailbox, newest 
 	const inbox = await runOn(client, "A SELECT INBOX");
 	assert.equal(inbox.selected.ref, "mbx1~inbox");
 	// EXPUNGE responses are in descending order so the remaining sequence numbers stay valid (RFC 3501 §7.4.1).
-	assert.equal((await runOn(client, "B MOVE 1:2 Receipts", inbox)).response, "* 2 EXPUNGE\r\n* 1 EXPUNGE\r\nB OK MOVE completed\r\n");
+	const moved = await runOn(client, "B MOVE 1:2 Receipts", inbox);
+	assert.equal(moved.response, "* 2 EXPUNGE\r\n* 1 EXPUNGE\r\nB OK MOVE completed\r\n");
+	// The reply reports the EXPUNGEs it wrote, which is the only shrink the client can know about; the mailbox's real
+	// remaining total is deliberately not reported, because other sessions may have changed it unseen.
+	assert.equal(moved.expunged, 2);
 	assert.deepEqual(calls.move[0].ids, ["msg1", "msg2"]);
 	assert.equal(calls.move[0].source.ref, "mbx1~inbox");
 	assert.equal(calls.move[0].destination.ref, "mbx1~f~fld1");
 	// A UID is a position here, so UID MOVE takes the same numbers.
-	assert.equal((await runOn(client, "C UID MOVE 3 Trash", inbox)).response, "* 3 EXPUNGE\r\nC OK UID MOVE completed\r\n");
+	const uidMoved = await runOn(client, "C UID MOVE 3 Trash", inbox);
+	assert.equal(uidMoved.response, "* 3 EXPUNGE\r\nC OK UID MOVE completed\r\n");
+	assert.equal(uidMoved.expunged, 1);
 	assert.deepEqual(calls.move[1].ids, ["msg3"]);
 	// Only the messages the backend says it changed are expunged: a move level with a message already there
 	// changes nothing, so the client is not told to drop a row that is still listed.
 	const partial = messageWriteBackend({ move: { result: "ok", changed: ["msg1"] } });
-	assert.equal((await runOn(partial.client, "D MOVE 1:3 Receipts", inbox)).response, "* 1 EXPUNGE\r\nD OK MOVE completed\r\n");
+	assert.equal((await runOn(partial.client, "D MOVE 1:3 Receipts", inbox)).expunged, 1);
 	const noop = messageWriteBackend({ move: { result: "ok", changed: [] } });
-	assert.equal((await runOn(noop.client, "E MOVE 1 Receipts", inbox)).response, "E OK MOVE completed\r\n");
+	const unchanged = await runOn(noop.client, "E MOVE 1 Receipts", inbox);
+	assert.equal(unchanged.response, "E OK MOVE completed\r\n");
+	// No EXPUNGE was written, so the client's total does not move either.
+	assert.equal(unchanged.expunged, 0);
 	// The selection survives a move, unlike a DELETE of the selected mailbox.
 	assert.equal((await runOn(client, "F NOOP", inbox)).response, "F OK NOOP completed\r\n");
 });
