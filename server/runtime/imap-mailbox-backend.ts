@@ -174,11 +174,11 @@ function entryForSelected(catalogue: ImapMailboxEntry[], selected: ImapSelectedM
 }
 
 /**
- * The access level a folder write is checked against. Same gate as `getMailboxFolderAccess`:
- * the mailbox has to be readable at all, and an API key that is scoped to a set of mailboxes
- * must not write outside that set. The caller decides whether `canManage` is required.
+ * The per-mailbox read gate: the mailbox has to be readable at all, and an API key that is scoped to a set of
+ * mailboxes must not read outside that set. Writes add their own `canManage` check on top; IDLE's poll re-runs
+ * this one on every tick, because a running selection may outlive the grant that justified it.
  */
-async function folderWriteAccess(db: AppDatabase, auth: ApiAuthResult, mailboxId: string) {
+async function mailboxReadAccess(db: AppDatabase, auth: ApiAuthResult, mailboxId: string) {
 	if (auth.mailboxIds && !auth.mailboxIds.includes(mailboxId)) return null;
 	const access = await getMailboxAccessLevel(db, auth.user, mailboxId);
 	if (!access?.canRead) return null;
@@ -204,6 +204,15 @@ export function imapMailboxBackend(db: AppDatabase, auth: ApiAuthResult, env: Cl
 	return {
 		list,
 		counts: (entry) => (entry.selectable ? mailboxCounts(db, auth, entry) : Promise.resolve({ messages: 0, unseen: 0 })),
+		idleCounts: async (entry) => {
+			// FETCH re-resolves the readable catalogue on every call; an IDLE lasts up to 29 minutes, so its poll
+			// re-checks the same gate every tick rather than trusting the entry IDLE resolved. A revoked shared grant,
+			// a disabled mailbox or a deleted one must stop the count, not keep feeding EXISTS. `mailboxReadAccess` is
+			// one mailbox-row read (plus the grant row for a shared mailbox) beside the count aggregate — the price of
+			// not serving a mailbox the session may no longer read.
+			if (!(await mailboxReadAccess(db, auth, entry.mailboxId))) return null;
+			return mailboxCounts(db, auth, entry);
+		},
 		messages: async (selected) => {
 			const entry = entryForSelected(await list(), selected);
 			return entry ? mailboxMessages(db, auth, entry) : [];
@@ -230,7 +239,7 @@ export function imapMailboxBackend(db: AppDatabase, auth: ApiAuthResult, env: Cl
  * a folder-shaped guess. `getImportMessageUserId` follows: sent and draft mail belongs to the appender.
  */
 async function appendMessage(env: CloudflareEnv, db: AppDatabase, auth: ApiAuthResult, request: ImapAppendRequest): Promise<ImapAppendResult> {
-	const access = await folderWriteAccess(db, auth, request.entry.mailboxId);
+	const access = await mailboxReadAccess(db, auth, request.entry.mailboxId);
 	if (!access?.canManage) return "denied";
 	const destination: ImportDestination = request.entry.folderId
 		? { type: "folder", folderId: request.entry.folderId }
@@ -277,7 +286,7 @@ async function moveMessages(
 	// `messages.mailbox_id` is in every reader's scope (counts, folders, the change journal), and JMAP refuses
 	// the same move, so an IMAP move between two of the account's mailboxes is refused rather than half-written.
 	if (destination.mailboxId !== source.mailboxId) return { result: "cross-mailbox" };
-	const access = await folderWriteAccess(db, auth, source.mailboxId);
+	const access = await mailboxReadAccess(db, auth, source.mailboxId);
 	if (!access?.canManage) return { result: "denied" };
 	const ref: MailboxRef = destination.folderId
 		? { kind: "folder", mailboxId: destination.mailboxId, folderId: destination.folderId }
@@ -309,7 +318,7 @@ async function moveMessages(
 
 /** CREATE. `userId` is the mailbox owner, the same column REST and JMAP write. */
 async function createFolderRow(db: AppDatabase, auth: ApiAuthResult, target: ImapFolderTarget): Promise<ImapFolderWriteResult> {
-	const access = await folderWriteAccess(db, auth, target.mailboxId);
+	const access = await mailboxReadAccess(db, auth, target.mailboxId);
 	// Creating a folder is a manage action: a read-only or send-only sharee must not add one.
 	if (!access?.canManage) return "denied";
 	try {
@@ -324,7 +333,7 @@ async function createFolderRow(db: AppDatabase, auth: ApiAuthResult, target: Ima
 
 /** DELETE. The `messages.folder_id` foreign key is `on delete set null`, so folder mail unfiles into its status mailbox. */
 async function deleteFolderRow(db: AppDatabase, auth: ApiAuthResult, target: ImapFolderTarget): Promise<ImapFolderWriteResult> {
-	const access = await folderWriteAccess(db, auth, target.mailboxId);
+	const access = await mailboxReadAccess(db, auth, target.mailboxId);
 	if (!access?.canManage) return "denied";
 	if (!(await folderRowExists(db, target))) return "missing";
 	await db.delete(folders).where(and(eq(folders.id, target.folderId!), eq(folders.mailboxId, target.mailboxId)));
@@ -333,7 +342,7 @@ async function deleteFolderRow(db: AppDatabase, auth: ApiAuthResult, target: Ima
 
 /** RENAME. The id stays put, so every message that points at this folder still points at it. */
 async function renameFolderRow(db: AppDatabase, auth: ApiAuthResult, target: ImapFolderTarget, name: string): Promise<ImapFolderWriteResult> {
-	const access = await folderWriteAccess(db, auth, target.mailboxId);
+	const access = await mailboxReadAccess(db, auth, target.mailboxId);
 	if (!access?.canManage) return "denied";
 	if (!(await folderRowExists(db, target))) return "missing";
 	try {

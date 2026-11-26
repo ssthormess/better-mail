@@ -81,6 +81,7 @@ const { parseImapCommand, dispatchImapCommand, isImapIdleDone, idleBusyResponse,
 const { startImapListener } = await import(pathToFileURL(join(outDir, "listener.mjs")).href);
 
 const ENTRY = { name: "INBOX", ref: "mbx1~inbox", mailboxId: "mbx1", role: "inbox", folderId: null, selectable: true };
+const TRASH = { name: "Trash", ref: "mbx1~trash", mailboxId: "mbx1", role: "trash", folderId: null, selectable: true };
 const SELECTED = { state: "selected", selected: { name: "INBOX", ref: "mbx1~inbox", uidValidity: 42, readOnly: true } };
 const protocolBackend = {
 	list: async () => [ENTRY],
@@ -90,21 +91,58 @@ const run = (line, session = SELECTED, backend = protocolBackend) =>
 	dispatchImapCommand(session, parseImapCommand(line), backend);
 
 globalThis.__auth = { userId: "u1", email: "alice@example.test", user: { id: "u1", role: "member" }, mailboxIds: null, keyId: "k1", keyKind: "app", scopes: [] };
-/** The one mailbox the socket tests read; every test resets it, and `counts` counts how often the poll ran. */
-const mailbox = { messages: 3, unseen: 1, counts: 0, missing: false };
+/**
+ * The one mailbox the socket tests read. Every test resets it; `counts` counts how often a count was read (SELECT,
+ * APPEND's re-count and each IDLE poll), which is how a test sees whether polling stopped.
+ */
+const mailbox = {
+	messages: 3,
+	unseen: 1,
+	counts: 0,
+	missing: false,
+	/** false models a revoked shared grant: `idleCounts` answers `null`, so the IDLE must end without a count. */
+	readable: true,
+	/** A promise the next count waits on, so a test can close the socket while a count is still in flight. */
+	pendingCount: null,
+};
 globalThis.__backend = {
-	list: async () => (mailbox.missing ? [] : [ENTRY]),
+	list: async () => (mailbox.missing ? [] : [ENTRY, TRASH]),
 	counts: async () => {
 		mailbox.counts += 1;
+		if (mailbox.pendingCount) await mailbox.pendingCount.promise;
 		return { messages: mailbox.messages, unseen: mailbox.unseen };
 	},
-	messages: async () => [],
+	// The socket layer's per-tick read: the same count, gated on current access.
+	idleCounts: async () => {
+		mailbox.counts += 1;
+		if (!mailbox.readable) return null;
+		return { messages: mailbox.messages, unseen: mailbox.unseen };
+	},
+	messages: async () => Array.from({ length: mailbox.messages }, (_, index) => ({
+		id: `msg${index + 1}`,
+		uid: index + 1,
+		read: false,
+		starred: false,
+		trashed: false,
+		draft: false,
+		outbound: false,
+	})),
+	move: async (source, ids) => {
+		mailbox.messages -= ids.length;
+		return { result: "ok", changed: ids };
+	},
+	append: async () => {
+		mailbox.messages += 1;
+		return "ok";
+	},
 };
 const resetMailbox = () => {
 	mailbox.messages = 3;
 	mailbox.unseen = 1;
 	mailbox.counts = 0;
 	mailbox.missing = false;
+	mailbox.readable = true;
+	mailbox.pendingCount = null;
 };
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -403,4 +441,189 @@ test("a refused IDLE starts no poll and pushes nothing", async (t) => {
 	assert.equal(client.received(), "");
 	client.socket.destroy();
 	await client.closed;
+});
+
+test("an IDLE ends without a count when the mailbox is no longer readable", async (t) => {
+	resetMailbox();
+	const port = await startListener(t, { idlePollMs: 20 });
+	const client = openClient(port);
+	await selectInbox(client, "L");
+	client.send("L3 IDLE\r\n");
+	await client.waitFor("+ idling\r\n");
+	// A shared grant was revoked (or the mailbox disabled): the per-tick gate now refuses the read, so the IDLE
+	// ends — with the tagged OK the deadline and DONE use — and no EXISTS for the mailbox is written.
+	mailbox.readable = false;
+	const answer = await client.waitFor("L3 OK Idle terminated\r\n");
+	assert.doesNotMatch(answer, /EXISTS/);
+	await delay(80);
+	assert.equal(client.received(), "");
+	// The poll stopped with the IDLE, so a gone grant costs no further queries.
+	const afterEnd = mailbox.counts;
+	await delay(120);
+	assert.equal(mailbox.counts, afterEnd);
+	client.socket.destroy();
+	await client.closed;
+});
+
+test("an IDLE never pushes a total below the one the client was told", async (t) => {
+	resetMailbox();
+	mailbox.messages = 7;
+	const port = await startListener(t, { idlePollMs: 20 });
+	const client = openClient(port);
+	await selectInbox(client, "M");
+	client.send("M3 IDLE\r\n");
+	assert.equal(await client.waitFor("+ idling\r\n"), "+ idling\r\n");
+
+	// An external delete takes 7 to 6. RFC 3501 §5.2 lets only an EXPUNGE lower the selected count, and this
+	// positional model cannot name the rows an EXPUNGE would, so the shrink is not pushed at all: the client's
+	// cached view of the mailbox is left stale rather than corrected with an illegal reduction.
+	mailbox.messages = 6;
+	await delay(120);
+	assert.equal(client.received(), "");
+
+	// The mailbox grows past the baseline: the total is now one the client has never been told, so it is pushed.
+	mailbox.messages = 8;
+	assert.equal(await client.waitFor("* 8 EXISTS\r\n"), "* 8 EXISTS\r\n");
+
+	// A later drop is suppressed again, which keeps the whole EXISTS stream non-decreasing.
+	mailbox.messages = 7;
+	await delay(120);
+	assert.equal(client.received(), "");
+	client.send("DONE\r\n");
+	assert.equal(await client.waitFor("M3 OK Idle terminated\r\n"), "M3 OK Idle terminated\r\n");
+	client.socket.destroy();
+	await client.closed;
+});
+
+test("a session MOVE lowers the baseline, so a following IDLE does not re-report the pre-move total", async (t) => {
+	resetMailbox();
+	mailbox.messages = 7;
+	const port = await startListener(t, { idlePollMs: 20 });
+	const client = openClient(port);
+	await selectInbox(client, "N");
+
+	// MOVE answers with the EXPUNGEs, which is how the client learns the mailbox shrank: after `* 2 EXPUNGE` and
+	// `* 1 EXPUNGE` its total is 5, and the IDLE baseline has to be 5 too, not the 7 SELECT reported.
+	client.send("N3 MOVE 1:2 Trash\r\n");
+	const moved = await client.waitFor("N3 OK MOVE completed\r\n");
+	assert.match(moved, /^\* 2 EXPUNGE\r\n\* 1 EXPUNGE\r\nN3 OK MOVE completed\r\n$/);
+	assert.equal(mailbox.messages, 5);
+
+	client.send("N4 IDLE\r\n");
+	assert.equal(await client.waitFor("+ idling\r\n"), "+ idling\r\n");
+	// Nothing is pushed: re-announcing 5 would be an EXISTS the client already knows, and 7 is below the baseline.
+	await delay(120);
+	assert.equal(client.received(), "");
+
+	// And mail after the move is still announced against the moved total.
+	mailbox.messages = 6;
+	assert.equal(await client.waitFor("* 6 EXISTS\r\n"), "* 6 EXISTS\r\n");
+	client.send("DONE\r\n");
+	assert.equal(await client.waitFor("N4 OK Idle terminated\r\n"), "N4 OK Idle terminated\r\n");
+	client.socket.destroy();
+	await client.closed;
+});
+
+test("a stored APPEND into the selected mailbox lowers the next IDLE's redundant report", async (t) => {
+	resetMailbox();
+	const port = await startListener(t, { idlePollMs: 20 });
+	const client = openClient(port);
+	await selectInbox(client, "O");
+	const raw = Buffer.from("From: a@b.test\r\nSubject: One\r\n\r\nhi\r\n", "utf8");
+	// LITERAL+ keeps the test one write for the payload; APPEND itself is not what this test pins.
+	client.send(`O3 APPEND INBOX {${raw.length}+}\r\n`);
+	client.send(raw);
+	client.send("\r\n");
+	await client.waitFor("O3 OK APPEND completed\r\n");
+	assert.equal(mailbox.messages, 4);
+
+	// The append re-read the selected mailbox's count, so the client's 4 and the baseline agree: IDLE says nothing.
+	client.send("O4 IDLE\r\n");
+	assert.equal(await client.waitFor("+ idling\r\n"), "+ idling\r\n");
+	await delay(120);
+	assert.equal(client.received(), "");
+	client.send("DONE\r\n");
+	assert.equal(await client.waitFor("O4 OK Idle terminated\r\n"), "O4 OK Idle terminated\r\n");
+	client.socket.destroy();
+	await client.closed;
+});
+
+test("a literal-bearing line is refused before literal mode while an IDLE is open or being answered", async (t) => {
+	resetMailbox();
+	const port = await startListener(t, { idlePollMs: 20 });
+	const client = openClient(port);
+	await selectInbox(client, "P");
+
+	// Pipelined behind an unanswered IDLE (the prelude window): the literal marker must not turn into a
+	// continuation and the payload must never be framed as commands.
+	const payload = Buffer.from("From: a@b.test\r\nSubject: Queued\r\n\r\nhi\r\n", "utf8");
+	client.send(`P3 IDLE\r\nP4 APPEND INBOX {${payload.length}}\r\n`);
+	assert.equal(await client.waitFor("+ idling\r\n"), "+ idling\r\n");
+	assert.equal(await client.waitFor("P4 BAD Only DONE ends IDLE\r\n"), "P4 BAD Only DONE ends IDLE\r\n");
+	// The refusal is not a continuation, and no APPEND was attempted.
+	assert.doesNotMatch(client.received(), /Ready for literal data/);
+	assert.equal(mailbox.messages, 3);
+
+	// A synchronizing literal got no continuation, so the bytes the client never owed are framed as its next
+	// command line — which is how a pipelined DONE still ends the IDLE.
+	client.send(`P5 APPEND INBOX {${payload.length}}\r\nDONE\r\n`);
+	assert.equal(await client.waitFor("P5 BAD Only DONE ends IDLE\r\n"), "P5 BAD Only DONE ends IDLE\r\n");
+	assert.equal(await client.waitFor("P3 OK Idle terminated\r\n"), "P3 OK Idle terminated\r\n");
+	assert.equal(mailbox.messages, 3);
+	client.socket.destroy();
+	await client.closed;
+});
+
+test("an in-flight LITERAL+ payload is drained while idling, so its DONE-like bytes are not commands", async (t) => {
+	resetMailbox();
+	const port = await startListener(t, { idlePollMs: 20 });
+	const client = openClient(port);
+	await selectInbox(client, "Q");
+	client.send("Q3 IDLE\r\n");
+	assert.equal(await client.waitFor("+ idling\r\n"), "+ idling\r\n");
+
+	// `{4+}` sends the payload without waiting, and here the payload is exactly the text "DONE": the framer has to
+	// drain the declared bytes and the CRLF that ends the command line, or that text would be read as a command and
+	// silently end the IDLE.
+	client.send("Q4 APPEND INBOX {4+}\r\nDONE\r\n");
+	assert.equal(await client.waitFor("Q4 BAD Only DONE ends IDLE\r\n"), "Q4 BAD Only DONE ends IDLE\r\n");
+	await delay(80);
+	// Still idling: the drained DONE was payload, not a termination.
+	assert.doesNotMatch(client.received(), /Idle terminated/);
+	client.send("DONE\r\n");
+	assert.equal(await client.waitFor("Q3 OK Idle terminated\r\n"), "Q3 OK Idle terminated\r\n");
+	assert.equal(mailbox.messages, 3);
+	client.socket.destroy();
+	await client.closed;
+});
+
+test("a socket that closes while its IDLE count is pending arms no timers", async (t) => {
+	resetMailbox();
+	const port = await startListener(t, { idlePollMs: 20 });
+	const client = openClient(port);
+	await selectInbox(client, "R");
+	// Park the count the IDLE command resolves before `+ idling`, so the socket can close mid-command.
+	let release;
+	mailbox.pendingCount = { promise: new Promise((resolve) => { release = resolve; }) };
+	client.send("R3 IDLE\r\n");
+	await delay(40);
+	client.socket.destroy();
+	await client.closed;
+	// Let the server observe the close first: this is the late-dispatch case, where the IDLE's count resolves after
+	// the connection is already gone.
+	await delay(120);
+	release();
+	mailbox.pendingCount = null;
+	await delay(40);
+	const afterClose = mailbox.counts;
+	await delay(160);
+	// No poll and no deadline were installed on the dead connection: a late IDLE must not start its machinery.
+	assert.equal(mailbox.counts, afterClose);
+	// The listener itself is unaffected.
+	const other = openClient(port);
+	await other.waitFor("* OK Mailflare IMAP4rev1 server ready\r\n");
+	other.send("R4 NOOP\r\n");
+	assert.equal(await other.waitFor("R4 OK NOOP completed\r\n"), "R4 OK NOOP completed\r\n");
+	other.socket.destroy();
+	await other.closed;
 });

@@ -26,6 +26,13 @@ import {
 
 const MAX_CLIENTS = 100;
 const MAX_CONNECTIONS_PER_IP = 10;
+/**
+ * How long a connection that is not idling may stay quiet before it is closed. RFC 3501 §5.4 asks for an
+ * inactivity timeout of at least 30 minutes; this value predates IDLE and is deliberately shorter for the
+ * bridge. An IDLE is exempt from it (see `startIdle`), because an idling client is supposed to be silent, and
+ * its own silence is bounded by IMAP_IDLE_MAX_MS instead. A later change to SOCKET_TIMEOUT_MS should raise it
+ * towards the RFC minimum; it is not raised here to keep this slice's behaviour identical for non-idling sessions.
+ */
 const SOCKET_TIMEOUT_MS = 60_000;
 const MAX_LINE_BYTES = 64 * 1024;
 /** The largest literal one command may send, which is also the APPEND limit CAPABILITY advertises (RFC 7889). */
@@ -115,8 +122,9 @@ export function startImapListener(env: CloudflareEnv, options: ImapOptions) {
 		 */
 		type ConnectionIdle = {
 			tag: string;
+			/** The highest total the client has been told; a poll only ever emits a total above it. */
 			messages: number;
-			count: () => Promise<ImapMailboxCounts>;
+			count: () => Promise<ImapMailboxCounts | null>;
 			poll: ReturnType<typeof setTimeout> | null;
 			deadline: ReturnType<typeof setTimeout>;
 		};
@@ -181,10 +189,15 @@ export function startImapListener(env: CloudflareEnv, options: ImapOptions) {
 				const counts = await current.count();
 				// DONE, the deadline or a close may have landed while the count was being read.
 				if (idle !== current || socket.destroyed) return;
-				// MESSAGES is the whole signal: EXISTS is the mailbox's total, so an UNSEEN-only change says nothing (a
-				// per-message flag push would be a FETCH update, which this bridge does not send yet). A total that fell
-				// is announced as the smaller EXISTS too: the positional model cannot name the rows an EXPUNGE would.
-				if (counts.messages !== current.messages) {
+				// `null` means the user may no longer read this mailbox (a revoked grant, a disabled or deleted mailbox):
+				// end the IDLE without a count rather than keep reporting a mailbox the session has lost access to.
+				if (counts === null) { endIdle(); return; }
+				// RFC 3501 §5.2: only an EXPUNGE may lower the selected mailbox's count, and this bridge cannot name the
+				// rows a positional EXPUNGE would (sequence = UID, so a deletion shifts every later number). A total that
+				// fell is therefore not pushed at all: the client learns the true count from its next SELECT, STATUS or
+				// NOOP, or when the mailbox grows past the total it was last told. Emitting only above the baseline keeps
+				// the EXISTS stream monotonic, which is what the protocol requires.
+				if (counts.messages > current.messages) {
 					current.messages = counts.messages;
 					writeExists(counts.messages);
 				}
@@ -197,20 +210,26 @@ export function startImapListener(env: CloudflareEnv, options: ImapOptions) {
 
 		/** Start the machinery `+ idling` opened: the deadline, the first poll, and any change since SELECT. */
 		const startIdle = (start: ImapIdleStart, mailboxBackend: ImapMailboxBackend) => {
+			// The socket can close while the IDLE's entry count is being read: arming a 29-minute deadline on a dead
+			// socket would leave a timer that can never write anything.
+			if (socket.destroyed) return;
 			// `+ idling` has already been written. An idling client is legitimately silent until DONE, so the inactivity
 			// timer is disabled rather than merely refreshed — the deadline below is what bounds the silence instead.
 			socket.setTimeout(0);
+			// The baseline is the highest total the client knows: the one this IDLE just counted, or the one it was last
+			// told if a shrink was suppressed in between. Only a total above it can be announced, never below.
+			const baseline = reportedMessages === null ? start.messages : Math.max(reportedMessages, start.messages);
 			const current: ConnectionIdle = {
 				tag: start.tag,
-				messages: start.messages,
-				count: () => mailboxBackend.counts(start.entry),
+				messages: baseline,
+				count: () => mailboxBackend.idleCounts(start.entry),
 				poll: null,
 				deadline: setTimeout(endIdle, idleMaxMs),
 			};
 			idle = current;
-			// Whatever arrived between the count the client was told and `+ idling` is reported now, so its view is
+			// Mail that arrived between the count the client was told and `+ idling` is reported now, so its view is
 			// current before it starts waiting; an unchanged mailbox says nothing at all.
-			if (reportedMessages !== null && start.messages !== reportedMessages) writeExists(start.messages);
+			if (reportedMessages !== null && start.messages > reportedMessages) writeExists(start.messages);
 			scheduleIdlePoll(current);
 		};
 
@@ -260,6 +279,10 @@ export function startImapListener(env: CloudflareEnv, options: ImapOptions) {
 			if (literal) command.literal = literal.buffer.slice(literal.byteOffset, literal.byteOffset + literal.byteLength) as ArrayBuffer;
 			const mailboxBackend = auth ? (backend ??= imapMailboxBackend(getDb(env), auth, env)) : undefined;
 			const action = await dispatchImapCommand(session, command, mailboxBackend);
+			// The socket can be gone by the time an async command resolves (a client that closed while its count was
+			// being read). Replying to it, and above all arming an IDLE's 29-minute deadline on it, would be work for a
+			// connection that no longer exists.
+			if (socket.destroyed) return;
 			if (action.login) {
 				if (!(await isImapEnabled(env))) { socket.write(`${command.tag} NO IMAP disabled\r\n`); return; }
 				const ipAddress = socket.remoteAddress ?? null;
@@ -304,6 +327,29 @@ export function startImapListener(env: CloudflareEnv, options: ImapOptions) {
 			const tag = /^([^\s{}]+)\s/.exec(prefix)?.[1];
 			socket.write(tag ? `${tag} NO Literal too large\r\n` : "* BAD Literal too large\r\n");
 			if (declared > 0 && (nonSynchronizing || buffer.length > 0)) pendingDrainBytes = declared;
+		};
+
+		/**
+		 * Refuse a literal-bearing line while an IDLE is open (or queued and not yet answered). The marker never becomes
+		 * a continuation, so a synchronizing literal is refused before the client sends a byte (RFC 3501 §4.3) and a
+		 * later `DONE` still frames as a line, not as payload.
+		 *
+		 * A LITERAL+ payload is already on the wire — `{n+}` never waits for a continuation — so those declared bytes
+		 * and the CRLF ending the command line are drained, exactly like any other refused literal: the bytes are never
+		 * read as command lines, and text inside them that looks like DONE cannot end the IDLE. A synchronizing literal
+		 * gets nothing drained, because this connection never sent the continuation, so a client that was refused owes
+		 * no bytes: whatever follows frames as its next command line (each answers BAD while the IDLE is open), which
+		 * keeps a legitimately pipelined `DONE` working instead of swallowing it as a payload nobody asked for.
+		 *
+		 * Draining is byte-level and has to happen now; the answer keeps its place in the command order behind the
+		 * IDLE. An answered IDLE has nothing queued, so its refusal can be written straight away, while one that is
+		 * still being decided owns the next reply and the BAD waits for it.
+		 */
+		const refuseLiteralWhileIdle = (prefix: string, declared: number, nonSynchronizing: boolean) => {
+			if (declared > 0 && nonSynchronizing) pendingDrainBytes = declared;
+			const response = idleBusyResponse(parseImapCommand(prefix));
+			if (idle) { socket.write(response); return; }
+			commandQueue = commandQueue.then(() => { if (!socket.destroyed) socket.write(response); });
 		};
 
 		const consume = () => {
@@ -368,12 +414,18 @@ export function startImapListener(env: CloudflareEnv, options: ImapOptions) {
 				}
 				const line = buffer.subarray(0, end).toString("utf8");
 				buffer = buffer.subarray(end + 2);
-				const literal = /\{(\d+)\+?\}$/.exec(line);
+				const literal = /\{(\d+)(\+)?\}$/.exec(line);
 				if (literal) {
 					const declared = Number(literal[1]);
 					const prefix = line.slice(0, literal.index);
 					// `{n+}` (LITERAL+) means the client sends the bytes without waiting for the continuation.
-					const nonSynchronizing = literal[0].endsWith("+");
+					// The `+` is inside the braces (`{n+}`), so it is the captured group that says LITERAL+ rather than the tail.
+					const nonSynchronizing = Boolean(literal[2]);
+					// An IDLE is open (or is being answered): RFC 2177 gives the client nothing to send in that state but
+					// DONE, so a literal is refused before this connection enters literal mode. Otherwise a client could get
+					// `+ Ready for literal data` in reply to a command it should not have sent, and a later DONE-looking line
+					// would be framed as payload instead of ending the IDLE.
+					if (idle || idleEntering) { refuseLiteralWhileIdle(prefix, Number.isSafeInteger(declared) ? declared : 0, nonSynchronizing); continue; }
 					if (!Number.isSafeInteger(declared) || !reserveLiteral(declared)) { refuseLiteral(prefix, Number.isSafeInteger(declared) ? declared : 0, nonSynchronizing); continue; }
 					pendingLiteralLength = declared;
 					pendingLiteralReserved = declared;

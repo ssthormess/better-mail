@@ -102,6 +102,13 @@ export type ImapMoveOutcome =
 export type ImapMailboxBackend = {
 	list(): Promise<ImapMailboxEntry[]>;
 	counts(entry: ImapMailboxEntry): Promise<ImapMailboxCounts>;
+	/**
+	 * IDLE's per-tick count, read only while the signed-in user may still read that mailbox: `null` means the
+	 * mailbox left the readable catalogue (a revoked shared grant, a disabled or deleted mailbox), which ends the
+	 * IDLE without a count. FETCH re-resolves the catalogue on every call for the same reason — a selection made
+	 * before a grant was revoked must not keep reading the mailbox afterwards.
+	 */
+	idleCounts(entry: ImapMailboxEntry): Promise<ImapMailboxCounts | null>;
 	/** Every message of the selected mailbox in sequence order, so index + 1 is the UID. */
 	messages(selected: ImapSelectedMailbox): Promise<ImapMessageEntry[]>;
 	/**
@@ -139,8 +146,9 @@ export type ImapAction = {
 	selected?: ImapSelectedMailbox | null;
 	login?: { username: string; password: string };
 	/**
-	 * The message count this reply just reported for the selection (SELECT/EXAMINE), so a later IDLE knows what
-	 * the client has already been told and can announce mail that arrived between the two commands.
+	 * The message count this reply leaves the client knowing for the selection: what SELECT/EXAMINE reported, or
+	 * what MOVE's EXPUNGEs (and a stored APPEND) left behind. A later IDLE compares against it, so it must track
+	 * what the client was last told rather than what the mailbox held when the selection was made.
 	 */
 	messages?: number;
 	/** Present when the command put the connection into IDLE; the socket layer owns the timers from there. */
@@ -251,7 +259,7 @@ export async function dispatchImapCommand(
 	if (verb === "RENAME") return renameCommand(tag, args, session, backend);
 	// APPEND is legal in both the authenticated and the selected state (RFC 3501 §6.3.11), and it names
 	// its own destination, so it does not read the selection.
-	if (verb === "APPEND") return appendCommand(tag, command, backend);
+	if (verb === "APPEND") return appendCommand(tag, command, session, backend);
 	if (verb === "IDLE") return idleCommand(tag, args, session, backend);
 	if (verb === "MOVE") return moveCommand(tag, false, args, session, backend);
 	if (verb === "FETCH") return fetchCommand(tag, false, args, session, backend);
@@ -389,19 +397,29 @@ async function listCommand(tag: string, verb: "LIST" | "LSUB", args: string[], b
 /**
  * IDLE (RFC 2177): selected state only, `+ idling`, and then the socket layer re-reads MESSAGES until DONE or
  * the re-arm window closes. Mailflare's change feed is the ordered `jmap_changes` journal, but the honest minimal
- * signal for "something is in this mailbox now" is the same count SELECT answered — one indexed query per poll,
- * and a different total is a `* n EXISTS`.
+ * signal for "something is in this mailbox now" is the same count SELECT answered — one indexed count query (and a
+ * per-mailbox read check) per tick, and a higher total is a `* n EXISTS`.
+ *
+ * Push is count polling, not event-driven: an update normally lands within one poll interval (~15 s) plus the query
+ * and event-loop delay, and can be later when a count query fails and the next tick retries. Only the total is
+ * pushed. Flag changes (UNSEEN included) are not: EXISTS is the total, so an unread-only change says nothing here,
+ * and a per-message FETCH update is a later slice. There is no CONDSTORE/QRESYNC tracking and no `jmap_changes`
+ * replay; the count diff is the whole mechanism.
  *
  * The bridge numbers messages by position (seq = UID, in createdAt/id order), so a deletion in the middle of a
- * mailbox shifts every later position and `* EXPUNGE` cannot name what left; only EXISTS is pushed, and a total
- * that fell is announced as the smaller EXISTS. Flag changes are not pushed either: EXISTS is the total, so an
- * UNSEEN-only change says nothing here (a per-message FETCH update is a later slice). There is no CONDSTORE or
- * QRESYNC sequence tracking, and no attempt to replay `jmap_changes` — the count diff is the whole mechanism.
+ * mailbox shifts every later position: `* EXPUNGE` cannot name what left, and RFC 3501 §5.2 forbids lowering the
+ * selected count any other way. A total that falls is therefore never pushed — the EXISTS stream is monotonic
+ * (non-decreasing) — and that is the documented resync policy rather than a legal shrink: the client's cached view
+ * stays stale until it re-synchronises (a new SELECT, or STATUS/NOOP and its own refresh), or until the mailbox
+ * grows past the total it was last told. A removal and an arrival that cancel out (equal total) are invisible for
+ * the same reason. A selection that was made before the user lost read access ends the IDLE instead of reporting
+ * a count (see `idleCounts`), so no mailbox activity leaks to a session that may no longer read it.
  */
 async function idleCommand(tag: string, args: string[], session: ImapSession, backend?: ImapMailboxBackend): Promise<ImapAction> {
 	if (args.length > 0) return { response: `${tag} BAD IDLE takes no arguments\r\n` };
-	// RFC 2177 adds IDLE to RFC 3501's selected-state command set (`command-select =/ idle`), so an unselected
-	// session answers the same BAD its siblings (FETCH, SEARCH, MOVE) answer rather than a NO.
+	// RFC 2177 §4 adds IDLE to `command_auth`, so the RFC also allows it in the authenticated state. Requiring a
+	// selection is this bridge's deliberate choice — the same selected-only shape FETCH, SEARCH and MOVE have, and
+	// the only state in which a count means anything — not something the RFC mandates.
 	if (!session.selected) return { response: `${tag} BAD No mailbox selected\r\n` };
 	if (!backend) return mailboxUnavailable(tag);
 	// The selection's folder may have been deleted since SELECT, so the catalogue is read fresh here the way the
@@ -601,9 +619,10 @@ const APPEND_FLAGS: Record<string, string> = {
  * An internal date older than the mailbox's newest message files the row earlier in the sequence, and the UID
  * of everything after it moves up by one: this bridge's UIDs are the arrival position (see `mailboxMessages`),
  * so APPEND is the one command that can renumber. Nothing here advertises CONDSTORE/QRESYNC, and the client
- * sees the new message through its next SELECT/STATUS rather than an untagged EXISTS.
+ * sees the new message through its next SELECT/STATUS rather than an untagged EXISTS — but the selected mailbox's
+ * count is re-read after a stored append, so a following IDLE's baseline matches what the client now holds.
  */
-async function appendCommand(tag: string, command: ImapCommand, backend?: ImapMailboxBackend): Promise<ImapAction> {
+async function appendCommand(tag: string, command: ImapCommand, session: ImapSession, backend?: ImapMailboxBackend): Promise<ImapAction> {
 	const parsed = parseImapAppendArguments(command.args);
 	if ("error" in parsed) return { response: `${tag} BAD APPEND ${parsed.error}\r\n` };
 	const name = decodeModifiedUtf7(parsed.name);
@@ -621,7 +640,12 @@ async function appendCommand(tag: string, command: ImapCommand, backend?: ImapMa
 	if (flags.includes("\\Draft") && entry.role !== "drafts") return { response: `${tag} NO Drafts mail is only appendable to the Drafts mailbox\r\n` };
 	if (flags.includes("\\Deleted") && entry.role !== "trash") return { response: `${tag} NO Deleted mail is only appendable to the Trash mailbox\r\n` };
 	const result = await backend.append({ entry, flags, internalDate: parsed.internalDate, raw });
-	return { response: `${tag} ${appendResponse(result)}\r\n` };
+	// A stored append can change the selected mailbox's total, so the count the client last heard is re-read rather
+	// than assumed: a running (or next) IDLE must not announce a total the client already knows, nor miss one that
+	// moved. Re-reading is one indexed count on a command that just wrote a whole message and its attachments, and
+	// only `ok` can add a row (a duplicate is the same message found again).
+	const counts = result === "ok" && entry.ref === session.selected?.ref ? await backend.counts(entry) : null;
+	return { response: `${tag} ${appendResponse(result)}\r\n`, ...(counts ? { messages: counts.messages } : {}) };
 }
 
 /** The flags decide their own columns, so APPEND never falls back to the import hints for read/starred. */
@@ -681,7 +705,10 @@ async function moveCommand(
 	const changed = new Set(outcome.changed);
 	const expunged = sequenceNumbers.filter((sequence, index) => changed.has(ids[index])).sort((left, right) => right - left);
 	const untagged = expunged.map((sequence) => `* ${sequence} EXPUNGE\r\n`).join("");
-	return { response: `${untagged}${tag} OK ${label} completed\r\n` };
+	// Those EXPUNGEs are how the client learns the mailbox shrank: the total it now knows is the one it had minus the
+	// rows this command removed. Reporting it keeps a following IDLE's baseline in step with the client's view
+	// instead of comparing against the pre-move total.
+	return { response: `${untagged}${tag} OK ${label} completed\r\n`, messages: messages.length - expunged.length };
 }
 
 /**
