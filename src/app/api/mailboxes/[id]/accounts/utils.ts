@@ -5,11 +5,12 @@ import type { SessionUser } from "@/lib/auth/types";
 import { isUniqueConstraintError } from "@/lib/database-errors";
 import { isExternalAccountCryptoError } from "@/lib/external-accounts/crypto";
 import type { ExternalAccountView } from "@/lib/external-accounts/types";
+import { isSyncCursorFormat } from "@/lib/external-accounts/cursor";
 import { getMailboxAccessLevel } from "@/lib/mailboxes/access";
 
 type Db = ReturnType<typeof getDb>;
 
-/** The columns a response may carry. `password_encrypted` and `sync_cursor` are deliberately absent. */
+/** The columns a response may carry. Credentials and the raw sync cursor are deliberately absent. */
 export const externalAccountColumns = {
 	id: externalAccounts.id,
 	protocol: externalAccounts.protocol,
@@ -22,6 +23,7 @@ export const externalAccountColumns = {
 	lastError: externalAccounts.lastError,
 	createdAt: externalAccounts.createdAt,
 	updatedAt: externalAccounts.updatedAt,
+	syncCursor: externalAccounts.syncCursor,
 };
 
 export type ExternalAccountRow = Pick<typeof externalAccounts.$inferSelect, keyof typeof externalAccountColumns>;
@@ -43,6 +45,16 @@ export async function requireManagedMailbox(db: Db, user: Pick<SessionUser, "id"
  * Masks the stored password as a boolean. A row always has one (`password_encrypted` is NOT NULL and no route
  * clears it), so the flag is exact without ever selecting the ciphertext.
  */
+function readSkippedUids(cursor: string | null): number[] {
+	if (!cursor || !isSyncCursorFormat(cursor, "imap")) return [];
+	try {
+		const value: unknown = JSON.parse(cursor);
+		if (typeof value !== "object" || value === null || Array.isArray(value)) return [];
+		const skipped = (value as { skippedUids?: unknown }).skippedUids;
+		return Array.isArray(skipped) && skipped.every((uid) => Number.isInteger(uid) && uid > 0 && uid <= 0xffffffff) ? skipped : [];
+	} catch { return []; }
+}
+
 export function externalAccountView(row: ExternalAccountRow): ExternalAccountView {
 	return {
 		id: row.id,
@@ -55,6 +67,7 @@ export function externalAccountView(row: ExternalAccountRow): ExternalAccountVie
 		passwordSet: true,
 		lastSyncedAt: row.lastSyncedAt?.toISOString() ?? null,
 		lastError: row.lastError,
+		skippedUids: readSkippedUids(row.syncCursor),
 		createdAt: row.createdAt.toISOString(),
 		updatedAt: row.updatedAt.toISOString(),
 	};

@@ -51,18 +51,23 @@ export type InboundQueueMessage = {
 
 /**
  * True when the address is a mailbox or alias owned by the user, so their own mail never counts as unread.
- * `suppressSideEffects` is for historical imports: it retains parsing and classification while avoiding replies,
- * user notifications, webhooks, auto-drafts, DSN actions and avatar lookups for old messages.
+ * `intakeMode: "historical_import"` imports mail without creating calendar invites/reminders, training spam
+ * reputation, ingesting DMARC reports, replying, notifying, dispatching webhooks, auto-drafting or avatar lookup.
+ * MIME parsing, routing, spam classification and message storage still run.
  */
 export async function processInboundMessage(
 	env: CloudflareEnv,
 	payload: InboundQueueMessage,
-	options: { reportBudget?: BatchBudget; suppressSideEffects?: boolean } = {},
+	options: { reportBudget?: BatchBudget; intakeMode?: "realtime" | "historical_import"; deadlineAt?: number } = {},
 ): Promise<void> {
+	const assertBeforeDeadline = () => { if (options.deadlineAt !== undefined && Date.now() >= options.deadlineAt) throw new Error("timeout"); };
+	assertBeforeDeadline();
+	const historicalImport = options.intakeMode === "historical_import";
 	const db = getDb(env);
-	// DMARC aggregate reports bypass mailboxes entirely (see report-address.ts); they are parsed into stats and discarded.
+	// DMARC aggregate reports bypass mailboxes entirely (see report-address.ts); historical imports do not ingest them.
 	const reportTarget = await matchReportAddress(env, payload.to);
 	if (reportTarget) {
+		if (historicalImport) { await env.BUCKET.delete(payload.rawR2Key); return; }
 		// The From header, not the envelope sender: it is what the DMARC verdict aligned to.
 		const from = Object.entries(payload.headers ?? {}).find(([name]) => name.toLowerCase() === "from")?.[1] ?? null;
 		await ingestReportMail(env, reportTarget, { rawR2Key: payload.rawR2Key, authenticated: readTrustedDmarcResult(payload.headers, payload.verdicts) === "pass", from }, { batchBudget: options.reportBudget });
@@ -70,6 +75,7 @@ export async function processInboundMessage(
 	}
 	// The sender is passed so that sender-based block rules resolve the same way here as they
 	// do in the Worker email handler.
+	assertBeforeDeadline();
 	const decision = await resolveInboundAddress(db, payload.to, payload.from, { headers: payload.headers });
 
 	// Nothing references the raw object on these paths, so keep it from piling up in storage.
@@ -100,11 +106,12 @@ export async function processInboundMessage(
 	if (stored) {
 		try {
 			const [existing] = await db.select().from(messages).where(eq(messages.id, stored.id)).limit(1);
-			if (!options.suppressSideEffects && existing && Date.now() - existing.createdAt.getTime() < 30 * 60_000) await scheduleAutoDraft(env, { mailboxId: decision.mailbox.mailboxId, sourceMessageId: existing.id, ownerUserId: decision.mailbox.userId, sender: existing.fromAddr, headers: payload.headers, status: existing.status, folderId: existing.folderId, spamVerdict: existing.spamVerdict, spamAnalysisError: existing.spamAnalysisError });
+			if (!historicalImport && existing && Date.now() - existing.createdAt.getTime() < 30 * 60_000) await scheduleAutoDraft(env, { mailboxId: decision.mailbox.mailboxId, sourceMessageId: existing.id, ownerUserId: decision.mailbox.userId, sender: existing.fromAddr, headers: payload.headers, status: existing.status, folderId: existing.folderId, spamVerdict: existing.spamVerdict, spamAnalysisError: existing.spamAnalysisError });
 		} catch (error) { console.error("Auto-draft recovery failed", error); }
 		return;
 	}
 
+	assertBeforeDeadline();
 	const raw = await env.BUCKET.get(payload.rawR2Key);
 	if (!raw) {
 		console.error(`Missing R2 object: ${payload.rawR2Key}`);
@@ -112,6 +119,7 @@ export async function processInboundMessage(
 	}
 
 	const buffer = await raw.arrayBuffer();
+	assertBeforeDeadline();
 	let parsed: Awaited<ReturnType<typeof parseRawMime>>;
 	try {
 		parsed = boundParsedEmail(await parseRawMime(buffer));
@@ -121,6 +129,7 @@ export async function processInboundMessage(
 		await env.BUCKET.delete(payload.rawR2Key);
 		return;
 	}
+	assertBeforeDeadline();
 	const attachmentLimitReason = inboundAttachmentLimitReason(parsed.attachments);
 	if (attachmentLimitReason) {
 		console.warn(`Inbound attachment limit reached for ${payload.to}: ${attachmentLimitReason}`);
@@ -134,6 +143,7 @@ export async function processInboundMessage(
 	// webhooks still see the envelope recipient the message was delivered to.
 	const toAddr = parsed.toAddr ?? payload.to;
 	const fromAddr = parsed.fromAddr ?? payload.from;
+	assertBeforeDeadline();
 	const destination = await resolveInboxRuleDestination(db, {
 		mailboxId: decision.mailbox.mailboxId,
 		toAddress: payload.to,
@@ -142,11 +152,14 @@ export async function processInboundMessage(
 		content: [parsed.text, parsed.html, snippet].filter(Boolean).join(" "),
 		headers: payload.headers,
 	});
+	assertBeforeDeadline();
 	let spamAnalysis: Awaited<ReturnType<typeof analyzeSpam>> | null = null;
 	let spamAnalysisError: string | null = null;
 	const [owner] = await db.select({ enabled: users.spamProtectionEnabled, strictness: users.spamStrictness }).from(users).where(eq(users.id, decision.mailbox.userId)).limit(1);
+	assertBeforeDeadline();
 	if (owner?.enabled !== false) {
 		try {
+			assertBeforeDeadline();
 			const intelligence = await getSpamIntelligenceConfig(env);
 			spamAnalysis = await analyzeSpam(db, {
 				mailboxId: decision.mailbox.mailboxId,
@@ -160,11 +173,13 @@ export async function processInboundMessage(
 				message: parsed,
 				intelligenceProvider: new ExternalSpamIntelligenceProvider(intelligence, env.BUCKET),
 			});
+			assertBeforeDeadline();
 		} catch (error) {
 			spamAnalysisError = error instanceof Error ? error.message.slice(0, 300) : "Spam analysis failed";
 			console.error(`Spam analysis failed for ${messageId}`, error);
 		}
 	}
+	assertBeforeDeadline();
 	if (destination.status === "spam" && spamAnalysis) {
 		spamAnalysis = {
 			score: 100,
@@ -178,16 +193,18 @@ export async function processInboundMessage(
 		: destination.status;
 	const folderId = status === "spam" ? null : destination.folderId;
 	// A contact the database cannot hold (e.g. an over-long address) must not lose the mail.
+	assertBeforeDeadline();
 	const contact = await upsertContactFromAddress(env, {
 		userId: decision.mailbox.userId,
 		address: fromAddr,
 		source: "inbound",
 		// Spam senders are strangers at best; do not announce them to Gravatar.
-		lookupAvatar: !options.suppressSideEffects && status !== "spam" && status !== "trash",
+		lookupAvatar: !historicalImport && status !== "spam" && status !== "trash",
 	}).catch((error) => {
 		console.error(`Contact upsert failed for ${messageId}`, error);
 		return null;
 	});
+	assertBeforeDeadline();
 	const { category, senderAddress } = await classifyInboundCategory(db, {
 		mailboxId: decision.mailbox.mailboxId,
 		from: fromAddr,
@@ -196,6 +213,7 @@ export async function processInboundMessage(
 	});
 	let threadId: string;
 	try {
+		assertBeforeDeadline();
 		threadId = await resolveThreadId(db, {
 			mailboxId: decision.mailbox.mailboxId,
 			messageId: parsed.messageId,
@@ -212,8 +230,10 @@ export async function processInboundMessage(
 		});
 		threadId = normalizeMessageId(parsed.messageId) ?? newId("thr");
 	}
+	assertBeforeDeadline();
 
 	try {
+		assertBeforeDeadline();
 		const inserted = await db.insert(messages).values({
 			id: messageId,
 			userId: decision.mailbox.userId,
@@ -246,12 +266,13 @@ export async function processInboundMessage(
 			spamAnalysisError,
 		}).onConflictDoNothing().returning({ id: messages.id });
 		if (!inserted.length) return;
-
+		// Finish the post-commit write set once the message row exists. Aborting here would make a retry
+		// mistake a partially stored message for a complete duplicate and skip its attachments.
 		await storeMessageAttachments(env, messageId, parsed.attachments);
-		if (status !== "spam" && status !== "trash") {
+		if (!historicalImport && status !== "spam" && status !== "trash") {
 			await registerInboundInvite(env, { userId: decision.mailbox.userId, mailboxId: decision.mailbox.mailboxId, messageId, senderAddress: fromAddr, attachments: parsed.attachments });
 		}
-		if (spamAnalysis) {
+		if (spamAnalysis && !historicalImport) {
 			try {
 				await recordReputationObservation(env, decision.mailbox.mailboxId, getReputationKeys(parsed, spamAnalysis.fingerprint));
 			} catch (error) {
@@ -271,12 +292,12 @@ export async function processInboundMessage(
 
 	// A returned message is still delivered to the mailbox; recording its failed recipients is best effort.
 	try {
-		if (!options.suppressSideEffects) await recordDsnBounces(env, { mailboxId: decision.mailbox.mailboxId, raw: buffer });
+		if (!historicalImport) await recordDsnBounces(env, { mailboxId: decision.mailbox.mailboxId, raw: buffer });
 	} catch (error) {
 		console.error(`Bounce recording failed for ${messageId}`, error);
 	}
 
-	if (status === "received" && !options.suppressSideEffects) {
+	if (status === "received" && !historicalImport) {
 		try {
 			await sendMailboxAutoReply(env, {
 				mailboxId: decision.mailbox.mailboxId,
@@ -291,7 +312,7 @@ export async function processInboundMessage(
 		}
 	}
 
-	if (options.suppressSideEffects) {
+	if (historicalImport) {
 		// Historical external mail is imported without notifying people or replying to old senders.
 	} else if (status === "spam" || status === "trash") {
 		console.info(`No notification for ${messageId}: filed as ${status}`);
@@ -315,7 +336,7 @@ export async function processInboundMessage(
 		}), { silent: isSilentPromotion(category, mode) });
 	}
 	// Spam and blocked mail carry an unauthenticated From; consumers acting on it would be fooled.
-	if (!options.suppressSideEffects && status !== "spam" && status !== "trash") {
+	if (!historicalImport && status !== "spam" && status !== "trash") {
 		await dispatchWebhooks(env, decision.mailbox.userId, "message.inbound", {
 			messageId,
 			from: fromAddr,
@@ -329,7 +350,7 @@ export async function processInboundMessage(
 		});
 	}
 	try {
-		if (!options.suppressSideEffects) await scheduleAutoDraft(env, { mailboxId: decision.mailbox.mailboxId, sourceMessageId: messageId, ownerUserId: decision.mailbox.userId, sender: fromAddr, headers: payload.headers, status, folderId, spamVerdict: spamAnalysis?.verdict, spamAnalysisError });
+		if (!historicalImport) await scheduleAutoDraft(env, { mailboxId: decision.mailbox.mailboxId, sourceMessageId: messageId, ownerUserId: decision.mailbox.userId, sender: fromAddr, headers: payload.headers, status, folderId, spamVerdict: spamAnalysis?.verdict, spamAnalysisError });
 	} catch (error) { console.error("Auto-draft scheduling failed", error); }
 }
 

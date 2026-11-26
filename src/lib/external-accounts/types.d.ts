@@ -18,6 +18,8 @@ export type ExternalAccountView = {
 	passwordSet: boolean;
 	lastSyncedAt: string | null;
 	lastError: string | null;
+	/** Most recent UIDs skipped because RFC822.SIZE exceeded the fetch limit. */
+	skippedUids: number[];
 	createdAt: string;
 	updatedAt: string;
 };

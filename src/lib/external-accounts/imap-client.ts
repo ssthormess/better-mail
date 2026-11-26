@@ -6,21 +6,19 @@ import { checkServerIdentity, connect as tlsConnect } from "node:tls";
 export const IMAP_MAX_MESSAGE_BYTES = 5 * 1024 * 1024;
 export const IMAP_MAX_MESSAGES_PER_POLL = 50;
 export const IMAP_MAX_BATCH_BYTES = 20 * 1024 * 1024;
+export const IMAP_UID_SEARCH_WINDOW = 1_000;
 const SESSION_TIMEOUT_MS = 45_000;
 const COMMAND_TIMEOUT_MS = 12_000;
 const MAX_BUFFERED_SOCKET_BYTES = 32 * 1024 * 1024;
 const MAX_LINE_BYTES = 16 * 1024;
 const MAX_RESPONSE_METADATA_BYTES = 512 * 1024;
-const MAX_SEARCH_UIDS = 65_536;
+const MAX_SEARCH_UIDS = IMAP_UID_SEARCH_WINDOW;
 
 type Socket = import("node:net").Socket;
 type FetchedMessage = { uid: number; raw: Buffer };
-type FetchEvent = (FetchedMessage | { uid: number; skipped: "oversized" }) & { uidValidity: number };
-type ImapRecord = { lines: string[]; literal: Buffer | null; literalLength: number; oversized: boolean };
+type FetchEvent = (FetchedMessage | { uid: number; outcome: "oversized" | "expunged" | "scanned" }) & { uidValidity: number };
+type ImapRecord = { lines: string[]; literal: Buffer | null; literalLength: number; hasLiteral: boolean };
 type ImapResponse = { records: ImapRecord[] };
-class OversizedLiteralError extends Error {
- constructor(readonly uid: number) { super("oversized_literal"); }
-}
 
 /**
  * Minimal RFC 3501 client for the Node runtime. Every command reads framed response records: literal octets
@@ -32,9 +30,9 @@ export async function fetchImap(
  cursor: { uidValidity: number; lastUid: number } | null,
  maxMessages = IMAP_MAX_MESSAGES_PER_POLL,
  maxBytes = IMAP_MAX_MESSAGE_BYTES,
- options: { maxBatchBytes?: number; onMessage?: (message: FetchEvent) => Promise<boolean | void> } = {},
+ options: { maxBatchBytes?: number; deadlineAt?: number; onMessage?: (message: FetchEvent) => Promise<boolean | void> } = {},
 ) {
- const sessionDeadline = Date.now() + SESSION_TIMEOUT_MS;
+ const sessionDeadline = Math.min(Date.now() + SESSION_TIMEOUT_MS, options.deadlineAt ?? Number.POSITIVE_INFINITY);
  let socket: Socket | undefined;
  const receive: Buffer[] = [];
  let bufferedBytes = 0;
@@ -105,41 +103,49 @@ export async function fetchImap(
   });
   next.on("error", onClosed); next.on("end", onClosed); next.on("close", onClosed);
  };
- const dialAddress = async () => {
-  // Resolve afresh for every connection and dial one of the checked numeric results, closing the DNS-rebind gap.
+ const dialAddresses = async () => {
+  // Resolve afresh and dial only checked numeric results, closing the DNS-rebind gap.
   const addresses = isIP(account.host) ? [{ address: account.host }] : await withDeadline(lookup(account.host, { all: true, verbatim: true }), Math.min(sessionDeadline, Date.now() + COMMAND_TIMEOUT_MS));
   if (!addresses.length) throw new Error("connection_failed");
   if (!account.allowPrivate && addresses.some(({ address }) => !isPublicAddress(address))) throw new Error("egress_denied");
-  return addresses[0].address;
+  return [...new Set(addresses.map(({ address }) => address))].slice(0, 8);
  };
  const establish = async (mode: "plain" | "implicit-tls" | "starttls") => {
-  const address = await dialAddress();
-  const tlsOptions = { host: address, port: account.port, ...(isIP(account.host) ? {} : { servername: account.host }), rejectUnauthorized: true as const, checkServerIdentity: (_host: string, cert: import("node:tls").PeerCertificate) => checkServerIdentity(account.host, cert) };
-  if (mode === "plain") {
-   const plain = tcpConnect({ host: address, port: account.port });
-   await new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => { plain.destroy(); reject(new Error("timeout")); }, Math.min(COMMAND_TIMEOUT_MS, sessionDeadline - Date.now()));
-    plain.once("connect", () => { clearTimeout(timer); resolve(); });
-    plain.once("error", () => { clearTimeout(timer); reject(new Error("connection_failed")); });
-   });
-   attach(plain); return;
+  const addresses = await dialAddresses();
+  let lastError: unknown = new Error("connection_failed");
+  for (const address of addresses) {
+   if (Date.now() >= sessionDeadline) throw new Error("timeout");
+   try {
+    if (mode === "plain") {
+     const plain = tcpConnect({ host: address, port: account.port });
+     await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => { plain.destroy(); reject(new Error("timeout")); }, Math.min(COMMAND_TIMEOUT_MS, sessionDeadline - Date.now()));
+      plain.once("connect", () => { clearTimeout(timer); resolve(); });
+      plain.once("error", () => { clearTimeout(timer); reject(new Error("connection_failed")); });
+     });
+     attach(plain); return;
+    }
+    const secure = tlsConnect({ host: address, port: account.port, ...(isIP(account.host) ? {} : { servername: account.host }), rejectUnauthorized: true, checkServerIdentity: (_host, cert) => checkServerIdentity(account.host, cert) });
+    await new Promise<void>((resolve, reject) => {
+     const timer = setTimeout(() => { secure.destroy(); reject(new Error("timeout")); }, Math.min(COMMAND_TIMEOUT_MS, sessionDeadline - Date.now()));
+     secure.once("secureConnect", () => { clearTimeout(timer); resolve(); });
+     secure.once("error", () => { clearTimeout(timer); reject(new Error("tls_failed")); });
+     secure.once("end", () => { clearTimeout(timer); reject(new Error("tls_failed")); });
+     secure.once("close", () => { if (!secure.authorized) { clearTimeout(timer); reject(new Error("tls_failed")); } });
+    });
+    attach(secure); return;
+   } catch (error) {
+    lastError = error;
+    if (Date.now() >= sessionDeadline) throw new Error("timeout");
+   }
   }
-  const secure = tlsConnect(tlsOptions);
-  await new Promise<void>((resolve, reject) => {
-   const timer = setTimeout(() => { secure.destroy(); reject(new Error("timeout")); }, Math.min(COMMAND_TIMEOUT_MS, sessionDeadline - Date.now()));
-   const done = () => { clearTimeout(timer); resolve(); };
-   secure.once("secureConnect", done);
-   secure.once("error", () => { clearTimeout(timer); reject(new Error("tls_failed")); });
-   secure.once("end", () => { clearTimeout(timer); reject(new Error("tls_failed")); });
-   secure.once("close", () => { if (!secure.authorized) { clearTimeout(timer); reject(new Error("tls_failed")); } });
-  });
-  attach(secure);
+  throw lastError instanceof Error ? lastError : new Error("connection_failed");
  };
  const readGreeting = async () => {
   const line = await readLine(Math.min(sessionDeadline, Date.now() + COMMAND_TIMEOUT_MS));
   if (!/^\* (?:OK|PREAUTH)(?: |$)/i.test(line) || /^\* PREAUTH(?: |$)/i.test(line)) throw new Error("server_unavailable");
  };
- const command = async (text: string, literalLimit = maxBytes, oversizedUid?: number): Promise<ImapResponse> => {
+ const command = async (text: string, literalLimit = maxBytes): Promise<ImapResponse> => {
   if (Date.now() >= sessionDeadline) throw new Error("timeout");
   responseMetadataBytes = 0;
   const s = socket!;
@@ -153,31 +159,30 @@ export async function fetchImap(
    const tagged = line.match(new RegExp(`^${tag} (OK|NO|BAD)(?: |$)`, "i"));
    if (tagged) {
     if (current && isFetchRecord(current)) validateFetchRecord(current);
-    if (tagged[1].toUpperCase() !== "OK") {
-     throw new Error(/\[AUTHENTICATIONFAILED\]/i.test(line) ? "authentication_failed" : "imap_command_failed");
-    }
+    if (tagged[1].toUpperCase() !== "OK") throw new Error(/\[AUTHENTICATIONFAILED\]/i.test(line) ? "authentication_failed" : "imap_command_failed");
     return { records };
    }
    if (/^[A-Za-z]\d+ /.test(line)) throw new Error("invalid_response");
    if (line.startsWith("+")) throw new Error("unsupported_continuation");
    if (line.startsWith("* ")) {
     if (current && isFetchRecord(current)) validateFetchRecord(current);
-    current = { lines: [line], literal: null, literalLength: 0, oversized: false };
+    current = { lines: [line], literal: null, literalLength: 0, hasLiteral: false };
     records.push(current);
    } else if (current) current.lines.push(line);
    else throw new Error("invalid_response");
 
-   const literalMarker = line.match(/\{(0|[1-9]\d*)\+?\}$/);
-   if (literalMarker) {
-    if (!current || !isFetchRecord(current) || current.literalLength !== 0) throw new Error("invalid_literal");
-    const length = Number(literalMarker[1]);
+   const tokens = current ? recordTokens(current) : [];
+   const marker = line.match(/\{(0|[1-9]\d*)\+?\}$/);
+   if (marker) {
+    if (!current || !isFetchRecord(current) || current.hasLiteral) throw new Error("invalid_literal");
+    const preceding = tokens.slice(0, -1).map(token => token.toUpperCase());
+    if (!preceding.some(token => token === "BODY[]" || token === "RFC822")) throw new Error("invalid_literal");
+    const length = Number(marker[1]);
     if (!Number.isSafeInteger(length)) throw new Error("response_limit");
+    current.hasLiteral = true;
     current.literalLength = length;
-    if (length > literalLimit) {
-     current.oversized = true;
-     if (oversizedUid !== undefined && isFetchRecord(current)) throw new OversizedLiteralError(oversizedUid);
-     await readBytes(length, deadline, false);
-    } else current.literal = await readBytes(length, deadline);
+    if (length > literalLimit) throw new Error("message_size_unverified");
+    current.literal = await readBytes(length, deadline) ?? Buffer.alloc(0);
    }
   }
  };
@@ -185,6 +190,15 @@ export async function fetchImap(
  const initialCursor = cursor;
  const maxBatchBytes = options.maxBatchBytes ?? IMAP_MAX_BATCH_BYTES;
  const callback = options.onMessage;
+ const deliver = async (event: FetchEvent) => {
+  const result = callback ? await callback(event) : undefined;
+  if (Date.now() >= sessionDeadline) throw new Error("timeout");
+  return result !== false;
+ };
+ const uidExists = async (uid: number) => {
+  const response = await command(`UID SEARCH UID ${uid}:${uid}`, 0);
+  return extractSearchUids(response, uid, uid).includes(uid);
+ };
  let currentValidity: number | null = null;
  let lastUid = cursor?.lastUid ?? 0;
  let batchBytes = 0;
@@ -212,47 +226,56 @@ export async function fetchImap(
   if (!isSafeLoginArgument(account.username) || !isSafeLoginArgument(account.password)) throw new Error("credentials_unsupported");
   await command(`LOGIN ${quote(account.username)} ${quote(account.password)}`, 0);
   const selected = await command('EXAMINE "INBOX"', 0);
-  const validityText = extractUidValidity(selected);
+  const validityText = extractResponseCode(selected, "UIDVALIDITY");
+  const uidNextText = extractResponseCode(selected, "UIDNEXT");
   const validity = Number(validityText);
-  if (!validityText || !/^[1-9]\d*$/.test(validityText) || !Number.isSafeInteger(validity) || validity > 0xffff_ffff) throw new Error("invalid_mailbox_state");
+  const uidNext = Number(uidNextText);
+  if (!validityText || !/^[1-9]\d*$/.test(validityText) || !Number.isSafeInteger(validity) || validity > 0xffff_ffff
+   || !uidNextText || !/^[1-9]\d*$/.test(uidNextText) || !Number.isSafeInteger(uidNext) || uidNext > 0xffff_ffff) throw new Error("invalid_mailbox_state");
   currentValidity = validity;
   const startUid = cursor?.uidValidity === validity ? cursor.lastUid + 1 : 1;
-  if (startUid <= 0xffff_ffff) {
-   const search = await command(`UID SEARCH UID ${startUid}:*`, 0);
-   const uids = extractSearchUids(search, startUid, maxMessages);
-   for (const uid of uids) {
+  if (cursor?.uidValidity !== validity) lastUid = 0;
+  if (startUid <= 0xffff_ffff && startUid < uidNext) {
+   const endUid = Math.min(0xffff_ffff, startUid + IMAP_UID_SEARCH_WINDOW - 1, uidNext - 1);
+   const search = await command(`UID SEARCH UID ${startUid}:${endUid}`, 0);
+   const uids = extractSearchUids(search, startUid, endUid);
+   let fullyProcessed = true;
+   for (const uid of uids.slice(0, maxMessages)) {
     if (Date.now() >= sessionDeadline) throw new Error("timeout");
-    let response: ImapResponse;
-    try { response = await command(`UID FETCH ${uid} (UID BODY.PEEK[])`, maxBytes, uid); }
-    catch (error) {
-     if (!(error instanceof OversizedLiteralError)) throw error;
-     if (callback) await withDeadline(Promise.resolve(callback({ uid, skipped: "oversized", uidValidity: validity })), sessionDeadline);
-     skippedUids.push(uid); delivered++; lastUid = Math.max(lastUid, uid);
-     if (sessionTimer) clearTimeout(sessionTimer);
-     socket?.destroy();
-     return { uidValidity: validity, lastUid: Math.max(initialCursor?.uidValidity === validity ? initialCursor.lastUid : 0, lastUid), messages, delivered, skippedUids, stoppedAfterOversized: true };
-    }
-    const fetchRecords = response.records.filter(isFetchRecord);
-    // Expunges between SEARCH and FETCH are normal; ignore the vanished UID and continue.
-    if (!fetchRecords.length) continue;
-    if (fetchRecords.length !== 1) throw new Error("invalid_fetch_response");
-    const record = fetchRecords[0];
-    validateFetchRecord(record);
-    const recordMetadata = record.lines.join(" ");
-    if (extractFetchUid(record) !== uid || !/(?:BODY\[\]|RFC822)/i.test(recordMetadata)) throw new Error("invalid_fetch_response");
-    if (record.oversized) {
-     const keepGoing = await (callback ? withDeadline(Promise.resolve(callback({ uid, skipped: "oversized", uidValidity: validity })), sessionDeadline) : undefined);
-     skippedUids.push(uid); delivered++; lastUid = Math.max(lastUid, uid);
-     if (keepGoing === false) break;
+    const sizeResponse = await command(`UID FETCH ${uid} (UID RFC822.SIZE)`, 0);
+    const sizeRecord = findFetchRecord(sizeResponse, uid, "RFC822.SIZE");
+    if (!sizeRecord) {
+     if (await uidExists(uid)) throw new Error("unexpected_fetch_response");
+     if (!await deliver({ uid, outcome: "expunged", uidValidity: validity })) { fullyProcessed = false; break; }
+     lastUid = Math.max(lastUid, uid);
      continue;
     }
-    if (!record.literal) throw new Error("invalid_fetch_response");
-    const event = { uid, raw: record.literal, uidValidity: validity };
-    if (event.raw.byteLength + batchBytes > maxBatchBytes) break;
-    const keepGoing = await (callback ? withDeadline(Promise.resolve(callback(event)), sessionDeadline) : undefined);
+    const size = extractFetchNumber(sizeRecord, "RFC822.SIZE");
+    if (size === null) throw new Error("invalid_fetch_response");
+    if (size > maxBytes) {
+     if (!await deliver({ uid, outcome: "oversized", uidValidity: validity })) { fullyProcessed = false; break; }
+     skippedUids.push(uid); delivered++; lastUid = Math.max(lastUid, uid);
+     continue;
+    }
+    const bodyResponse = await command(`UID FETCH ${uid} (UID BODY.PEEK[])`, maxBytes);
+    const bodyRecord = findFetchRecord(bodyResponse, uid, "BODY[]", "RFC822");
+    if (!bodyRecord) {
+     if (await uidExists(uid)) throw new Error("unexpected_fetch_response");
+     if (!await deliver({ uid, outcome: "expunged", uidValidity: validity })) { fullyProcessed = false; break; }
+     lastUid = Math.max(lastUid, uid);
+     continue;
+    }
+    if (!bodyRecord.hasLiteral || bodyRecord.literal === null) throw new Error("invalid_fetch_response");
+    if (bodyRecord.literalLength > maxBytes) throw new Error("message_size_unverified");
+    const event = { uid, raw: bodyRecord.literal, uidValidity: validity };
+    if (event.raw.byteLength + batchBytes > maxBatchBytes) { fullyProcessed = false; break; }
+    if (!await deliver(event)) { fullyProcessed = false; break; }
     batchBytes += event.raw.byteLength; delivered++; lastUid = Math.max(lastUid, uid);
     if (!callback) messages.push(event);
-    if (keepGoing === false) break;
+   }
+   if (fullyProcessed && uids.length < maxMessages) {
+    await deliver({ uid: endUid, outcome: "scanned", uidValidity: validity });
+    lastUid = Math.max(lastUid, endUid);
    }
   }
   await command("LOGOUT", 0).catch(() => {});
@@ -266,44 +289,82 @@ export async function fetchImap(
  }
 }
 
-function isFetchRecord(record: ImapRecord) { return /^\* \d+ FETCH \(/i.test(record.lines[0] ?? ""); }
+function isFetchRecord(record: ImapRecord) { return /^\* [1-9]\d* FETCH \(/i.test(record.lines[0] ?? ""); }
+function recordTokens(record: ImapRecord): string[] {
+ const text = record.lines.join(" "); const tokens: string[] = [];
+ for (let i = 0; i < text.length;) {
+  if (/\s/.test(text[i])) { i++; continue; }
+  if (text[i] === "(" || text[i] === ")") { tokens.push(text[i++]); continue; }
+  if (text[i] === '"') {
+   let j = i + 1;
+   while (j < text.length) { if (text[j] === "\\") { j += 2; continue; } if (text[j++] === '"') break; }
+   if (j > text.length || text[j - 1] !== '"') throw new Error("invalid_fetch_response");
+   tokens.push("<quoted>"); i = j; continue;
+  }
+  let j = i + 1;
+  while (j < text.length && !/[\s()]/.test(text[j])) j++;
+  tokens.push(text.slice(i, j)); i = j;
+ }
+ return tokens;
+}
 function validateFetchRecord(record: ImapRecord) {
- if (!record.lines.at(-1)?.endsWith(")") || record.literalLength > 0 && record.literal === null && !record.oversized) throw new Error("invalid_fetch_response");
+ const tokens = recordTokens(record);
+ if (!isFetchRecord(record) || tokens.at(-1) !== ")") throw new Error("invalid_fetch_response");
+ let depth = 0;
+ for (const token of tokens.slice(3)) {
+  if (token === "(") depth++;
+  else if (token === ")" && --depth < 0) throw new Error("invalid_fetch_response");
+ }
+ if (depth !== 0 || record.hasLiteral !== (record.literal !== null)) throw new Error("invalid_fetch_response");
 }
-function extractFetchUid(record: ImapRecord) {
- const metadata = record.lines.join(" ");
- const value = metadata.match(/\bUID (0|[1-9]\d*)\b/i)?.[1];
- if (!value || !/^(?:0|[1-9]\d*)$/.test(value)) return null;
+function extractFetchUid(record: ImapRecord): number | null {
+ const tokens = recordTokens(record); const positions = tokens.map((token, index) => token.toUpperCase() === "UID" ? index : -1).filter(index => index >= 0);
+ if (positions.length !== 1) return null;
+ const value = tokens[positions[0] + 1];
+ if (!value || !/^[1-9]\d*$/.test(value)) return null;
  const uid = Number(value);
- return Number.isSafeInteger(uid) && uid > 0 && uid <= 0xffff_ffff ? uid : null;
+ return Number.isSafeInteger(uid) && uid <= 0xffff_ffff ? uid : null;
 }
-function extractUidValidity(response: ImapResponse): string | null {
+function extractResponseCode(response: ImapResponse, name: "UIDVALIDITY" | "UIDNEXT"): string | null {
  for (const record of response.records) {
   const first = record.lines[0] ?? "";
-  if (/^\* OK(?: |$)/i.test(first)) {
-   const value = first.match(/\[UIDVALIDITY ([^\]\s]+)\]/i)?.[1];
-   if (value) return value;
-  }
+  const match = first.match(/^\* OK \[([A-Z]+) ([0-9]+)\]/i);
+  if (match?.[1].toUpperCase() === name) return match[2];
  }
  return null;
 }
-function extractSearchUids(response: ImapResponse, startUid: number, maxMessages: number): number[] {
+function findFetchRecord(response: ImapResponse, uid: number, ...attributes: string[]): ImapRecord | null {
+ const matching = response.records.filter(record => {
+  if (!isFetchRecord(record)) return false;
+  const tokens = recordTokens(record).map(token => token.toUpperCase());
+  return extractFetchUid(record) === uid && attributes.some(attribute => tokens.includes(attribute.toUpperCase()));
+ });
+ if (matching.length > 1) throw new Error("invalid_fetch_response");
+ return matching[0] ?? null;
+}
+function extractFetchNumber(record: ImapRecord, attribute: string): number | null {
+ const tokens = recordTokens(record); const key = attribute.toUpperCase();
+ const positions = tokens.map((token, index) => token.toUpperCase() === key ? index : -1).filter(index => index >= 0);
+ if (positions.length !== 1) return null;
+ const value = tokens[positions[0] + 1];
+ if (!value || !/^(0|[1-9]\d*)$/.test(value)) return null;
+ const result = Number(value);
+ return Number.isSafeInteger(result) ? result : null;
+}
+function extractSearchUids(response: ImapResponse, startUid: number, endUid: number): number[] {
  const lines = response.records.filter(record => /^\* SEARCH(?: |$)/i.test(record.lines[0] ?? ""));
  if (lines.length !== 1 || lines[0].lines.length !== 1) throw new Error("invalid_search_response");
  const tokens = lines[0].lines[0].slice(8).trim().split(/\s+/).filter(Boolean);
  if (tokens.length > MAX_SEARCH_UIDS) throw new Error("search_limit");
- const ordered: number[] = [];
+ const uids: number[] = [];
  for (const token of tokens) {
   if (!/^[1-9]\d*$/.test(token)) throw new Error("invalid_search_response");
   const uid = Number(token);
-  if (!Number.isSafeInteger(uid) || uid > 0xffff_ffff) throw new Error("invalid_search_response");
-  if (uid < startUid) continue; // Dovecot and RFC sequence-set semantics can return lower UIDs for `N:*`.
-  let at = ordered.findIndex(value => value > uid);
-  if (at < 0) at = ordered.length;
-  ordered.splice(at, 0, uid);
-  if (ordered.length > maxMessages) ordered.pop();
+  if (!Number.isSafeInteger(uid) || uid > 0xffff_ffff || uid < startUid || uid > endUid) throw new Error("invalid_search_response");
+  if (uids.includes(uid)) throw new Error("invalid_search_response");
+  uids.push(uid);
  }
- return [...new Set(ordered)];
+ return uids.sort((a, b) => a - b);
 }
 async function withDeadline<T>(promise: Promise<T>, deadline: number): Promise<T> {
  let timer: ReturnType<typeof setTimeout> | undefined;

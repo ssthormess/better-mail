@@ -1,4 +1,4 @@
-import { and, asc, eq, lte, or, isNull, sql } from "drizzle-orm";
+import { and, asc, eq, lte, notInArray, or, isNull, sql } from "drizzle-orm";
 import { getDb } from "@/db";
 import { domains, externalAccounts, mailboxes } from "@/db/schema";
 import { decryptSecret } from "./crypto";
@@ -11,108 +11,172 @@ import { readHeaderMap } from "@/lib/email/provider-trace";
 const INTERVAL_MS = 60_000;
 const MAX_ACCOUNTS_PER_TICK = 10;
 const MAX_TICK_MS = 50_000;
-const inFlightAccounts = new Set<string>();
-const failures = new Map<string, number>();
-let pollTickInFlight = false;
+const CLAIM_LEASE_MS = 120_000;
+const CLAIM_RENEW_MS = 20_000;
+const SKIPPED_WARNING = "Oversized messages skipped; see skippedUids";
 type ImapCursor = { uidValidity: number; lastUid: number; skippedUids?: number[] };
+type FailureState = { count: number; retryAt: number };
+const failures = new Map<string, FailureState>();
+let pollTickInFlight = false;
 
-/** Runs only in Node. A single process-wide guard prevents overlapping scheduler ticks. */
+/** Runs only in Node. The database lease fences concurrent pollers across processes. */
 export async function pollExternalImapAccounts(env: CloudflareEnv, now = new Date()) {
  if (env.MAILFLARE_RUNTIME !== "node") return { skipped: "runtime_unsupported", accounts: 0 };
  if (pollTickInFlight) return { skipped: "already_running", accounts: 0 };
  pollTickInFlight = true;
- const tickStartedAt = Date.now();
+ const tickDeadline = Date.now() + MAX_TICK_MS;
  try {
-  const db = getDb(env); const cutoff = new Date(now.getTime() - INTERVAL_MS);
-  // Overfetch so old rows in backoff/in-flight do not starve later eligible accounts; CASE makes NULL first on every dialect.
+  const db = getDb(env);
+  const activeRows = await db.select({ id: externalAccounts.id }).from(externalAccounts)
+   .where(and(eq(externalAccounts.enabled, true), eq(externalAccounts.protocol, "imap")));
+  const activeIds = new Set(activeRows.map(row => row.id));
+  for (const id of failures.keys()) if (!activeIds.has(id)) failures.delete(id);
+  const retryIds = [...failures].filter(([, state]) => state.retryAt > now.getTime()).map(([id]) => id);
+  const nowDate = new Date();
+  const claimAvailable = or(isNull(externalAccounts.pollClaimUntil), lte(externalAccounts.pollClaimUntil, nowDate));
+  const backoffAvailable = retryIds.length ? notInArray(externalAccounts.id, retryIds) : undefined;
   const rows = await db.select({ account: externalAccounts, mailbox: mailboxes, domain: domains })
    .from(externalAccounts).innerJoin(mailboxes, eq(externalAccounts.mailboxId, mailboxes.id)).innerJoin(domains, eq(mailboxes.domainId, domains.id))
-   .where(and(eq(externalAccounts.enabled, true), eq(externalAccounts.protocol, "imap"), or(isNull(externalAccounts.lastSyncedAt), lte(externalAccounts.lastSyncedAt, cutoff))))
-   .orderBy(asc(sql`case when ${externalAccounts.lastSyncedAt} is null then 0 else 1 end`), asc(externalAccounts.lastSyncedAt)).limit(1000);
-  let completed = 0; let attempted = 0;
+   .where(and(
+    eq(externalAccounts.enabled, true), eq(externalAccounts.protocol, "imap"),
+    or(isNull(externalAccounts.lastSyncedAt), lte(externalAccounts.lastSyncedAt, new Date(now.getTime() - INTERVAL_MS))),
+    claimAvailable,
+    ...(backoffAvailable ? [backoffAvailable] : []),
+   ))
+   .orderBy(asc(sql`case when ${externalAccounts.lastSyncedAt} is null then 0 else 1 end`), asc(externalAccounts.lastSyncedAt))
+   .limit(MAX_ACCOUNTS_PER_TICK);
+  let completed = 0;
   for (const row of rows) {
-   if (attempted >= MAX_ACCOUNTS_PER_TICK || Date.now() - tickStartedAt >= MAX_TICK_MS) break;
+   if (Date.now() >= tickDeadline) break;
    const { account, mailbox, domain } = row;
-   if (inFlightAccounts.has(account.id)) continue;
-   const backoff = Math.min(30 * 60_000, INTERVAL_MS * 2 ** Math.min(failures.get(account.id) ?? 0, 5));
-   if (account.lastSyncedAt && now.getTime() - account.lastSyncedAt.getTime() < backoff) continue;
-   inFlightAccounts.add(account.id); attempted++;
-   let expectedUpdatedAt = account.updatedAt;
+   const claimToken = crypto.randomUUID();
+   const sourceIdentity = and(
+    eq(externalAccounts.mailboxId, account.mailboxId), eq(externalAccounts.protocol, account.protocol),
+    eq(externalAccounts.host, account.host), eq(externalAccounts.port, account.port), eq(externalAccounts.tlsMode, account.tlsMode),
+    eq(externalAccounts.username, account.username), eq(externalAccounts.passwordEncrypted, account.passwordEncrypted),
+   );
+   const originalCursor = account.syncCursor === null ? isNull(externalAccounts.syncCursor) : eq(externalAccounts.syncCursor, account.syncCursor);
+   const claimNow = new Date();
+   await db.update(externalAccounts).set({ pollClaimToken: claimToken, pollClaimUntil: new Date(claimNow.getTime() + CLAIM_LEASE_MS) })
+    .where(and(eq(externalAccounts.id, account.id), eq(externalAccounts.enabled, true), sourceIdentity, originalCursor,
+     or(isNull(externalAccounts.pollClaimUntil), lte(externalAccounts.pollClaimUntil, claimNow))));
+   const [claim] = await db.select({ token: externalAccounts.pollClaimToken }).from(externalAccounts)
+    .where(and(eq(externalAccounts.id, account.id), eq(externalAccounts.pollClaimToken, claimToken))).limit(1);
+   if (!claim) continue;
+
+   let renewalInFlight: Promise<void> = Promise.resolve();
+   let claimLost = false;
+   const renewClaim = async () => {
+    try {
+     const until = new Date(Date.now() + CLAIM_LEASE_MS);
+     await db.update(externalAccounts).set({ pollClaimUntil: until })
+      .where(and(eq(externalAccounts.id, account.id), eq(externalAccounts.pollClaimToken, claimToken)));
+     const [owned] = await db.select({ token: externalAccounts.pollClaimToken }).from(externalAccounts).where(eq(externalAccounts.id, account.id)).limit(1);
+     if (owned?.token !== claimToken) claimLost = true;
+    } catch { claimLost = true; }
+   };
+   const heartbeat = setInterval(() => { renewalInFlight = renewalInFlight.then(renewClaim); }, CLAIM_RENEW_MS);
    let expectedCursorRaw = account.syncCursor;
+   let committedCursor: ImapCursor | null = null;
+   const deadlineAt = Math.min(tickDeadline, Date.now() + 45_000);
+   const assertOwned = async () => {
+    if (claimLost || Date.now() >= deadlineAt) throw new Error(Date.now() >= deadlineAt ? "timeout" : "account_changed");
+    const [current] = await db.select({
+     enabled: externalAccounts.enabled, token: externalAccounts.pollClaimToken, host: externalAccounts.host,
+     port: externalAccounts.port, protocol: externalAccounts.protocol, tlsMode: externalAccounts.tlsMode,
+     username: externalAccounts.username, passwordEncrypted: externalAccounts.passwordEncrypted,
+     mailboxId: externalAccounts.mailboxId, syncCursor: externalAccounts.syncCursor,
+    }).from(externalAccounts).where(eq(externalAccounts.id, account.id)).limit(1);
+    if (!current?.enabled || current.token !== claimToken || current.host !== account.host || current.port !== account.port
+      || current.protocol !== account.protocol || current.tlsMode !== account.tlsMode || current.username !== account.username
+      || current.passwordEncrypted !== account.passwordEncrypted || current.mailboxId !== account.mailboxId
+      || current.syncCursor !== expectedCursorRaw) throw new Error("account_changed");
+   };
+   const setState = async (cursor: ImapCursor) => {
+    await assertOwned();
+    const encoded = JSON.stringify(cursor);
+    if (!isSyncCursorFormat(encoded, "imap")) throw new Error("invalid_cursor");
+    const changed = await db.update(externalAccounts).set({
+     syncCursor: encoded, lastSyncedAt: now,
+     lastError: cursor.skippedUids?.length ? SKIPPED_WARNING : null,
+    }).where(and(eq(externalAccounts.id, account.id), eq(externalAccounts.enabled, true),
+     eq(externalAccounts.pollClaimToken, claimToken), sourceIdentity,
+     expectedCursorRaw === null ? isNull(externalAccounts.syncCursor) : eq(externalAccounts.syncCursor, expectedCursorRaw)))
+     .returning({ id: externalAccounts.id });
+    if (changed.length !== 1) throw new Error("account_changed");
+    expectedCursorRaw = encoded;
+    committedCursor = cursor;
+   };
    try {
-    const dbAccount = await db.select({ id: externalAccounts.id, enabled: externalAccounts.enabled, updatedAt: externalAccounts.updatedAt, syncCursor: externalAccounts.syncCursor, passwordEncrypted: externalAccounts.passwordEncrypted }).from(externalAccounts).where(eq(externalAccounts.id, account.id)).limit(1);
-    const live = dbAccount[0];
-    if (!live || !live.enabled || live.updatedAt.getTime() !== account.updatedAt.getTime() || live.syncCursor !== account.syncCursor || live.passwordEncrypted !== account.passwordEncrypted) continue;
+    await assertOwned();
     const initialCursor = account.syncCursor === null ? null : isSyncCursorFormat(account.syncCursor, "imap") ? JSON.parse(account.syncCursor) as ImapCursor : null;
-    const validCursor = initialCursor && Number.isInteger(initialCursor.uidValidity) && initialCursor.uidValidity > 0 && initialCursor.uidValidity <= 0xffff_ffff && Number.isInteger(initialCursor.lastUid) && initialCursor.lastUid >= 0 && initialCursor.lastUid <= 0xffff_ffff ? initialCursor : null;
+    const validCursor = initialCursor && Number.isInteger(initialCursor.uidValidity) && initialCursor.uidValidity > 0
+     && initialCursor.uidValidity <= 0xffff_ffff && Number.isInteger(initialCursor.lastUid) && initialCursor.lastUid >= 0
+     && initialCursor.lastUid <= 0xffff_ffff ? initialCursor : null;
+    committedCursor = validCursor;
     const secret = await decryptSecret(env, account.passwordEncrypted);
-    let committedCursor: ImapCursor | null = validCursor;
-    let skippedAny = false;
-    const setState = async (cursor: ImapCursor, clearError: boolean) => {
-     const encoded = JSON.stringify(cursor);
-     if (!isSyncCursorFormat(encoded, "imap")) throw new Error("invalid_cursor");
-     const writeAt = new Date(Math.ceil(Math.max(now.getTime(), expectedUpdatedAt.getTime() + 1000) / 1000) * 1000);
-     const expectedCursorCondition = expectedCursorRaw === null ? isNull(externalAccounts.syncCursor) : eq(externalAccounts.syncCursor, expectedCursorRaw);
-     const changed = await db.update(externalAccounts).set({ syncCursor: encoded, lastSyncedAt: now, ...(clearError ? { lastError: null } : {}), updatedAt: writeAt })
-      .where(and(eq(externalAccounts.id, account.id), eq(externalAccounts.enabled, true), eq(externalAccounts.updatedAt, expectedUpdatedAt), expectedCursorCondition))
-      .returning({ id: externalAccounts.id });
-     if (changed.length !== 1) throw new Error("account_changed");
-     expectedUpdatedAt = writeAt; expectedCursorRaw = encoded; committedCursor = cursor;
-    };
     const fetchResult = await fetchImap({
      host: account.host, port: account.port, tlsMode: account.tlsMode, username: account.username, password: secret,
      allowPrivate: env.EXTERNAL_FETCH_ALLOW_PRIVATE === "1",
-    }, validCursor ? { uidValidity: validCursor.uidValidity, lastUid: validCursor.lastUid } : null, IMAP_MAX_MESSAGES_PER_POLL, IMAP_MAX_MESSAGE_BYTES, {
+    }, validCursor ? { uidValidity: validCursor.uidValidity, lastUid: validCursor.lastUid } : null,
+    IMAP_MAX_MESSAGES_PER_POLL, IMAP_MAX_MESSAGE_BYTES, {
      maxBatchBytes: IMAP_MAX_BATCH_BYTES,
+     deadlineAt,
      onMessage: async event => {
-      // Check for disable/edit after dialing and before every store; the cursor write below is the CAS fence.
-      const [current] = await db.select({ enabled: externalAccounts.enabled, updatedAt: externalAccounts.updatedAt, syncCursor: externalAccounts.syncCursor }).from(externalAccounts).where(eq(externalAccounts.id, account.id)).limit(1);
-      if (!current?.enabled || current.updatedAt.getTime() !== expectedUpdatedAt.getTime() || current.syncCursor !== expectedCursorRaw) throw new Error("account_changed");
-      let skippedUids = committedCursor?.uidValidity === event.uidValidity ? [...(committedCursor?.skippedUids ?? [])] : [];
-      if ("skipped" in event) {
-       skippedAny = true;
-       skippedUids = [...skippedUids.filter(uid => uid !== event.uid), event.uid].slice(-SYNC_CURSOR_MAX_SKIPPED_UIDS);
-      } else {
+      await assertOwned();
+      const skippedUids = committedCursor?.uidValidity === event.uidValidity ? [...(committedCursor.skippedUids ?? [])] : [];
+      if ("outcome" in event && event.outcome === "oversized") {
+       skippedUids.push(event.uid);
+       if (skippedUids.length > SYNC_CURSOR_MAX_SKIPPED_UIDS) skippedUids.splice(0, skippedUids.length - SYNC_CURSOR_MAX_SKIPPED_UIDS);
+      } else if (!("outcome" in event)) {
        const rawBytes = new Uint8Array(event.raw.byteLength); rawBytes.set(event.raw); const rawBuffer = rawBytes.buffer;
        const rawR2Key = await inboundStorageKey(rawBuffer, mailbox.id);
+       await assertOwned();
        await env.BUCKET.put(rawR2Key, rawBuffer, { httpMetadata: { contentType: "message/rfc822" } });
+       if (Date.now() >= deadlineAt) { await env.BUCKET.delete(rawR2Key).catch(() => {}); throw new Error("timeout"); }
        const headers = readHeaderMap(rawBuffer);
-       await processInboundMessage(env, { from: headers.from ?? "", to: `${mailbox.localPart}@${domain.hostname}`, rawR2Key, headers }, { suppressSideEffects: true });
+       await assertOwned();
+       await processInboundMessage(env, { from: headers.from ?? "", to: `${mailbox.localPart}@${domain.hostname}`, rawR2Key, headers }, { intakeMode: "historical_import", deadlineAt });
+       await assertOwned();
       }
       const lastUid = Math.max(committedCursor?.uidValidity === event.uidValidity ? committedCursor.lastUid : 0, event.uid);
-      const nextCursor: ImapCursor = { uidValidity: event.uidValidity, lastUid, ...(skippedUids.length ? { skippedUids } : {}) };
-      await setState(nextCursor, false);
+      await setState({ uidValidity: event.uidValidity, lastUid, ...(skippedUids.length ? { skippedUids } : {}) });
      },
     });
-    if (Date.now() - tickStartedAt >= MAX_TICK_MS) throw new Error("timeout");
-    // A UIDVALIDITY change with an empty mailbox still requires replacing the old epoch cursor.
+    await assertOwned();
     const completedCursor: ImapCursor = committedCursor?.uidValidity === fetchResult.uidValidity
      ? committedCursor
-     : { uidValidity: fetchResult.uidValidity, lastUid: 0 };
-    if (JSON.stringify(completedCursor) !== expectedCursorRaw || skippedAny || account.lastError !== null) await setState(completedCursor, !skippedAny);
+     : { uidValidity: fetchResult.uidValidity, lastUid: fetchResult.lastUid };
+    if (JSON.stringify(completedCursor) !== expectedCursorRaw) await setState(completedCursor);
     else {
-     const expectedCursorCondition = expectedCursorRaw === null ? isNull(externalAccounts.syncCursor) : eq(externalAccounts.syncCursor, expectedCursorRaw);
-     const writeAt = new Date(Math.ceil(Math.max(now.getTime(), expectedUpdatedAt.getTime() + 1000) / 1000) * 1000);
-     const changed = await db.update(externalAccounts).set({ lastSyncedAt: now, lastError: null, updatedAt: writeAt }).where(and(eq(externalAccounts.id, account.id), eq(externalAccounts.enabled, true), eq(externalAccounts.updatedAt, expectedUpdatedAt), expectedCursorCondition)).returning({ id: externalAccounts.id });
+     const changed = await db.update(externalAccounts).set({ lastSyncedAt: now, lastError: completedCursor.skippedUids?.length ? SKIPPED_WARNING : null })
+      .where(and(eq(externalAccounts.id, account.id), eq(externalAccounts.enabled, true), eq(externalAccounts.pollClaimToken, claimToken), sourceIdentity,
+       expectedCursorRaw === null ? isNull(externalAccounts.syncCursor) : eq(externalAccounts.syncCursor, expectedCursorRaw)))
+      .returning({ id: externalAccounts.id });
      if (changed.length !== 1) throw new Error("account_changed");
-     expectedUpdatedAt = writeAt;
     }
-    if (skippedAny) {
-     const writeAt = new Date(Math.ceil(Math.max(now.getTime(), expectedUpdatedAt.getTime() + 1000) / 1000) * 1000);
-     const changed = await db.update(externalAccounts).set({ lastError: "Oversized messages skipped; see sync cursor skippedUids", updatedAt: writeAt })
-      .where(and(eq(externalAccounts.id, account.id), eq(externalAccounts.enabled, true), eq(externalAccounts.updatedAt, expectedUpdatedAt), eq(externalAccounts.syncCursor, JSON.stringify(completedCursor)))).returning({ id: externalAccounts.id });
-     if (changed.length === 1) expectedUpdatedAt = writeAt;
-    }
-    failures.delete(account.id); completed++;
+    failures.delete(account.id);
+    completed++;
    } catch (error) {
-    const count = (failures.get(account.id) ?? 0) + 1; failures.set(account.id, count);
-    const message = error instanceof Error && error.message === "authentication_failed" ? "Authentication failed" : error instanceof Error && error.message === "message_too_large" ? "Message exceeds the per-message fetch limit" : error instanceof Error && error.message === "egress_denied" ? "Outbound destination denied by fetch egress policy" : error instanceof Error && error.message === "credentials_unsupported" ? "IMAP credentials contain unsupported characters" : "IMAP poll failed; retry is backed off";
-    // This CAS refuses to overwrite a concurrent edit/disable or another poller's newer cursor.
-    const expectedCursorCondition = expectedCursorRaw === null ? isNull(externalAccounts.syncCursor) : eq(externalAccounts.syncCursor, expectedCursorRaw);
-    await db.update(externalAccounts).set({ lastError: message, lastSyncedAt: now, updatedAt: new Date(Math.ceil(Math.max(now.getTime(), expectedUpdatedAt.getTime() + 1000) / 1000) * 1000) })
-     .where(and(eq(externalAccounts.id, account.id), eq(externalAccounts.enabled, true), eq(externalAccounts.updatedAt, expectedUpdatedAt), expectedCursorCondition));
-   } finally { inFlightAccounts.delete(account.id); }
+    const count = (failures.get(account.id)?.count ?? 0) + 1;
+    const delay = Math.min(30 * 60_000, INTERVAL_MS * 2 ** Math.min(count, 5));
+    failures.set(account.id, { count, retryAt: now.getTime() + delay });
+    const message = error instanceof Error && error.message === "authentication_failed" ? "Authentication failed"
+     : error instanceof Error && error.message === "egress_denied" ? "Outbound destination denied by fetch egress policy"
+     : error instanceof Error && error.message === "credentials_unsupported" ? "IMAP credentials contain unsupported characters"
+     : committedCursor?.skippedUids?.length ? "IMAP poll failed; see skippedUids for previously skipped messages"
+     : "IMAP poll failed; retry is backed off";
+    await db.update(externalAccounts).set({ lastError: message, lastSyncedAt: now })
+     .where(and(eq(externalAccounts.id, account.id), eq(externalAccounts.pollClaimToken, claimToken), sourceIdentity));
+   } finally {
+    if (heartbeat) clearInterval(heartbeat);
+    await renewalInFlight;
+    await db.update(externalAccounts).set({ pollClaimToken: null, pollClaimUntil: null })
+     .where(and(eq(externalAccounts.id, account.id), eq(externalAccounts.pollClaimToken, claimToken)));
+   }
   }
   return { accounts: completed };
- } finally { pollTickInFlight = false; }
+ } finally {
+  pollTickInFlight = false;
+ }
 }

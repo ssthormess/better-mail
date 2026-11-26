@@ -1,4 +1,4 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, isNull, lte, or } from "drizzle-orm";
 import { NextResponse } from "next/server";
 import { getDb } from "@/db";
 import { externalAccounts } from "@/db/schema";
@@ -30,14 +30,24 @@ export async function PATCH(request: Request, { params }: MailboxAccountRoutePar
 	if (access.error) return access.error;
 
 	const [existing] = await db
-		.select({ id: externalAccounts.id })
+		.select({ id: externalAccounts.id, protocol: externalAccounts.protocol, host: externalAccounts.host, port: externalAccounts.port, tlsMode: externalAccounts.tlsMode, username: externalAccounts.username })
 		.from(externalAccounts)
 		.where(and(eq(externalAccounts.id, accountId), eq(externalAccounts.mailboxId, id)))
 		.limit(1);
 	if (!existing) return NextResponse.json({ error: "Account not found" }, { status: 404 });
 
 	const { password, ...fields } = parsed.data;
-	const values: Partial<typeof externalAccounts.$inferInsert> = { ...fields, updatedAt: new Date() };
+	const sourceChanged = password !== undefined
+		|| (fields.protocol !== undefined && fields.protocol !== existing.protocol)
+		|| (fields.host !== undefined && fields.host !== existing.host)
+		|| (fields.port !== undefined && fields.port !== existing.port)
+		|| (fields.tlsMode !== undefined && fields.tlsMode !== existing.tlsMode)
+		|| (fields.username !== undefined && fields.username !== existing.username);
+	const values: Partial<typeof externalAccounts.$inferInsert> = {
+		...fields,
+		updatedAt: new Date(),
+		...(sourceChanged ? { syncCursor: null, lastSyncedAt: null, lastError: null } : {}),
+	};
 	if (password !== undefined) {
 		// Re-encrypted only when the body carries a new password; absent means the stored one stays.
 		try {
@@ -52,12 +62,17 @@ export async function PATCH(request: Request, { params }: MailboxAccountRoutePar
 	try {
 		// The update binds the sealed credential when the body carries a password, so a driver rejection must not
 		// escape with it.
-		await writeCredential(() =>
+		const [updatedRow] = await writeCredential(() =>
 			db
 				.update(externalAccounts)
-				.set(values)
-				.where(and(eq(externalAccounts.id, accountId), eq(externalAccounts.mailboxId, id))),
+				.set({ ...values, pollClaimToken: null, pollClaimUntil: null })
+				.where(and(
+					eq(externalAccounts.id, accountId), eq(externalAccounts.mailboxId, id),
+					or(isNull(externalAccounts.pollClaimUntil), lte(externalAccounts.pollClaimUntil, new Date())),
+				))
+				.returning({ id: externalAccounts.id }),
 		);
+		if (!updatedRow) return NextResponse.json({ error: "Account is being polled; try again shortly" }, { status: 409 });
 	} catch (error) {
 		const response = credentialWriteErrorResponse(error);
 		if (response) return response;
@@ -86,6 +101,12 @@ export async function DELETE(request: Request, { params }: MailboxAccountRoutePa
 		.where(and(eq(externalAccounts.id, accountId), eq(externalAccounts.mailboxId, id)))
 		.limit(1);
 	if (!existing) return NextResponse.json({ error: "Account not found" }, { status: 404 });
-	await db.delete(externalAccounts).where(and(eq(externalAccounts.id, accountId), eq(externalAccounts.mailboxId, id)));
+	const [removed] = await db.delete(externalAccounts)
+		.where(and(
+			eq(externalAccounts.id, accountId), eq(externalAccounts.mailboxId, id),
+			or(isNull(externalAccounts.pollClaimUntil), lte(externalAccounts.pollClaimUntil, new Date())),
+		))
+		.returning({ id: externalAccounts.id });
+	if (!removed) return NextResponse.json({ error: "Account is being polled; try again shortly" }, { status: 409 });
 	return NextResponse.json({ ok: true });
 }

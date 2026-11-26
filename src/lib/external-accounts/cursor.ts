@@ -55,6 +55,7 @@ function isCursorShape(value: unknown, protocol: ExternalAccountProtocol): boole
 	}
 	if (protocol === "imap") {
 		const cursor = value as Record<string, unknown>;
+		if (entries.length > 0 && (!Object.hasOwn(cursor, "uidValidity") || !Object.hasOwn(cursor, "lastUid"))) return false;
 		const lastUid = cursor.lastUid;
 		if (Array.isArray(cursor.skippedUids) && (typeof lastUid !== "number" || cursor.skippedUids.some((uid) => typeof uid !== "number" || uid > lastUid))) return false;
 	}

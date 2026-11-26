@@ -174,6 +174,8 @@ test("a restore refuses a cursor that is not the protocol's bounded JSON shape",
 		[JSON.stringify({ uidValidity: 0, lastUid: 2 }), undefined],
 		[JSON.stringify({ uidValidity: 1, lastUid: 2 ** 33 }), undefined],
 		[JSON.stringify({ uidValidity: 1, lastUid: 1, skippedUids: [2] }), undefined],
+		[JSON.stringify({ lastUid: 2, skippedUids: [1] }), undefined],
+		[JSON.stringify({ uidValidity: 1 }), undefined],
 		[JSON.stringify({ uidValidity: 1, lastUid: 2, skippedUids: [2, 2] }), undefined],
 		[JSON.stringify({ uidValidity: 1, lastUid: 200, skippedUids: Array(129).fill(2) }), undefined],
 		// A POP3 cursor on an IMAP account, and an IMAP cursor on a POP3 account.

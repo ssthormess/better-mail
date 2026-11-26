@@ -35,7 +35,12 @@ const INSERT_BATCH_SIZE = 50;
  * Serial ids that are never backed up or restored: on PostgreSQL an explicit id does not advance the sequence,
  * so the next insert after a restore would collide. The row's identity is its unique key, not the id.
  */
-const OMITTED_COLUMNS: Partial<Record<DatabaseBackupTable, string[]>> = { dmarc_daily_stats: ["id"], tls_daily_stats: ["id"] };
+const OMITTED_COLUMNS: Partial<Record<DatabaseBackupTable, string[]>> = {
+	dmarc_daily_stats: ["id"],
+	tls_daily_stats: ["id"],
+	// A lease is process coordination, never durable account configuration; restoring it could strand or replay a poll.
+	external_accounts: ["poll_claim_token", "poll_claim_until"],
+};
 
 export function getBackupConfigurationStatus(_env?: CloudflareEnv) {
 	return { configured: true, missing: [] };

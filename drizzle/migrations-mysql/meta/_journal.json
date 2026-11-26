@@ -197,6 +197,13 @@
       "when": 1795027669151,
       "tag": "0035_external_accounts",
       "breakpoints": true
+    },
+    {
+      "idx": 28,
+      "version": "5",
+      "when": 1795713627880,
+      "tag": "0036_external_account_poll_claims",
+      "breakpoints": true
     }
   ]
 }

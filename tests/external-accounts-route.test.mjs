@@ -113,9 +113,10 @@ test("the owner creates an account and reads it back without the password", asyn
 	assert.equal(view.enabled, true);
 	assert.equal(view.lastSyncedAt, null);
 	assert.equal(view.lastError, null);
-	// The credential is never round-tripped, and neither is the poller's private state.
+	assert.deepEqual(view.skippedUids, []);
+	// The credential is never round-tripped, and only bounded skip diagnostics are visible.
 	assert.deepEqual(Object.keys(view).sort(), [
-		"createdAt", "enabled", "host", "id", "lastError", "lastSyncedAt", "passwordSet", "port", "protocol", "tlsMode", "updatedAt", "username",
+		"createdAt", "enabled", "host", "id", "lastError", "lastSyncedAt", "passwordSet", "port", "protocol", "skippedUids", "tlsMode", "updatedAt", "username",
 	]);
 
 	const [row] = f.rows();
@@ -124,17 +125,33 @@ test("the owner creates an account and reads it back without the password", asyn
 	assert.ok(row.password_encrypted !== PASSWORD);
 	assert.ok(!row.password_encrypted.includes(PASSWORD));
 	assert.equal(await decryptSecret({ MAILFLARE_ENCRYPTION_KEY: f.encryptionKey }, row.password_encrypted), PASSWORD);
+	f.sql.prepare("UPDATE external_accounts SET sync_cursor = ?, last_error = ? WHERE id = ?").run(JSON.stringify({ uidValidity: 7, lastUid: 4, skippedUids: [2] }), "Oversized messages skipped; see skippedUids", row.id);
 
 	const listed = await f.list("owner", "m-personal");
 	assert.equal(listed.status, 200);
 	const body = await listed.json();
 	assert.equal(body.accounts.length, 1);
 	assert.equal(body.accounts[0].id, row.id);
+	assert.deepEqual(body.accounts[0].skippedUids, [2]);
+	assert.equal("syncCursor" in body.accounts[0], false);
 	const serialized = JSON.stringify(body);
 	assert.ok(!serialized.includes(PASSWORD));
 	assert.ok(!serialized.includes(row.password_encrypted));
 	assert.equal("password" in body.accounts[0], false);
 	assert.equal("passwordEncrypted" in body.accounts[0], false);
+});
+
+test("source changes reset the cursor and mutations respect the active database lease", async (t) => {
+	const f = await fixture(t);
+	const created = await f.create("owner", "m-personal", valid());
+	const { account } = await created.json();
+	f.sql.prepare("UPDATE external_accounts SET sync_cursor = ?, poll_claim_token = ?, poll_claim_until = ? WHERE id = ?")
+		.run(JSON.stringify({ uidValidity: 3, lastUid: 9 }), "claim", Math.floor(Date.now() / 1000) + 60, account.id);
+	assert.equal((await f.patch("owner", "m-personal", account.id, { host: "other.example.com" })).status, 409);
+	assert.equal((await f.remove("owner", "m-personal", account.id)).status, 409);
+	f.sql.prepare("UPDATE external_accounts SET poll_claim_until = ? WHERE id = ?").run(Math.floor(Date.now() / 1000) - 1, account.id);
+	assert.equal((await f.patch("owner", "m-personal", account.id, { host: "other.example.com" })).status, 200);
+	assert.equal(f.sql.prepare("SELECT sync_cursor FROM external_accounts WHERE id = ?").get(account.id).sync_cursor, null);
 });
 
 test("the same host and username cannot be fetched twice into one mailbox", async (t) => {
@@ -418,4 +435,5 @@ test("external_accounts is backed up, in the accounts group", () => {
 	// leaves rows the poller cannot decrypt, which the operator fixes by re-entering the passwords.
 	assert.ok(list.includes('"external_accounts"'), "BACKUP_TABLES lacks external_accounts");
 	assert.ok(accounts.includes('"external_accounts"'), "the accounts group lacks external_accounts");
+	assert.match(exportSource, /external_accounts: \["poll_claim_token", "poll_claim_until"\]/, "transient claims must not be backed up");
 });

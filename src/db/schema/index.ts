@@ -941,6 +941,9 @@ export const externalAccounts = sqliteTable(
 		 * sync; the backup restore accepts only null or valid JSON within the same bound.
 		 */
 		syncCursor: text("sync_cursor"),
+		/** Cross-process poll lease. These transient claim fields are excluded from backups. */
+		pollClaimToken: text("poll_claim_token"),
+		pollClaimUntil: timestamp("poll_claim_until"),
 		createdAt: timestamp("created_at").notNull().$defaultFn(() => new Date()),
 		updatedAt: timestamp("updated_at").notNull().$defaultFn(() => new Date()),
 	},
@@ -950,6 +953,7 @@ export const externalAccounts = sqliteTable(
 		uniqueIndex("external_accounts_mailbox_host_user_idx").on(t.mailboxId, t.host, t.username),
 		// The future poller scan: enabled accounts, least recently synced first.
 		index("external_accounts_poll_idx").on(t.enabled, t.lastSyncedAt),
+		index("external_accounts_claim_idx").on(t.enabled, t.protocol, t.pollClaimUntil, t.lastSyncedAt),
 		// Owner hint only; see the userId comment above (no foreign key on purpose).
 		index("external_accounts_user_idx").on(t.userId),
 	],

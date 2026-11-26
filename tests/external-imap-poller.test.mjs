@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import test, { after } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { spawn } from "node:child_process";
 import { build } from "esbuild";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -23,8 +24,8 @@ const m = await import(pathToFileURL(join(out, "entry.mjs")));
 const KEY = Buffer.from("0123456789abcdef0123456789abcdef").toString("base64");
 const PASSWORD = "poller-password-secret";
 
-function makeServer({ uidValidity = 77, messages = new Map([[1, "From: sender@outside.test\r\nTo: me@one.test\r\nSubject: imported\r\nMessage-ID: <same@outside.test>\r\nDate: Thu, 19 Nov 2026 10:00:00 +0000\r\nContent-Type: text/plain\r\n\r\nhello\r\n"]]), failAuth = false, pauseFetch = false } = {}) {
- const state = { uidValidity, messages, failAuth, pauseFetch, resumeFetch: null, commands: [], connections: 0 };
+function makeServer({ uidValidity = 77, messages = new Map([[1, "From: sender@outside.test\r\nTo: me@one.test\r\nSubject: imported\r\nMessage-ID: <same@outside.test>\r\nDate: Thu, 19 Nov 2026 10:00:00 +0000\r\nContent-Type: text/plain\r\n\r\nhello\r\n"]]), failAuth = false, pauseFetch = false, pauseExamine = false } = {}) {
+ const state = { uidValidity, messages, failAuth, pauseFetch, pauseExamine, resumeFetch: null, commands: [], connections: 0 };
  const server = createServer(socket => {
   state.connections++;
   socket.on("error", () => {}); // Oversized bodies intentionally close the client before the server writes the literal.
@@ -36,13 +37,17 @@ function makeServer({ uidValidity = 77, messages = new Map([[1, "From: sender@ou
     const line = buffer.slice(0, end); buffer = buffer.slice(end + 2);
     const [tag, ...parts] = line.split(" "); const command = parts.join(" "); state.commands.push(command);
     if (command.startsWith("LOGIN") && state.failAuth) socket.write(`${tag} NO [AUTHENTICATIONFAILED] leaked server payload ${PASSWORD}\r\n`);
-    else if (command.startsWith("EXAMINE")) socket.write(`* 2 EXPUNGE\r\n* OK [UIDVALIDITY ${state.uidValidity}] valid\r\n${tag} OK examined\r\n`);
+    else if (command.startsWith("EXAMINE")) {
+     const reply = () => socket.write(`* 2 EXPUNGE\r\n* OK [UIDVALIDITY ${state.uidValidity}] valid\r\n* OK [UIDNEXT ${Math.max(0, ...state.messages.keys()) + 1}] next\r\n${tag} OK examined\r\n`);
+     if (state.pauseExamine) setTimeout(reply, 500); else reply();
+    }
     else if (command.startsWith("UID SEARCH")) {
-     const start = Number(command.match(/UID (\d+):\*/)?.[1] ?? 1);
-     const uids = [...state.messages.keys()].filter(uid => uid >= start).sort((a, b) => a - b);
+     const [start, end] = command.match(/UID (\d+):(\d+)/)?.slice(1).map(Number) ?? [1, 0xffff_ffff];
+     const uids = [...state.messages.keys()].filter(uid => uid >= start && uid <= end).sort((a, b) => a - b);
      socket.write(`* SEARCH ${uids.join(" ")}\r\n${tag} OK searched\r\n`);
     } else if (command.startsWith("UID FETCH")) {
      const uid = Number(command.match(/UID FETCH (\d+)/)?.[1]); const raw = Buffer.from(state.messages.get(uid));
+     if (command.includes("RFC822.SIZE")) { socket.write(`* 1 FETCH (UID ${uid} RFC822.SIZE ${raw.length})\r\n${tag} OK size\r\n`); continue; }
      const reply = () => socket.write(Buffer.concat([Buffer.from(`* 1 FETCH (UID ${uid} BODY[] {${raw.length}}\r\n`), raw, Buffer.from(`)\r\n${tag} OK fetched\r\n`)]));
      if (state.pauseFetch) state.resumeFetch = reply; else reply();
     } else socket.write(`${tag} OK done\r\n`);
@@ -54,7 +59,7 @@ function makeServer({ uidValidity = 77, messages = new Map([[1, "From: sender@ou
 
 async function fixture(t, options = {}) {
  const server = await makeServer(options); t.after(() => server.server.close());
- const database = new m.SqliteDatabase(":memory:"); t.after(() => database.db.close());
+ const database = new m.SqliteDatabase(options.databasePath ?? ":memory:"); t.after(() => database.db.close());
  await m.applyMigrations(database, join(root, "drizzle/migrations"));
  const sql = database.db;
  sql.exec(`
@@ -97,6 +102,26 @@ test("poll fetches, processes through the canonical inbound consumer and persist
  assert.equal(f.sql.prepare("SELECT count(*) AS n FROM auto_reply_deliveries").get().n, 0);
 });
 
+test("historical intake stores calendar mail without creating invites/reminders or spam reputation observations", async t => {
+ muteInboundLogs(t);
+ const message = [
+  "From: organizer@outside.test", "To: me@one.test", "Subject: old invite", "Message-ID: <old-invite@outside.test>",
+  'MIME-Version: 1.0', 'Content-Type: multipart/mixed; boundary="calendar-boundary"', "", "--calendar-boundary",
+  "Content-Type: text/plain; charset=utf-8", "", "Please join this old meeting.", "--calendar-boundary",
+  'Content-Type: text/calendar; method=REQUEST; name="invite.ics"', 'Content-Disposition: attachment; filename="invite.ics"', "",
+  "BEGIN:VCALENDAR", "VERSION:2.0", "METHOD:REQUEST", "BEGIN:VEVENT", "UID:old-invite@example.test",
+  "DTSTART:20261104T170000Z", "DTEND:20261104T180000Z", "SUMMARY:Old meeting",
+  "ORGANIZER:mailto:organizer@outside.test", "ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:me@one.test", "BEGIN:VALARM",
+  "TRIGGER:-PT15M", "ACTION:DISPLAY", "DESCRIPTION:Old meeting", "END:VALARM", "END:VEVENT", "END:VCALENDAR",
+  "--calendar-boundary--", "",
+ ].join("\r\n");
+ const f = await fixture(t, { messages: new Map([[1, message]]) }); await f.poll(new Date());
+ assert.equal(f.sql.prepare("SELECT count(*) AS n FROM messages").get().n, 1);
+ assert.equal(f.sql.prepare("SELECT count(*) AS n FROM calendar_events").get().n, 0);
+ assert.equal(f.sql.prepare("SELECT count(*) AS n FROM spam_reputation").get().n, 0);
+ assert.equal(f.effects.realtime, 0); assert.equal(f.effects.autoReply, 0); assert.equal(f.effects.webhook, 0);
+});
+
 test("a permanently oversized UID is recorded and skipped without blocking later messages", async t => {
  muteInboundLogs(t);
  const small1 = "From: a@outside.test\r\nTo: me@one.test\r\nSubject: before\r\nMessage-ID: <before@outside.test>\r\n\r\nsmall\r\n";
@@ -104,22 +129,23 @@ test("a permanently oversized UID is recorded and skipped without blocking later
  const messages = new Map([[1, small1], [2, Buffer.alloc(5 * 1024 * 1024 + 1, 0x61)], [3, small3]]);
  const f = await fixture(t, { messages }); const at = new Date(); await f.poll(at);
  const firstSubjects = f.sql.prepare("SELECT subject FROM messages ORDER BY subject").all().map(row => row.subject);
- assert.deepEqual(firstSubjects, ["before"], "UID 1 was stored before the oversized UID and UID 2 was skipped");
+ assert.deepEqual(firstSubjects, ["after", "before"], "valid messages were stored and UID 2 was skipped in sequence");
  const firstState = f.sql.prepare("SELECT sync_cursor, last_error FROM external_accounts").get();
- assert.deepEqual(JSON.parse(firstState.sync_cursor), { uidValidity: 77, lastUid: 2, skippedUids: [2] });
+ assert.deepEqual(JSON.parse(firstState.sync_cursor), { uidValidity: 77, lastUid: 3, skippedUids: [2] });
  assert.match(firstState.last_error, /oversized messages skipped/i);
  await f.poll(new Date(at.getTime() + 61_000));
  const subjects = f.sql.prepare("SELECT subject FROM messages ORDER BY subject").all().map(row => row.subject);
  assert.deepEqual(subjects, ["after", "before"], "the next poll continued at UID 3 instead of retrying UID 2");
  const state = f.sql.prepare("SELECT sync_cursor, last_error FROM external_accounts").get();
  assert.deepEqual(JSON.parse(state.sync_cursor), { uidValidity: 77, lastUid: 3, skippedUids: [2] });
- assert.equal(state.last_error, null);
+ assert.match(state.last_error, /oversized messages skipped/i);
 });
 
 test("a crash after canonical store but before cursor commit is idempotent on retry", async t => {
  muteInboundLogs(t); const f = await fixture(t); const originalPrepare = f.database.prepare.bind(f.database); let fail = true;
  f.database.prepare = sql => {
-  if (fail && /^\s*UPDATE\s+["`]?external_accounts/i.test(sql)) { fail = false; throw new Error(`simulated commit failure; ${PASSWORD}`); }
+  const setClause = sql.match(/update\s+["`]?external_accounts["`]?\s+set([\s\S]*?)\s+where/i)?.[1] ?? "";
+  if (fail && /["`]?sync_cursor["`]?\s*=/i.test(setClause)) { fail = false; throw new Error(`simulated commit failure; ${PASSWORD}`); }
   return originalPrepare(sql);
  };
  const at = new Date(); await f.poll(at);
@@ -135,7 +161,7 @@ test("a crash after canonical store but before cursor commit is idempotent on re
 test("UIDVALIDITY reset re-fetches old UIDs but mailbox-scoped raw hash deduplicates stored mail", async t => {
  muteInboundLogs(t); const first = await fixture(t); const at = new Date(); await first.poll(at);
  first.server.state.uidValidity = 78; await first.poll(new Date(at.getTime() + 61_000));
- assert.ok(first.server.state.commands.includes("UID SEARCH UID 1:*"));
+ assert.ok(first.server.state.commands.includes("UID SEARCH UID 1:1"));
  assert.equal(first.sql.prepare("SELECT count(*) AS n FROM messages").get().n, 1);
  assert.deepEqual(JSON.parse(first.sql.prepare("SELECT sync_cursor FROM external_accounts").get().sync_cursor), { uidValidity: 78, lastUid: 1 });
 });
@@ -168,6 +194,23 @@ test("overlapping scheduler ticks are skipped across a slow in-flight poll", asy
  assert.equal(f.server.state.connections, 1);
  f.server.state.resumeFetch();
  await first;
+});
+
+test("two independent Node processes acquire only one database-backed account lease", async t => {
+ const databasePath = join(out, "claim-fence.db");
+ const f = await fixture(t, { databasePath, messages: new Map(), pauseExamine: true });
+ const bundleUrl = pathToFileURL(join(out, "entry.mjs")).href;
+ const runChild = () => new Promise((resolve, reject) => {
+  const source = `const m=await import(${JSON.stringify(bundleUrl)});const db=new m.SqliteDatabase(process.env.TEST_DB);const env={DB:db,MAILFLARE_RUNTIME:"node",EXTERNAL_FETCH_ALLOW_PRIVATE:"1",MAILFLARE_ENCRYPTION_KEY:process.env.TEST_KEY,BUCKET:{}};try{console.log(JSON.stringify(await m.pollExternalImapAccounts(env)));}catch(e){console.error(e.message);process.exitCode=1}finally{db.db.close()}`;
+  const child = spawn(process.execPath, ["--input-type=module", "-e", source], { env: { ...process.env, TEST_DB: databasePath, TEST_KEY: KEY }, stdio: ["ignore", "pipe", "pipe"] });
+  let stdout = ""; let stderr = ""; child.stdout.on("data", chunk => { stdout += chunk; }); child.stderr.on("data", chunk => { stderr += chunk; });
+  child.once("error", reject); child.once("exit", code => code === 0 ? resolve(JSON.parse(stdout.trim())) : reject(new Error(stderr || `child exited ${code}`)));
+ });
+ const results = await Promise.all([runChild(), runChild()]);
+ assert.deepEqual(results.map(result => result.accounts).sort(), [0, 1]);
+ assert.equal(f.server.state.connections, 1);
+ const row = f.sql.prepare("SELECT poll_claim_token, poll_claim_until FROM external_accounts").get();
+ assert.equal(row.poll_claim_token, null); assert.equal(row.poll_claim_until, null);
 });
 
 test("workerd runtime is explicitly gated from the Node TCP poller", async t => {

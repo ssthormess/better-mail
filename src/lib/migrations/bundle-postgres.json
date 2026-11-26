@@ -563,6 +563,14 @@
         "CREATE INDEX \"external_accounts_poll_idx\" ON \"external_accounts\" USING btree (\"enabled\",\"last_synced_at\");",
         "CREATE INDEX \"external_accounts_user_idx\" ON \"external_accounts\" USING btree (\"user_id\");"
       ]
+    },
+    {
+      "name": "0036_external_account_poll_claims.sql",
+      "statements": [
+        "ALTER TABLE \"external_accounts\" ADD COLUMN \"poll_claim_token\" text;",
+        "ALTER TABLE \"external_accounts\" ADD COLUMN \"poll_claim_until\" bigint;",
+        "CREATE INDEX \"external_accounts_claim_idx\" ON \"external_accounts\" USING btree (\"enabled\",\"protocol\",\"poll_claim_until\",\"last_synced_at\");"
+      ]
     }
   ]
 }
