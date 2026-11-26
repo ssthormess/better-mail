@@ -568,7 +568,12 @@ export const messageAttachments = sqliteTable(
 			.notNull()
 			.$defaultFn(() => new Date()),
 	},
-	(t) => [index("message_attachments_message_idx").on(t.messageId)],
+	(t) => [
+		index("message_attachments_message_idx").on(t.messageId),
+		// The extraction sweep reads the oldest rows still at "none" (attachment-sweep.ts), so this index
+		// answers both halves of that query (the status filter and the createdAt order) in one seek.
+		index("message_attachments_extract_status_idx").on(t.extractStatus, t.createdAt),
+	],
 );
 
 export const sharedAttachmentLinks = sqliteTable("shared_attachment_links", {

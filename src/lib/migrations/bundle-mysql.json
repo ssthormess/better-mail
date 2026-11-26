@@ -519,6 +519,12 @@
         "ALTER TABLE `message_attachments` ADD `extract_status` varchar(64) NOT NULL DEFAULT 'none';",
         "ALTER TABLE `message_attachments` ADD `extracted_at` bigint;"
       ]
+    },
+    {
+      "name": "0033_attachment_extract_status_idx.sql",
+      "statements": [
+        "CREATE INDEX `message_attachments_extract_status_idx` ON `message_attachments` (`extract_status`,`created_at`);"
+      ]
     }
   ]
 }

@@ -6,6 +6,7 @@ import { runCalendarReminders } from "@/lib/calendar/reminders";
 import { runDavChangeRetention } from "@/lib/dav/changes";
 import { runDeliverabilityDaily } from "@/lib/deliverability/daily";
 import { runDriveTrashRetention } from "@/lib/drive/retention";
+import { sweepAttachmentExtraction } from "@/lib/email/attachment-sweep";
 import { sweepOrphanedRawMail } from "@/lib/email/raw-sweeper";
 import { runTrashRetention } from "@/lib/email/trash-retention";
 import { runFollowUpReminders } from "@/lib/follow-ups/service";
@@ -31,6 +32,8 @@ export function frequentJobs(env: CloudflareEnv, now: Date): ScheduledJob[] {
 		{ name: "Calendar reminders", run: () => runCalendarReminders(env, now) },
 		// Its daily row budget assumes one run per five minutes.
 		{ name: "Promotions backfill", run: () => runPromotionsBackfill(env, now), everyFiveMinutes: true },
+		// Attachment text is only ever extracted off a request path, so this job is the enricher (F52).
+		{ name: "Attachment extraction sweep", run: () => sweepAttachmentExtraction(env), everyFiveMinutes: true },
 		{ name: "Import job sweep", run: () => sweepImportJobs(env, now) },
 		{ name: "Undo claim prune", run: () => pruneExpiredMessageActionUndoClaims(env, now) },
 		// Takes a small slice per run (one collection, 90 rows), so it runs on every tick.

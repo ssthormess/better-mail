@@ -197,6 +197,13 @@
       "when": 1795677354871,
       "tag": "0032_attachment_extraction",
       "breakpoints": true
+    },
+    {
+      "idx": 28,
+      "version": "5",
+      "when": 1795763754871,
+      "tag": "0033_attachment_extract_status_idx",
+      "breakpoints": true
     }
   ]
 }

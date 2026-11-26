@@ -561,6 +561,12 @@
         "ALTER TABLE \"message_attachments\" ADD COLUMN \"extract_status\" text DEFAULT 'none' NOT NULL;",
         "ALTER TABLE \"message_attachments\" ADD COLUMN \"extracted_at\" bigint;"
       ]
+    },
+    {
+      "name": "0033_attachment_extract_status_idx.sql",
+      "statements": [
+        "CREATE INDEX \"message_attachments_extract_status_idx\" ON \"message_attachments\" USING btree (\"extract_status\",\"created_at\");"
+      ]
     }
   ]
 }

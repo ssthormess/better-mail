@@ -666,6 +666,13 @@
       "when": 1795677354871,
       "tag": "0108_attachment_extraction",
       "breakpoints": true
+    },
+    {
+      "idx": 96,
+      "version": "6",
+      "when": 1795763754871,
+      "tag": "0109_attachment_search_index",
+      "breakpoints": true
     }
   ]
 }

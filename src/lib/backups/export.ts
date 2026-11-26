@@ -27,11 +27,13 @@ export function getBackupConfigurationStatus(_env?: CloudflareEnv) {
 /**
  * Tables D1 manages itself, which are intentionally absent from BACKUP_TABLES.
  */
-export const INTERNAL_TABLE_PATTERNS = ["sqlite_%", "_cf%", "messages_fts%"];
+export const INTERNAL_TABLE_PATTERNS = ["sqlite_%", "_cf%", "messages_fts%", "attachments_fts%"];
 const matchesPattern = (name: string, pattern: string) => name.startsWith(pattern.replace(/%$/, ""));
 /**
- * The search index is derived data: its triggers repopulate it as messages are
- * restored, so it is neither exported nor part of the coverage check.
+ * The search indexes are derived data: their triggers repopulate them as messages
+ * and attachments are restored (a database filled from a backup that predates the
+ * index needs one `rebuild`, see src/lib/search/index-admin.ts), so they are neither
+ * exported nor part of the coverage check.
  */
 export const INTERNAL_TABLES = [
 	"d1_migrations",

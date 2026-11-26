@@ -28,6 +28,12 @@ const { exportDatabaseRecords, restoreDatabaseRecords } = await import(pathToFil
 const { migrations } = JSON.parse(readFileSync(join(root, "src/lib/migrations/bundle.json"), "utf8"));
 
 const EXTRACTION_MIGRATION = "0108_attachment_extraction.sql";
+/**
+ * A database that stopped before the extraction migration. Later migrations are
+ * unapplied with it — they are applied in name order, and 0109 indexes the columns
+ * 0108 adds.
+ */
+const notAppliedBeforeExtraction = (name) => name >= EXTRACTION_MIGRATION;
 
 function d1(sqlite) {
 	const prepare = (sql) => {
@@ -61,7 +67,7 @@ function d1(sqlite) {
 function database({ beforeExtraction = false } = {}) {
 	const sqlite = new Database(":memory:");
 	sqlite.pragma("foreign_keys = ON");
-	for (const migration of migrations.filter((candidate) => !(beforeExtraction && candidate.name === EXTRACTION_MIGRATION))) {
+	for (const migration of migrations.filter((candidate) => !(beforeExtraction && notAppliedBeforeExtraction(candidate.name)))) {
 		for (const statement of migration.statements) sqlite.exec(statement);
 	}
 	return sqlite;

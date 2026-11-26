@@ -246,7 +246,7 @@ Removing the last passkey (`DELETE /api/settings/passkeys/:id`) is allowed when 
 | `is:unread`, `is:read`, `is:starred` | flags |
 | `after:2026-09-01`, `before:2026-09-30` | date bounds (midnight in the account's time zone, or the `X-Time-Zone` header when none is saved; `before` exclusive) |
 
-Terms combine with AND. Admins can check or rebuild the index with `GET` / `POST /api/admin/search-index`; triggers keep it current, so a rebuild is only needed after restoring a backup made before the index existed.
+Terms combine with AND. On SQLite, the free text of a query also matches the extracted text of a message's attachments (text files and PDFs), so `invoice` finds a message whose PDF says invoice even when the body does not; `from:`, `to:` and `subject:` still apply to the message itself, and `-word` excludes a message that mentions the word in an attachment too. Attachment text is only searchable once the scheduled extraction has read the file, which happens within minutes of arrival on the 5-minute cron and never on a request. Admins can check or rebuild the indexes with `GET` / `POST /api/admin/search-index`; triggers keep them current, so a rebuild is only needed after restoring a backup made before an index existed.
 
 ## Real-time updates
 
