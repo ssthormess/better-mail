@@ -52,9 +52,13 @@ async function fixture(t) {
 	globalThis.__mailflareNodeEnv = env;
 	t.after(() => { delete globalThis.__mailflareNodeEnv; });
 	let n = 0;
-	const deliverRaw = async (raw, payloadHeaders) => {
+	const storeRaw = async (raw) => {
 		const key = `raw/${++n}`;
 		objects.set(key, new TextEncoder().encode(raw).buffer);
+		return key;
+	};
+	const deliverRaw = async (raw, payloadHeaders) => {
+		const key = await storeRaw(raw);
 		await m.processInboundMessage(env, { from: "bounce@x.test", to: "me@one.test", rawR2Key: key, headers: payloadHeaders });
 		return key;
 	};
@@ -65,7 +69,7 @@ async function fixture(t) {
 	// Realtime hub stand-in: every body POSTed to a user's hub, in order.
 	const sent = [];
 	env.REALTIME = { getByName: (user) => ({ fetch: async (_url, init) => { sent.push({ user, body: JSON.parse(init.body) }); return new Response(null, { status: 204 }); } }) };
-	return { deliver, deliverRaw, raw: database.db, database, sent };
+	return { deliver, deliverRaw, storeRaw, raw: database.db, database, env, sent };
 }
 
 test("intake stores the category and sender address of bulk mail", async (t) => {
@@ -121,6 +125,38 @@ test("an ordinary contact dependency error named timeout preserves normal mail a
 	assert.equal(injected, true, `the contact lookup failure was exercised: ${JSON.stringify(contactQueries)}`);
 	assert.equal(raw.prepare("SELECT count(*) AS n FROM messages WHERE raw_r2_key = ?").get(key).n, 1);
 	assert.equal(raw.prepare("SELECT count(*) AS n FROM calendar_events").get().n, 1);
+});
+
+test("concurrent normal duplicate deliveries emit notification effects only for the completion-transition winner", async (t) => {
+	const { storeRaw, raw, database, env, sent } = await fixture(t);
+	t.mock.method(console, "info", () => {});
+	const originalPrepare = database.prepare.bind(database);
+	let dedupReads = 0;
+	const preparedQueries = [];
+	let releaseReaders;
+	const bothReaders = new Promise((resolve) => { releaseReaders = resolve; });
+	const wrap = (statement, query) => new Proxy(statement, { get(target, property) {
+		if (property === "all" || property === "first" || property === "raw") return async (...args) => {
+			const rows = await target[property](...args);
+			if (/select[\s\S]+from ["`]?messages["`]?/i.test(query) && /raw_r2_key/.test(query)) {
+				dedupReads++;
+				if (dedupReads === 2) releaseReaders();
+				await bothReaders;
+			}
+			return rows;
+		};
+		const value = Reflect.get(target, property, target);
+		if (property === "bind" && typeof value === "function") return (...args) => wrap(value.apply(target, args), query);
+		return typeof value === "function" ? value.bind(target) : value;
+	} });
+	database.prepare = query => { preparedQueries.push(query); return wrap(originalPrepare(query), query); };
+	const key = await storeRaw(mime("friend@outside.test"));
+	const payload = { from: "bounce@outside.test", to: "me@one.test", rawR2Key: key };
+	await Promise.all([m.processInboundMessage(env, payload), m.processInboundMessage(env, payload)]);
+	database.prepare = originalPrepare;
+	assert.equal(dedupReads, 2, `both calls passed the pre-insert duplicate lookup together: ${JSON.stringify(preparedQueries.filter(query => /messages/i.test(query)))}`);
+	assert.equal(raw.prepare("SELECT count(*) AS n FROM messages WHERE raw_r2_key = ? AND intake_complete = 1").get(key).n, 1);
+	assert.equal(sent.filter((entry) => entry.body.type === "new_message").length, 1);
 });
 
 test("a sender override and a correspondent contact keep mail in Inbox", async (t) => {

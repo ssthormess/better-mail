@@ -256,6 +256,7 @@ export async function processInboundMessage(
 	assertBeforeDeadline();
 
 	let insertedNewRow = false;
+	let effectsWinner = false;
 	try {
 		assertBeforeDeadline();
 		const inserted = await awaitOperation(db.insert(messages).values({
@@ -294,28 +295,38 @@ export async function processInboundMessage(
 		// Attachment IDs and object keys are deterministic for this message. If a timed-out attempt is still
 		// finishing, a retry can safely repeat the same writes without duplicating or deleting its objects.
 		await awaitOperation(storeMessageAttachments(env, messageId, parsed.attachments, { retrySafe: true }), options.deadlineAt);
-		if (!historicalImport && status !== "spam" && status !== "trash") {
-			await registerInboundInvite(env, { userId: decision.mailbox.userId, mailboxId: decision.mailbox.mailboxId, messageId, senderAddress: fromAddr, attachments: parsed.attachments });
-		}
-		await awaitOperation(db.update(messages).set({ intakeComplete: true }).where(eq(messages.id, messageId)), options.deadlineAt);
-		if (spamAnalysis && !historicalImport && inserted.length > 0) {
-			try {
-				await recordReputationObservation(env, decision.mailbox.mailboxId, getReputationKeys(parsed, spamAnalysis.fingerprint));
-			} catch (error) {
-				console.error(`Spam reputation observation failed for ${messageId}`, error);
-			}
-			console.info(JSON.stringify({
-				messageId,
-				spamScore: spamAnalysis.score,
-				verdict: spamAnalysis.verdict,
-				signals: spamAnalysis.signals.map((signal) => signal.id),
-			}));
-		}
+		const [completed] = await awaitOperation(db.update(messages).set({ intakeComplete: true }).where(and(
+			eq(messages.id, messageId),
+			eq(messages.intakeComplete, false),
+		)).returning({ id: messages.id }), options.deadlineAt);
+		effectsWinner = !!completed;
+
 	} catch (error) {
 		// A deadline cannot cancel an already-submitted insert or attachment write. Leave the row explicitly
 		// incomplete so replay repairs it; only roll back an insert on a real, observed dependency failure.
-		if (!isInboundDeadlineExceeded(error) && insertedNewRow) await awaitOperation(db.delete(messages).where(eq(messages.id, messageId)), options.deadlineAt);
+		if (!isInboundDeadlineExceeded(error) && insertedNewRow) {
+			await awaitOperation(db.delete(messages).where(and(eq(messages.id, messageId), eq(messages.intakeComplete, false))), options.deadlineAt);
+		}
 		throw error;
+	}
+	// The false-to-true completion transition is the durable at-most-once claim for normal downstream effects.
+	// Historical retries still repair the write set, but only one concurrent/replay caller may emit effects.
+	if (!effectsWinner) return;
+	if (!historicalImport && status !== "spam" && status !== "trash") {
+		await registerInboundInvite(env, { userId: decision.mailbox.userId, mailboxId: decision.mailbox.mailboxId, messageId, senderAddress: fromAddr, attachments: parsed.attachments });
+	}
+	if (spamAnalysis && !historicalImport) {
+		try {
+			await recordReputationObservation(env, decision.mailbox.mailboxId, getReputationKeys(parsed, spamAnalysis.fingerprint));
+		} catch (error) {
+			console.error(`Spam reputation observation failed for ${messageId}`, error);
+		}
+		console.info(JSON.stringify({
+			messageId,
+			spamScore: spamAnalysis.score,
+			verdict: spamAnalysis.verdict,
+			signals: spamAnalysis.signals.map((signal) => signal.id),
+		}));
 	}
 
 	// A returned message is still delivered to the mailbox; recording its failed recipients is best effort.

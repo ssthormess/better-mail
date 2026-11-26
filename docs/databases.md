@@ -58,6 +58,8 @@ Migrations are plain SQL, one directory per dialect, applied by the same code ev
 
 PostgreSQL and MySQL start from a single baseline generated from the current schema (`0000_baseline.sql`), followed by `0001_triggers_and_seeds.sql` for what drizzle-kit cannot generate (seed rows and triggers). SQLite keeps its full history.
 
+MySQL commits DDL independently from its migration ledger. The runner schema-verifies additive-column migrations before applying them and after DDL errors, so a concurrent initializer or restart can adopt a committed `ADD COLUMN` only when the column's type, nullability and default match. Migration 0036 also verifies nullable/signed claim columns and the non-unique claim index; an unknown shape fails closed without ledgering. This uses MySQL's metadata-lock serialization plus a fresh schema read rather than a named lock: the pooled executor may run successive queries on different connections. If a concurrent `ALTER` wins, the losing initializer re-reads and accepts only the complete expected shape.
+
 Changing the schema (`src/db/schema/index.ts`) means generating a migration for each dialect:
 
 ```bash
