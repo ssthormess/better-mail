@@ -194,8 +194,10 @@ and the DNS page shows what to set by hand.
 - **Logs.** `docker compose logs -f mailflare`.
 - **Queues.** Jobs are held in memory and are not re-queued after a restart.
   Inbound mail is written to the volume before it is queued, but a message
-  whose job is lost stays unparsed, and the nightly clean-up removes raw
-  inbound files that no message references after 24 hours. Scheduled and
+  whose job is lost stays unparsed. The nightly clean-up scans a bounded,
+  persisted key-ordered cursor and removes unreferenced raw inbound files once
+  they are at least 24 hours old; large backlogs may take multiple nightly passes.
+  Scheduled and
   undo-send mail that has not been sent when the container restarts is not
   sent automatically.
 

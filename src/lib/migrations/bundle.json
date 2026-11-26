@@ -1009,6 +1009,12 @@
       "statements": [
         "ALTER TABLE `messages` ADD `intake_complete` integer DEFAULT true NOT NULL;"
       ]
+    },
+    {
+      "name": "0114_raw_mail_sweep_cursor.sql",
+      "statements": [
+        "ALTER TABLE `app_settings` ADD `raw_mail_sweep_cursor` text;"
+      ]
     }
   ]
 }

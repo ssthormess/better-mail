@@ -1644,6 +1644,8 @@ export const appSettings = sqliteTable("app_settings", {
 	resendEventsWebhookSecret: text("resend_events_webhook_secret"),
 	/** JSON: the SNS topic, URL token and SES identities that feed bounces and complaints (see src/lib/deliverability/ses-feed.ts). */
 	sesFeedback: text("ses_feedback"),
+	/** Continuation token for the bounded inbound-raw orphan sweep. */
+	rawMailSweepCursor: text("raw_mail_sweep_cursor"),
 	updatedAt: timestamp("updated_at")
 		.notNull()
 		.$defaultFn(() => new Date()),

@@ -1,0 +1,1 @@
+ALTER TABLE "app_settings" ADD COLUMN "raw_mail_sweep_cursor" text;

@@ -1,0 +1,1 @@
+ALTER TABLE `app_settings` ADD `raw_mail_sweep_cursor` longtext;

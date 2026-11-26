@@ -1,6 +1,6 @@
-import { inArray } from "drizzle-orm";
+import { and, eq, inArray, isNull } from "drizzle-orm";
 import { getDb } from "@/db";
-import { messages } from "@/db/schema";
+import { appSettings, messages } from "@/db/schema";
 import { INBOUND_SIGNATURE_MAX_AGE_SECONDS } from "@/lib/email/intake-signature";
 import { SNS_MAX_AGE_MS } from "@/lib/aws/sns-signature";
 import { UPLOAD_PREFIX } from "@/lib/jmap/blobs";
@@ -27,19 +27,37 @@ const STALE_PREFIXES: Array<{ prefix: string; maxAgeMs: number }> = [
 ];
 /** D1 allows 100 bound parameters per statement. */
 const LOOKUP_BATCH = 50;
+const SWEEP_CURSOR_SETTINGS_ID = "default";
+
+async function readSweepCursor(db: ReturnType<typeof getDb>): Promise<string | null> {
+	await db.insert(appSettings).values({ id: SWEEP_CURSOR_SETTINGS_ID }).onConflictDoNothing();
+	const [settings] = await db.select({ cursor: appSettings.rawMailSweepCursor }).from(appSettings)
+		.where(eq(appSettings.id, SWEEP_CURSOR_SETTINGS_ID)).limit(1);
+	return settings?.cursor ?? null;
+}
+
+async function advanceSweepCursor(db: ReturnType<typeof getDb>, previous: string | null, next: string | null): Promise<boolean> {
+	const previousMatch = previous === null ? isNull(appSettings.rawMailSweepCursor) : eq(appSettings.rawMailSweepCursor, previous);
+	const [updated] = await db.update(appSettings).set({ rawMailSweepCursor: next })
+		.where(and(eq(appSettings.id, SWEEP_CURSOR_SETTINGS_ID), previousMatch))
+		.returning({ id: appSettings.id });
+	return !!updated;
+}
 
 /**
  * Deletes raw MIME under `inbound/` that no stored message refers to and that is old enough
- * that its queue message is long finished. This catches what the early-return cleanup in
- * `processInboundMessage` cannot: messages dropped after their final failed retry and
- * mail accepted for addresses that never resolved to a mailbox. Afterwards it removes stale relay/SNS dedupe objects and old JMAP uploads.
+ * that its queue message is long finished. Its bounded listing cursor is persisted after each page,
+ * so successive invocations cover the key-sorted bucket and wrap to the start when a pass completes.
+ * New keys sorting before a saved cursor wait for the next pass. Afterwards it removes stale relay/SNS
+ * dedupe objects and old JMAP uploads.
  */
 export async function sweepOrphanedRawMail(env: CloudflareEnv, now = new Date()): Promise<number> {
 	const db = getDb(env);
 	let removed = 0;
-	let cursor: string | undefined;
+	let cursor = await readSweepCursor(db);
 	for (let page = 0; page < MAX_PAGES; page += 1) {
-		const listing = await env.BUCKET.list({ prefix: PREFIX, cursor, limit: PAGE });
+		const previousCursor = cursor;
+		const listing = await env.BUCKET.list({ prefix: PREFIX, ...(cursor ? { cursor } : {}), limit: PAGE });
 		const old = listing.objects.filter((object) => now.getTime() - object.uploaded.getTime() > MIN_AGE_MS).map((object) => object.key);
 		const orphans: string[] = [];
 		for (let index = 0; index < old.length; index += LOOKUP_BATCH) {
@@ -52,8 +70,12 @@ export async function sweepOrphanedRawMail(env: CloudflareEnv, now = new Date())
 			await env.BUCKET.delete(orphans);
 			removed += orphans.length;
 		}
-		if (!listing.truncated || !listing.cursor) break;
-		cursor = listing.cursor;
+		if (listing.truncated && !listing.cursor) throw new Error("Raw mail listing was truncated without a continuation cursor");
+		const nextCursor = listing.truncated ? listing.cursor! : null;
+		if (listing.truncated && nextCursor === previousCursor) throw new Error("Raw mail listing did not advance its continuation cursor");
+		if (nextCursor !== previousCursor && !await advanceSweepCursor(db, previousCursor, nextCursor)) break;
+		cursor = nextCursor;
+		if (!listing.truncated) break;
 	}
 	// After the main sweep, so a backlog under these prefixes cannot use up its request budget.
 	for (const { prefix, maxAgeMs } of STALE_PREFIXES) {

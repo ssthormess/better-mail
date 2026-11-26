@@ -532,6 +532,12 @@
       "statements": [
         "ALTER TABLE `messages` ADD `intake_complete` boolean DEFAULT true NOT NULL;"
       ]
+    },
+    {
+      "name": "0038_raw_mail_sweep_cursor.sql",
+      "statements": [
+        "ALTER TABLE `app_settings` ADD `raw_mail_sweep_cursor` longtext;"
+      ]
     }
   ]
 }
