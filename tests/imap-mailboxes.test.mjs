@@ -704,7 +704,7 @@ test("the write slice is APPEND and MOVE only", async () => {
 	const { client } = messageWriteBackend();
 	const inbox = await runOn(client, "A SELECT INBOX");
 	// Capability is how a client knows MOVE is there (RFC 6851 §3.1) and how big an APPEND it may send (RFC 7889).
-	assert.match((await run("A CAPABILITY")).response, /^\* CAPABILITY IMAP4rev1 MOVE ID APPENDLIMIT=10485760\r\n/);
+	assert.match((await run("A CAPABILITY")).response, /^\* CAPABILITY IMAP4rev1 MOVE IDLE ID APPENDLIMIT=10485760\r\n/);
 	for (const line of ["B STORE 1 +FLAGS (\\Seen)", "C UID STORE 1 +FLAGS (\\Seen)", "D COPY 1 Receipts", "E UID COPY 1 Receipts", "F EXPUNGE", "G UID EXPUNGE 1"]) {
 		assert.equal((await runOn(client, line, inbox)).response, `${line.split(" ")[0]} NO Not implemented yet\r\n`, line);
 	}

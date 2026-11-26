@@ -289,7 +289,7 @@ test("CAPABILITY advertises the APPEND limit before a client sends anything", as
 	const answer = await client.waitFor("G1 OK CAPABILITY completed\r\n");
 	// RFC 7889: the numeric APPENDLIMIT in CAPABILITY is the limit for every mailbox, so a client can size the
 	// message before it opens a literal. 10485760 is LIMITS.maxSizeUpload, the same number JMAP uploads allow.
-	assert.match(answer, /^\* CAPABILITY IMAP4rev1 MOVE ID APPENDLIMIT=10485760\r\nG1 OK CAPABILITY completed\r\n$/);
+	assert.match(answer, /^\* CAPABILITY IMAP4rev1 MOVE IDLE ID APPENDLIMIT=10485760\r\nG1 OK CAPABILITY completed\r\n$/);
 	client.socket.destroy();
 	await client.closed;
 });

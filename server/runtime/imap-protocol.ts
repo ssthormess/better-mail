@@ -121,11 +121,30 @@ export type ImapMailboxBackend = {
 	move(source: ImapMailboxEntry, messageIds: string[], destination: ImapMailboxEntry): Promise<ImapMoveOutcome>;
 };
 
+/**
+ * What an accepted IDLE hands the socket layer: the tag its eventual `OK Idle terminated` answers, the mailbox
+ * whose counts are re-read, and the count at the moment `+ idling` was written. The protocol module keeps no
+ * timers — polling and the re-arm window belong beside the socket they write to.
+ */
+export type ImapIdleStart = {
+	tag: string;
+	entry: ImapMailboxEntry;
+	/** MESSAGES at `+ idling`, the baseline the first poll compares against. */
+	messages: number;
+};
+
 export type ImapAction = {
 	response: string;
 	state?: ImapSessionState;
 	selected?: ImapSelectedMailbox | null;
 	login?: { username: string; password: string };
+	/**
+	 * The message count this reply just reported for the selection (SELECT/EXAMINE), so a later IDLE knows what
+	 * the client has already been told and can announce mail that arrived between the two commands.
+	 */
+	messages?: number;
+	/** Present when the command put the connection into IDLE; the socket layer owns the timers from there. */
+	idle?: ImapIdleStart;
 };
 
 /** The one hierarchy delimiter Mailflare's IMAP names use. */
@@ -147,6 +166,17 @@ export const IMAP_FLAGS = ["\\Seen", "\\Flagged", "\\Draft", "\\Deleted"] as con
  * this module refuses again, which is what a caller that does not go through the socket gets.
  */
 export const IMAP_APPEND_LIMIT = LIMITS.maxSizeUpload;
+
+/**
+ * RFC 2177 IDLE: how long one poll waits, and how long one IDLE may run before the server ends it.
+ *
+ * 15 s is the shortest interval whose cost is clearly negligible — one indexed count query per idling connection
+ * per tick — while still being prompt next to a client's own polling. 29 min is the re-arm window the RFC's
+ * deployment guidance calls for: a connection that stays silent for 30 min can be dropped by a NAT, a proxy or a
+ * firewall, so the server ends the IDLE before that and the client is expected to send IDLE again.
+ */
+export const IMAP_IDLE_POLL_MS = 15_000;
+export const IMAP_IDLE_MAX_MS = 29 * 60_000;
 
 /** Parse an IMAP command line. Quoted strings support backslash escapes; literals are supplied by the socket layer as quoted values. */
 export function quoteImapLiteral(value: string): string {
@@ -199,7 +229,7 @@ export async function dispatchImapCommand(
 ): Promise<ImapAction> {
 	const session = asImapSession(sessionInput);
 	const { tag, verb, args } = command;
-	if (verb === "CAPABILITY") return { response: `* CAPABILITY IMAP4rev1 MOVE ID APPENDLIMIT=${IMAP_APPEND_LIMIT}\r\n${tag} OK CAPABILITY completed\r\n` };
+	if (verb === "CAPABILITY") return { response: `* CAPABILITY IMAP4rev1 MOVE IDLE ID APPENDLIMIT=${IMAP_APPEND_LIMIT}\r\n${tag} OK CAPABILITY completed\r\n` };
 	if (verb === "NOOP") return { response: `${tag} OK NOOP completed\r\n` };
 	if (verb === "LOGOUT") return { response: `* BYE Logging out\r\n${tag} OK LOGOUT completed\r\n`, state: "logged-out", selected: null };
 	if (verb === "ID") return { response: `* ID (\"name\" \"Mailflare\")\r\n${tag} OK ID completed\r\n` };
@@ -222,6 +252,7 @@ export async function dispatchImapCommand(
 	// APPEND is legal in both the authenticated and the selected state (RFC 3501 §6.3.11), and it names
 	// its own destination, so it does not read the selection.
 	if (verb === "APPEND") return appendCommand(tag, command, backend);
+	if (verb === "IDLE") return idleCommand(tag, args, session, backend);
 	if (verb === "MOVE") return moveCommand(tag, false, args, session, backend);
 	if (verb === "FETCH") return fetchCommand(tag, false, args, session, backend);
 	if (verb === "SEARCH") return searchCommand(tag, false, args, session, backend);
@@ -355,6 +386,49 @@ async function listCommand(tag: string, verb: "LIST" | "LSUB", args: string[], b
 	return { response: `${listed}${tag} OK ${verb} completed\r\n` };
 }
 
+/**
+ * IDLE (RFC 2177): selected state only, `+ idling`, and then the socket layer re-reads MESSAGES until DONE or
+ * the re-arm window closes. Mailflare's change feed is the ordered `jmap_changes` journal, but the honest minimal
+ * signal for "something is in this mailbox now" is the same count SELECT answered — one indexed query per poll,
+ * and a different total is a `* n EXISTS`.
+ *
+ * The bridge numbers messages by position (seq = UID, in createdAt/id order), so a deletion in the middle of a
+ * mailbox shifts every later position and `* EXPUNGE` cannot name what left; only EXISTS is pushed, and a total
+ * that fell is announced as the smaller EXISTS. Flag changes are not pushed either: EXISTS is the total, so an
+ * UNSEEN-only change says nothing here (a per-message FETCH update is a later slice). There is no CONDSTORE or
+ * QRESYNC sequence tracking, and no attempt to replay `jmap_changes` — the count diff is the whole mechanism.
+ */
+async function idleCommand(tag: string, args: string[], session: ImapSession, backend?: ImapMailboxBackend): Promise<ImapAction> {
+	if (args.length > 0) return { response: `${tag} BAD IDLE takes no arguments\r\n` };
+	// RFC 2177 adds IDLE to RFC 3501's selected-state command set (`command-select =/ idle`), so an unselected
+	// session answers the same BAD its siblings (FETCH, SEARCH, MOVE) answer rather than a NO.
+	if (!session.selected) return { response: `${tag} BAD No mailbox selected\r\n` };
+	if (!backend) return mailboxUnavailable(tag);
+	// The selection's folder may have been deleted since SELECT, so the catalogue is read fresh here the way the
+	// other selected-state verbs read it, instead of trusting a name the client remembers.
+	const entry = (await backend.list()).find((candidate) => candidate.selectable && candidate.ref === session.selected!.ref) ?? null;
+	if (!entry) return { response: `${tag} NO No such mailbox\r\n` };
+	const counts = await backend.counts(entry);
+	// `+ idling` is the continuation RFC 2177 §3 defines. Everything written between it and the terminating tagged
+	// response is untagged and may arrive at any time; the socket layer writes those as its polls see changes.
+	return { response: "+ idling\r\n", idle: { tag, entry, messages: counts.messages } };
+}
+
+/** The one input an idling client may send: an untagged `DONE`, in any case (RFC 2177 §3). */
+export function isImapIdleDone(line: string): boolean {
+	return line.trim().toUpperCase() === "DONE";
+}
+
+/**
+ * Anything else a client sends while idling is a protocol error: RFC 2177 defines only DONE in that state. The
+ * server answers BAD and keeps idling rather than tearing the connection down — the client can still end the
+ * IDLE it started, and a command sent at the wrong moment is not a reason to lose the session. The tag is echoed
+ * when the line has one; DONE itself carries none, so a bare line gets the untagged form.
+ */
+export function idleBusyResponse(command: ImapCommand | null): string {
+	return command ? `${command.tag} BAD Only DONE ends IDLE\r\n` : "* BAD Only DONE ends IDLE\r\n";
+}
+
 async function selectCommand(
 	tag: string,
 	verb: "SELECT" | "EXAMINE",
@@ -381,7 +455,9 @@ async function selectCommand(
 		`* OK [PERMANENTFLAGS ()] Read-only mailbox`,
 		`${tag} OK [READ-ONLY] ${verb} completed`,
 	];
-	return { response: `${lines.join("\r\n")}\r\n`, state: "selected", selected };
+	// The count in that EXISTS is what the client now knows, so an IDLE that starts later can tell whether mail
+	// arrived in between and answer it right after `+ idling`.
+	return { response: `${lines.join("\r\n")}\r\n`, state: "selected", selected, messages: counts.messages };
 }
 
 async function statusCommand(tag: string, args: string[], backend?: ImapMailboxBackend): Promise<ImapAction> {

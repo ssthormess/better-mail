@@ -8,12 +8,19 @@ import { isImapEnabled } from "@/lib/imap/settings";
 import { imapMailboxBackend } from "./imap-mailbox-backend";
 import {
 	IMAP_APPEND_LIMIT,
+	IMAP_IDLE_MAX_MS,
+	IMAP_IDLE_POLL_MS,
 	asImapSession,
 	dispatchImapCommand,
+	idleBusyResponse,
+	isImapIdleDone,
 	loginResult,
 	parseImapCommand,
 	quoteImapLiteral,
+	type ImapCommand,
+	type ImapIdleStart,
 	type ImapMailboxBackend,
+	type ImapMailboxCounts,
 	type ImapSession,
 } from "./imap-protocol";
 
@@ -44,6 +51,18 @@ type ImapOptions = {
 	 * (MAX_BUFFERED_LITERAL_BYTES) is what production runs; a smaller one is how a test proves the bound.
 	 */
 	bufferedLiteralBytes?: number;
+	/**
+	 * How long an IDLE waits between count polls, and how long one IDLE may run before the server ends it with a
+	 * tagged OK. The defaults are the contract (`IMAP_IDLE_POLL_MS`, `IMAP_IDLE_MAX_MS`); a test shortens them so
+	 * the timers can be observed inside its own lifetime.
+	 */
+	idlePollMs?: number;
+	idleMaxMs?: number;
+	/**
+	 * The silence that closes a connection which is not idling. The default (SOCKET_TIMEOUT_MS) is what production
+	 * runs; a test shortens it to prove an IDLE is exempt from it.
+	 */
+	inactivityTimeoutMs?: number;
 };
 
 /** Start an IMAP skeleton listener. Without certificate paths it accepts plaintext; configure TLS for credential privacy. */
@@ -51,6 +70,9 @@ export function startImapListener(env: CloudflareEnv, options: ImapOptions) {
 	const connectionsByIp = new Map<string, number>();
 	const admitted = new Set<Socket>();
 	const maxBufferedLiteralBytes = options.bufferedLiteralBytes ?? MAX_BUFFERED_LITERAL_BYTES;
+	const idlePollMs = options.idlePollMs ?? IMAP_IDLE_POLL_MS;
+	const idleMaxMs = options.idleMaxMs ?? IMAP_IDLE_MAX_MS;
+	const inactivityTimeoutMs = options.inactivityTimeoutMs ?? SOCKET_TIMEOUT_MS;
 	// Shared by every connection: the budget literals are reserved from (see MAX_BUFFERED_LITERAL_BYTES).
 	let bufferedLiteralBytes = 0;
 	const onConnection = (socket: Socket) => {
@@ -59,7 +81,10 @@ export function startImapListener(env: CloudflareEnv, options: ImapOptions) {
 		if (count > MAX_CONNECTIONS_PER_IP || admitted.size >= MAX_CLIENTS) { socket.end("* BYE Too many connections\r\n"); return; }
 		admitted.add(socket);
 		connectionsByIp.set(ip, count);
-		socket.setTimeout(SOCKET_TIMEOUT_MS, () => socket.destroy());
+		// One timeout listener for the connection's life rather than a callback per arming: IDLE disarms and re-arms
+		// this timer on every cycle, and a callback per arm would stack listeners on a long-lived session.
+		socket.on("timeout", () => socket.destroy());
+		socket.setTimeout(inactivityTimeoutMs);
 		socket.write("* OK Mailflare IMAP4rev1 server ready\r\n");
 		let buffer = Buffer.alloc(0);
 		let pendingPrefix: string | null = null;
@@ -80,6 +105,26 @@ export function startImapListener(env: CloudflareEnv, options: ImapOptions) {
 		// One backend per login. It reads the catalogue fresh on every call, so a folder written
 		// through CREATE (or another session) is visible to the next LIST without a reconnect.
 		let backend: ImapMailboxBackend | null = null;
+		// The last message count this session told the client its selection holds: SELECT's EXISTS, then every IDLE
+		// push. An IDLE that starts after mail arrived can announce it immediately instead of waiting a poll.
+		let reportedMessages: number | null = null;
+		/**
+		 * The running IDLE, if there is one: `+ idling` has been written and the mailbox is re-read until DONE or the
+		 * re-arm window closes. `count` is bound to the login's backend and the entry IDLE resolved, so a poll cannot
+		 * read a different mailbox than the one the client selected.
+		 */
+		type ConnectionIdle = {
+			tag: string;
+			messages: number;
+			count: () => Promise<ImapMailboxCounts>;
+			poll: ReturnType<typeof setTimeout> | null;
+			deadline: ReturnType<typeof setTimeout>;
+		};
+		let idle: ConnectionIdle | null = null;
+		// A client may pipeline DONE straight behind IDLE, before this connection has answered the IDLE: those lines
+		// wait here until the IDLE is accepted or refused, then go to the idle line handler or back through the queue.
+		let idleEntering = false;
+		let idlePrelude: Array<{ line: string; literal: Buffer | null; reserved: number }> = [];
 
 		/** Claim room for one literal, or say no: over the per-command limit, or the server-wide budget is full. */
 		const reserveLiteral = (size: number) => {
@@ -95,10 +140,100 @@ export function startImapListener(env: CloudflareEnv, options: ImapOptions) {
 			bufferedLiteralBytes -= amount;
 		};
 
+		/** Write IDLE's one untagged response, and remember it as the count the client now knows. */
+		const writeExists = (messages: number) => {
+			reportedMessages = messages;
+			socket.write(`* ${messages} EXISTS\r\n`);
+		};
+
+		/** Drop the running IDLE's timers. Returns it when there was one, so the caller can decide what to write. */
+		const stopIdle = () => {
+			const current = idle;
+			idle = null;
+			if (!current) return null;
+			if (current.poll) clearTimeout(current.poll);
+			clearTimeout(current.deadline);
+			return current;
+		};
+
+		/**
+		 * End the IDLE the way RFC 2177 asks: a tagged OK answering the IDLE command's tag, with the session still
+		 * selected. DONE and the re-arm deadline reach here the same way — the client that is still there ends its
+		 * own IDLE, and the one that went quiet learns the server did, and may send IDLE again.
+		 */
+		const endIdle = () => {
+			const current = stopIdle();
+			if (!current || socket.destroyed) return;
+			// The silence exemption lasted exactly as long as the IDLE: the ordinary inactivity contract is armed again.
+			socket.setTimeout(inactivityTimeoutMs);
+			socket.write(`${current.tag} OK Idle terminated\r\n`);
+		};
+
+		/** A recursive timeout rather than an interval, so a count query slower than the poll cannot stack polls. */
+		const scheduleIdlePoll = (current: ConnectionIdle) => {
+			current.poll = setTimeout(() => void pollIdle(current), idlePollMs);
+		};
+
+		const pollIdle = async (current: ConnectionIdle) => {
+			current.poll = null;
+			if (idle !== current || socket.destroyed) return;
+			try {
+				const counts = await current.count();
+				// DONE, the deadline or a close may have landed while the count was being read.
+				if (idle !== current || socket.destroyed) return;
+				// MESSAGES is the whole signal: EXISTS is the mailbox's total, so an UNSEEN-only change says nothing (a
+				// per-message flag push would be a FETCH update, which this bridge does not send yet). A total that fell
+				// is announced as the smaller EXISTS too: the positional model cannot name the rows an EXPUNGE would.
+				if (counts.messages !== current.messages) {
+					current.messages = counts.messages;
+					writeExists(counts.messages);
+				}
+			} catch (error) {
+				// A count that could not be read is not a reason to lose the session: the next poll tries again.
+				console.error("IMAP IDLE poll failed", error);
+			}
+			if (idle === current && !socket.destroyed) scheduleIdlePoll(current);
+		};
+
+		/** Start the machinery `+ idling` opened: the deadline, the first poll, and any change since SELECT. */
+		const startIdle = (start: ImapIdleStart, mailboxBackend: ImapMailboxBackend) => {
+			// `+ idling` has already been written. An idling client is legitimately silent until DONE, so the inactivity
+			// timer is disabled rather than merely refreshed — the deadline below is what bounds the silence instead.
+			socket.setTimeout(0);
+			const current: ConnectionIdle = {
+				tag: start.tag,
+				messages: start.messages,
+				count: () => mailboxBackend.counts(start.entry),
+				poll: null,
+				deadline: setTimeout(endIdle, idleMaxMs),
+			};
+			idle = current;
+			// Whatever arrived between the count the client was told and `+ idling` is reported now, so its view is
+			// current before it starts waiting; an unchanged mailbox says nothing at all.
+			if (reportedMessages !== null && start.messages !== reportedMessages) writeExists(start.messages);
+			scheduleIdlePoll(current);
+		};
+
+		/** While idling, DONE is the only line that means anything (RFC 2177); everything else is a BAD. */
+		const handleIdleLine = (line: string, command: ImapCommand | null) => {
+			if (isImapIdleDone(line)) { endIdle(); return; }
+			socket.write(idleBusyResponse(command));
+		};
+
 		let commandQueue = Promise.resolve();
 		const enqueueLine = (line: string, literal: Buffer | null = null, reserved = 0) => {
+			// An IDLE is not a command the queue may wait on: the DONE line has to be read off the wire while the IDLE
+			// is open, so an idling connection's lines never enter the queue at all.
+			const command = parseImapCommand(line);
+			if (idle) {
+				if (reserved > 0) releaseLiteral(reserved);
+				handleIdleLine(line, command);
+				return;
+			}
+			if (idleEntering) { idlePrelude.push({ line, literal, reserved }); return; }
+			if (command?.verb === "IDLE") idleEntering = true;
 			commandQueue = commandQueue
-				.then(() => handleLine(line, literal))
+				.then(() => handleLine(command, literal))
 				.catch((error: unknown) => {
 					console.error("IMAP command failed", error);
 					socket.write("* BYE Temporary server error\r\n");
@@ -106,11 +241,20 @@ export function startImapListener(env: CloudflareEnv, options: ImapOptions) {
 				})
 				// The literal stays reserved while its command is queued: answering it is when the bytes are done with.
 				.finally(() => {
+					// Lines that arrived behind the IDLE now know whether it is idling or whether they are ordinary commands.
+					if (command?.verb === "IDLE") settleIdlePrelude();
 					if (reserved > 0) releaseLiteral(reserved);
 				});
 		};
-		const handleLine = async (line: string, literal: Buffer | null) => {
-			const command = parseImapCommand(line);
+		const settleIdlePrelude = () => {
+			idleEntering = false;
+			const prelude = idlePrelude;
+			idlePrelude = [];
+			// Replaying through enqueueLine is what routes each line: to the idle handler when the IDLE was accepted,
+			// back through the queue when it was refused (a refused IDLE leaves this connection not idling).
+			for (const item of prelude) enqueueLine(item.line, item.literal, item.reserved);
+		};
+		const handleLine = async (command: ImapCommand | null, literal: Buffer | null) => {
 			if (!command) { socket.write("* BAD Invalid command syntax\r\n"); return; }
 			// APPEND's literal is the message itself, so it travels beside the arguments rather than as a token.
 			if (literal) command.literal = literal.buffer.slice(literal.byteOffset, literal.byteOffset + literal.byteLength) as ArrayBuffer;
@@ -128,12 +272,19 @@ export function startImapListener(env: CloudflareEnv, options: ImapOptions) {
 				backend = null;
 				session.state = result.state ?? session.state;
 				session.selected = null;
+				reportedMessages = null;
 				socket.write(result.response);
 				return;
 			}
 			session.state = action.state ?? session.state;
-			if (action.selected !== undefined) session.selected = action.selected;
+			if (action.selected !== undefined) {
+				session.selected = action.selected;
+				// A deselect leaves no selected count for this session to have been told about.
+				if (action.selected === null) reportedMessages = null;
+			}
+			if (action.messages !== undefined) reportedMessages = action.messages;
 			socket.write(action.response);
+			if (action.idle && mailboxBackend) startIdle(action.idle, mailboxBackend);
 			if (session.state === "logged-out") { auth = null; backend = null; socket.end(); }
 		};
 
@@ -236,6 +387,11 @@ export function startImapListener(env: CloudflareEnv, options: ImapOptions) {
 		};
 		socket.on("data", (chunk: Buffer) => { buffer = Buffer.concat([buffer, chunk]); consume(); });
 		socket.on("close", () => {
+			// An idling connection must not leave its poll behind: the timer would keep reading counts for a client that
+			// is gone, and would keep the connection's socket alive in the event loop.
+			stopIdle();
+			idleEntering = false;
+			idlePrelude = [];
 			// Whatever this connection still held goes back to the budget before anything else, including the
 			// literals of commands that were queued but never answered.
 			bufferedLiteralBytes -= heldLiteralBytes;
