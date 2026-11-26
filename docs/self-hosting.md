@@ -3,7 +3,8 @@
 Mailflare can run as a single container on any host instead of Cloudflare
 Workers. The same code serves both; the container provides its own database
 (SQLite on a volume), blob storage (files on the same volume), job queue,
-realtime WebSocket, backup schedule and an SMTP listener for inbound mail.
+realtime WebSocket, backup schedule, an SMTP listener for inbound mail and an
+IMAP listener for mail apps.
 
 ## Quick start
 
@@ -131,6 +132,36 @@ domain configures Email Routing and the sending subdomain automatically,
 exactly as on Workers. Without it, domains are recorded as manually managed
 and the DNS page shows what to set by hand.
 
+## Mail apps (IMAP)
+
+The container also serves IMAP for mail apps and scripts, **off until an
+administrator turns on Admin → General → "Allow mail apps to connect over
+IMAP"**, and it serves no message bodies: a mail client can list mailboxes,
+counts and flags, search, manage folders and append mail, but not download a
+message. [IMAP bridge](imap-bridge.md) has the command list and every
+limitation.
+
+The port is not published by the bundled compose files, so add it yourself:
+
+```yaml
+    ports:
+      - "3000:3000"   # web app and JMAP
+      - "25:25"       # inbound SMTP
+      - "993:993"     # IMAP
+```
+
+`IMAP_TLS_KEY` and `IMAP_TLS_CERT` (paths inside the container, both or
+neither) enable implicit TLS — the default port becomes 993 and clients must
+be set to SSL/TLS, since `STARTTLS` is not offered. Without them the default
+is 143 and the listener, app password included, is plaintext. Ports below
+1024 need root or a capability, as with SMTP; use `IMAP_PORT=1143` behind a
+port mapping otherwise. `IMAP_PORT=0` disables the listener.
+
+Clients sign in with an app password created under **Settings → App
+passwords** with **Read mail over IMAP** ticked; the username is ignored. The
+administrator switch is checked at sign-in, so an open session is not closed
+by turning it off.
+
 ## Configuration reference
 
 | Variable | Default | Purpose |
@@ -145,6 +176,9 @@ and the DNS page shows what to set by hand.
 | `MAIL_HOSTNAME` | `mail.<domain>` | Host the MX record points at; SMTP banner |
 | `SMTP_MAX_SIZE` | 36 MiB | Largest raw inbound message; allows for encoding overhead on up to 25 MB of attachments. Oversized mail receives an SMTP rejection, which the sender's mail provider can report as a delivery failure. |
 | `SMTP_TLS_KEY`, `SMTP_TLS_CERT` | unset | STARTTLS certificate for the listener |
+| `IMAP_PORT` | `993` with certificates, `143` without | IMAP listener for mail apps; `0` disables. Off until enabled under Admin → General |
+| `IMAP_HOST` | `0.0.0.0` | Address the IMAP listener binds |
+| `IMAP_TLS_KEY`, `IMAP_TLS_CERT` | unset | Implicit-TLS certificate for the IMAP listener (both or neither). Without them that listener is plaintext and STARTTLS is not offered |
 | `SMTP_URL` | unset | Outbound relay |
 | `SMTP_TLS_REJECT_UNAUTHORIZED` | `true` | Trust self-signed relay certificates when `false` |
 | `CF_EMAIL_WORKER_NAME` | `mailflare` | Worker name that Email Routing rules created through the Cloudflare API target. If you change it on an install whose rules already target `mailflare`, recreate those rules; the old ones are no longer recognised |

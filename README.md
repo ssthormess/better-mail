@@ -30,6 +30,7 @@ Self-host it on Cloudflare or Docker. **Or try [Mailflare Cloud](https://cloud.m
 
 - **Email**: Custom domain mailboxes, personal or shared, with access you control. Send and receive with Cloudflare Email, Resend or Amazon SES.
 - **Routing rules**: Store, forward, reject or sort incoming mail, including a one-rule filter for newsletters and promotions.
+- **IMAP bridge**: A read-only IMAP endpoint for mail apps and scripts — mailboxes, counts, flags, search, folder management, APPEND and IDLE over app passwords. Off by default, and it serves no message bodies. See [IMAP bridge](docs/imap-bridge.md).
 - **Calendar**: Repeating events with time zones. Attendees get email invitations.
 - **Booking**: Share a public link so anyone can book a free time on your calendar.
 - **Drive**: Store and share files.
@@ -126,6 +127,7 @@ A schema change needs a migration for each database type. See [Databases](docs/d
 - [Sending and receiving providers](docs/providers.md)
 - [API and integrations](docs/api.md)
 - [Email assistant and MCP](docs/email-assistant-and-mcp.md)
+- [IMAP bridge](docs/imap-bridge.md)
 - [Importing from Google Takeout](docs/import.md)
 - [Adding a language](docs/localization.md)
 - [Troubleshooting](docs/troubleshooting.md)
