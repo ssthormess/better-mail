@@ -4,8 +4,10 @@ import { isMissingTableError } from "@/lib/database-errors";
 /**
  * Maintenance for the full-text indexes. On SQLite (D1) triggers keep both FTS5 tables current, so a rebuild is
  * only needed after a restore from a backup that predates an index, or if the counts below ever disagree.
- * PostgreSQL and MySQL search the message columns directly (see conditions.ts), so there is no index to
- * rebuild and the status always reports every message as searchable.
+ * PostgreSQL and MySQL search the message columns directly (see conditions.ts) and their attachment indexes
+ * (F53) are engine-maintained — a GIN or FULLTEXT index is written with the row, so unlike an external-content
+ * FTS5 table it cannot drift and there is nothing to rebuild. The status therefore still reports every message
+ * as searchable on those dialects.
  */
 export async function rebuildSearchIndex(env: CloudflareEnv): Promise<void> {
 	if (dialectOf(env.DB) !== "sqlite") return;

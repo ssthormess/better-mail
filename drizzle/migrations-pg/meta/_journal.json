@@ -204,6 +204,13 @@
       "when": 1795763754871,
       "tag": "0033_attachment_extract_status_idx",
       "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "7",
+      "when": 1796447534871,
+      "tag": "0041_attachment_search_index",
+      "breakpoints": true
     }
   ]
 }

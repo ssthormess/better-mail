@@ -1,4 +1,16 @@
 import { dialectOf } from "@/db/introspect";
+import type { DatabaseDialect } from "@/db/dialect";
+
+/**
+ * The name the attachment-text index goes by on each dialect (F52/F53): the FTS5 table
+ * on SQLite, the partial GIN expression index on PostgreSQL, the FULLTEXT index on
+ * MySQL. conditions.ts answers attachment matches through whichever one exists.
+ */
+const INDEX_OBJECT: Record<DatabaseDialect, string> = {
+	sqlite: "attachments_fts",
+	postgres: "message_attachments_extracted_text_fts_idx",
+	mysql: "message_attachments_extracted_text_fts_idx",
+};
 
 /**
  * Whether the attachment-text index (F52, `attachments_fts`) exists — as seen by the
@@ -36,8 +48,11 @@ import { dialectOf } from "@/db/introspect";
  *     applies the migration on the primary and `applyPendingMigrations` clears the cache
  *     outright, so the next probe sees the index without a redeploy.
  *
- * PostgreSQL and MySQL have no attachment index (F53 adds their parity), so the answer
- * there is always false.
+ * PostgreSQL and MySQL have no D1 session problem — their `env.DB` is one external
+ * connection per process, and WeakMap keyed on it is the right granularity. Their
+ * probe is one catalog lookup (`to_regclass` / `information_schema.statistics`)
+ * against the migration-created index (0041), bounded the same way: cached per
+ * connection, a "no" re-asked after MISS_TTL_MS, cleared when migrations apply.
  */
 const MISS_TTL_MS = 30_000;
 
@@ -61,9 +76,18 @@ export function clearAttachmentIndexProbe(connection?: object): void {
 	probes.delete(connection);
 }
 
+/** The catalog lookup for the dialect's index object; each is one row off the catalog. */
+function probeSql(dialect: DatabaseDialect): string {
+	if (dialect === "postgres") return `SELECT to_regclass('${INDEX_OBJECT.postgres}') AS name`;
+	if (dialect === "mysql") {
+		return `SELECT COUNT(*) AS n FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = 'message_attachments' AND index_name = '${INDEX_OBJECT.mysql}' AND index_type = 'FULLTEXT'`;
+	}
+	return "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'attachments_fts'";
+}
+
 export async function hasAttachmentSearchIndex(env: ProbeEnv): Promise<boolean> {
 	const connection = env.DB;
-	if (dialectOf(connection) !== "sqlite") return false;
+	const dialect = dialectOf(connection);
 	const cached = probes.get(connection);
 	if (cached && (cached.available || Date.now() - cached.checkedAt < MISS_TTL_MS)) return cached.available;
 	// Capture the cache identity before awaiting: a clear can replace the map (or empty this
@@ -71,8 +95,8 @@ export async function hasAttachmentSearchIndex(env: ProbeEnv): Promise<boolean> 
 	// restamp state that was just reset.
 	const map = probes;
 	const startedAt = generation;
-	const found = await connection.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'attachments_fts'").first<{ name: string }>();
-	const available = !!found?.name;
+	const found = await connection.prepare(probeSql(dialect)).first<{ name?: string | null; n?: number }>();
+	const available = dialect === "mysql" ? Number(found?.n ?? 0) > 0 : !!found?.name;
 	if (map === probes && startedAt === generation) map.set(connection, { available, checkedAt: Date.now() });
 	return available;
 }

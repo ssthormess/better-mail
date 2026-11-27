@@ -2,7 +2,17 @@ import { and, eq, exists, gte, isNull, lt, ne, not, or, sql } from "drizzle-orm"
 import type { AnyColumn, SQL } from "drizzle-orm";
 import { messageAttachments, messages } from "@/db/schema";
 import { schemaDialect } from "@/db/dialect";
-import { buildFtsColumnMatch, buildFtsFreeTextMatch, buildFtsNegation, parseSearchQuery, tokenizeSearchText } from "./query-utils";
+import {
+	buildBooleanFreeTextMatch,
+	buildBooleanNegation,
+	buildFtsColumnMatch,
+	buildFtsFreeTextMatch,
+	buildFtsNegation,
+	buildTsQueryFreeTextMatch,
+	buildTsQueryNegation,
+	parseSearchQuery,
+	tokenizeSearchText,
+} from "./query-utils";
 import type { ParsedSearchQuery } from "./types";
 
 /** `!` is the escape character because it needs no escaping itself in either SQL string syntax. */
@@ -13,10 +23,19 @@ const contains = (column: SQL | AnyColumn, term: string) => sql`coalesce(lower($
 /**
  * Text search for databases without FTS5 (PostgreSQL, MySQL): every term must appear as a substring of the
  * subject, an address or the body. It scans the mailbox's messages instead of using an index, which is the
- * documented trade-off of those dialects.
+ * documented trade-off of those dialects for the message's own columns.
+ *
+ * The attachment half of a free-text search does use an index here (F53): PostgreSQL keeps a partial GIN
+ * index over a `to_tsvector` expression on the eligible rows and MySQL a FULLTEXT index on the column —
+ * both named `message_attachments_extracted_text_fts_idx` and both scoped to the same `extract_status =
+ * 'done' AND extracted_text IS NOT NULL` set the SQLite FTS5 table holds (MySQL indexes every row and the
+ * predicate is enforced in the WHERE instead — there are no partial indexes). The shape is the FTS5 one:
+ * every positive term has to appear in the message or in one same attachment (the union), and a negated
+ * term is rejected against both — a hit on one side never excuses a NOT on the other.
  */
-function buildLikeConditions(parsed: ParsedSearchQuery): SQL[] {
+function buildLikeConditions(parsed: ParsedSearchQuery, attachmentText: boolean): SQL[] {
 	const conditions: SQL[] = [];
+	const positives: SQL[] = [];
 	for (const token of tokenizeSearchText(parsed.text)) {
 		const match = or(
 			contains(messages.subject, token.term),
@@ -26,8 +45,22 @@ function buildLikeConditions(parsed: ParsedSearchQuery): SQL[] {
 			contains(messages.textBody, token.term),
 			and(sql`${messages.textBody} is null`, contains(messages.htmlBody, token.term)),
 		)!;
-		conditions.push(token.negate ? not(match) : match);
+		if (token.negate) conditions.push(not(match));
+		else positives.push(match);
 	}
+	// The dialect's attachment index answers an expression built from the same tokens the LIKE clauses
+	// use: a `to_tsquery` input on PostgreSQL, a boolean-mode AGAINST string on MySQL. Either way the
+	// expression stays a bound parameter — the token words carry no operators (see query-utils.ts).
+	const postgres = schemaDialect() === "postgres";
+	const attachmentMatches = (expr: string) =>
+		sql`${messages}.id IN (SELECT ${messageAttachments.messageId} FROM ${messageAttachments} WHERE ${messageAttachments.extractStatus} = 'done' AND ${messageAttachments.extractedText} IS NOT NULL AND ${postgres
+			? sql`to_tsvector('simple', ${messageAttachments.extractedText}) @@ to_tsquery('simple', ${expr})`
+			: sql`MATCH(${messageAttachments.extractedText}) AGAINST(${expr} IN BOOLEAN MODE)`})`;
+	const freeText = postgres ? buildTsQueryFreeTextMatch(parsed) : buildBooleanFreeTextMatch(parsed);
+	if (attachmentText && freeText) conditions.push(or(and(...positives), attachmentMatches(freeText))!);
+	else conditions.push(...positives);
+	const negation = postgres ? buildTsQueryNegation(parsed) : buildBooleanNegation(parsed);
+	if (attachmentText && negation) conditions.push(not(attachmentMatches(negation)));
 	const column = (columns: Array<SQL | AnyColumn>, value: string | undefined) => {
 		if (!value) return;
 		for (const token of tokenizeSearchText(value)) conditions.push(or(...columns.map((c) => contains(c, token.term)))!);
@@ -39,7 +72,7 @@ function buildLikeConditions(parsed: ParsedSearchQuery): SQL[] {
 }
 
 export type SearchConditionOptions = {
-	/** Whether `attachments_fts` exists; see `hasAttachmentSearchIndex` in ./attachment-index. */
+	/** Whether the dialect's attachment-text index exists; see `hasAttachmentSearchIndex` in ./attachment-index. */
 	attachmentText?: boolean;
 };
 
@@ -65,9 +98,10 @@ export type SearchConditionOptions = {
  *
  * Two things to know about that text. It exists only for rows the extraction
  * sweep has reached: a row still at `extract_status = 'none'` is invisible to
- * search until then (see src/lib/email/attachment-sweep.ts). And none of this runs
- * on PostgreSQL or MySQL, where the branch below stays the LIKE scan it always
- * was; those dialects get attachment parity in F53.
+ * search until then (see src/lib/email/attachment-sweep.ts). And the attachment
+ * half of the union exists on every dialect (F53): PostgreSQL and MySQL keep
+ * message columns on the LIKE scan but match attachment text through their own
+ * indexes with the same union/negation split — see buildLikeConditions.
  *
  * `attachments_fts` is checked first: the Worker is deployed before its migrations are
  * applied (docs/deployment.md), so a SQLite database can be one release behind the code,
@@ -107,7 +141,7 @@ export function buildSearchConditions(raw: string, timeZone = "UTC", options: Se
 			if (attachmentText) conditions.push(attachmentMisses(negation));
 		}
 	} else {
-		conditions.push(...buildLikeConditions(parsed));
+		conditions.push(...buildLikeConditions(parsed, options.attachmentText === true));
 	}
 	if (parsed.hasAttachment) {
 		conditions.push(

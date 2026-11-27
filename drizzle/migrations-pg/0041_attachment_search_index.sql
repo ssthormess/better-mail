@@ -1,0 +1,12 @@
+-- Attachment text is searchable on PostgreSQL too (F53): a partial GIN index over the
+-- tsvector of the rows a search is allowed to see — the same extract_status = 'done'
+-- AND extracted_text IS NOT NULL set the SQLite FTS5 table holds (see
+-- drizzle/migrations/0109_attachment_search_index.sql and its attachments_fts_source
+-- view). A partial expression index is used instead of a generated or trigger-maintained
+-- tsvector column: it writes index entries only for eligible rows, stores no extra
+-- column, needs no trigger code, and the query repeats the same predicate so the
+-- planner always qualifies for it. 'simple' is the matching config — FTS5's unicode61
+-- does not stem, and the 'english' config's stemming and stopword list would make terms
+-- FTS5 indexes (e.g. "the") unmatchable.
+-- conditions.ts matches through to_tsvector('simple', extracted_text) @@ to_tsquery('simple', ?).
+CREATE INDEX "message_attachments_extracted_text_fts_idx" ON "message_attachments" USING gin ((to_tsvector('simple', "extracted_text"))) WHERE "extract_status" = 'done' AND "extracted_text" IS NOT NULL;

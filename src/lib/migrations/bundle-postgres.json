@@ -567,6 +567,12 @@
       "statements": [
         "CREATE INDEX \"message_attachments_extract_status_idx\" ON \"message_attachments\" USING btree (\"extract_status\",\"created_at\");"
       ]
+    },
+    {
+      "name": "0041_attachment_search_index.sql",
+      "statements": [
+        "CREATE INDEX \"message_attachments_extracted_text_fts_idx\" ON \"message_attachments\" USING gin ((to_tsvector('simple', \"extracted_text\"))) WHERE \"extract_status\" = 'done' AND \"extracted_text\" IS NOT NULL;"
+      ]
     }
   ]
 }

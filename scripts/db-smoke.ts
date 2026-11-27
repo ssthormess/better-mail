@@ -5,7 +5,7 @@
  */
 import { and, eq, sql } from "drizzle-orm";
 import { createDb } from "@/db";
-import { users, domains, mailboxes, messages, calendarEvents, contacts, contactDetails, davCards, davCollections, folders, jmapChanges, appSettings, webhooks, spamTokenStats, spamReputation, mailboxPromotionSettings, emailSuppressions, domainDeliverability } from "@/db/schema";
+import { users, domains, mailboxes, messages, messageAttachments, calendarEvents, contacts, contactDetails, davCards, davCollections, folders, jmapChanges, appSettings, webhooks, spamTokenStats, spamReputation, mailboxPromotionSettings, emailSuppressions, domainDeliverability } from "@/db/schema";
 import { getDatabaseConfig } from "@/db/with-database";
 import { openExternalDatabase } from "@/db/external";
 import { applyPendingMigrations, getMigrationStatus } from "@/lib/migrations/service";
@@ -40,6 +40,10 @@ const check = (name: string, ok: boolean) => {
 };
 
 const config = getDatabaseConfig({ DATABASE_URL: url, DATABASE_DRIVER: driver } as never);
+// The URL arrives as an argument rather than through env, so the tooling override
+// (MAILFLARE_DB_DIALECT, see src/db/dialect.ts) tells schemaDialect-dependent code —
+// the search conditions' dialect branch — which query shapes this database speaks.
+process.env.MAILFLARE_DB_DIALECT = config.dialect;
 const external = openExternalDatabase(config, true);
 const d1 = external as unknown as D1Database;
 console.log(`dialect=${config.dialect} driver=${config.driver}`);
@@ -111,6 +115,21 @@ for (const [query, expected] of [["quarterly", 1], ["subject:report", 1], ["from
 	const found = await db.select({ id: messages.id }).from(messages).where(and(eq(messages.mailboxId, `mbx_${stamp}`), ...buildSearchConditions(query, "UTC", searchOptions)));
 	check(`search "${query}"`, found.length === expected);
 }
+
+// Attachment text is part of a free-text search on every dialect (F52/F53): the message
+// is a hit when its own columns miss but an extracted attachment's text matches, and a
+// negated term rejects it whichever side would have matched.
+await db.insert(messageAttachments).values([
+	{ id: `att_${stamp}`, messageId: `msg_${stamp}`, filename: "note.txt", contentType: "text/plain", size: 10, r2Key: `a/${stamp}`, extractStatus: "done", extractedText: "smoketoken agreement" },
+	{ id: `att2_${stamp}`, messageId: `msg_${stamp}`, filename: "pending.txt", contentType: "text/plain", size: 10, r2Key: `b/${stamp}`, extractStatus: "none", extractedText: "pendingtoken" },
+] as never[]);
+const attachmentSearch = async (query: string) =>
+	(await db.select({ id: messages.id }).from(messages).where(and(eq(messages.mailboxId, `mbx_${stamp}`), ...buildSearchConditions(query, "UTC", searchOptions)))).length;
+check("search hits attachment text", (await attachmentSearch("smoketoken")) === 1);
+check("search hits attachment text by prefix", (await attachmentSearch("smoketok")) === 1);
+check("search hits attachment phrase", (await attachmentSearch('"smoketoken agreement"')) === 1);
+check("negated attachment term excludes", (await attachmentSearch("quarterly -smoketoken")) === 0);
+check("pending attachment is not indexed", (await attachmentSearch("pendingtoken")) === 0);
 
 const env = { DB: d1 } as unknown as CloudflareEnv;
 const event = { hostIds: [userId], name: "Intro", location: "Zoom", color: "blue", timeZone: "UTC" } as never;

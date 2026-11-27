@@ -525,6 +525,12 @@
       "statements": [
         "CREATE INDEX `message_attachments_extract_status_idx` ON `message_attachments` (`extract_status`,`created_at`);"
       ]
+    },
+    {
+      "name": "0041_attachment_search_index.sql",
+      "statements": [
+        "CREATE FULLTEXT INDEX `message_attachments_extracted_text_fts_idx` ON `message_attachments` (`extracted_text`);"
+      ]
     }
   ]
 }

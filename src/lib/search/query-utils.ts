@@ -98,12 +98,22 @@ function ftsString(value: string): string {
 }
 
 /**
- * One term. Phrases match whole words; plain terms match by prefix so "inv"
- * finds "invoice". Punctuation FTS5 treats as separators is normalised to
- * spaces first, so "maya@acme.test" becomes the phrase "maya acme test".
+ * The words a search term is allowed to contribute, in every dialect. Punctuation the
+ * tokenizers treat as separators is normalised to spaces first, so "maya@acme.test"
+ * becomes the words "maya acme test". Whatever remains is letters, digits and spaces —
+ * nothing that could change the grammar of the expression it is rendered into, which is
+ * what keeps the tsquery and boolean-mode strings below safe to build.
+ */
+function cleanTermWords(term: string): string {
+	return term.replace(/[^\p{L}\p{N}\s]+/gu, " ").replace(/\s+/g, " ").trim();
+}
+
+/**
+ * One term as an FTS5 expression. Phrases match whole words; plain terms match by prefix
+ * so "inv" finds "invoice". A term that cleans to several words is matched as a phrase.
  */
 function ftsTerm(term: string, phrase: boolean): string {
-	const cleaned = term.replace(/[^\p{L}\p{N}\s]+/gu, " ").replace(/\s+/g, " ").trim();
+	const cleaned = cleanTermWords(term);
 	if (!cleaned) return "";
 	if (phrase || cleaned.includes(" ")) {
 		// A multi-word prefix query needs the last word starred, which FTS5 only
@@ -113,16 +123,47 @@ function ftsTerm(term: string, phrase: boolean): string {
 	return `${ftsString(cleaned)}*`;
 }
 
-/** Free-text terms as FTS5 expressions, kept apart so negations can be applied separately. */
-function ftsTextParts(text: string): { positives: string[]; negatives: string[] } {
+/**
+ * One term as a `to_tsquery` operand (PostgreSQL, F53): `word:*` keeps FTS5's prefix
+ * matching and `w1 <-> w2` is the adjacent-words phrase. Parenthesised so a phrase can
+ * sit inside a `&` or `|` expression without depending on operator precedence. The words
+ * carry no operators — cleanTermWords already removed them — so the composed string is
+ * still a plain parameter of `to_tsquery`, never interpolated SQL.
+ */
+function tsQueryTerm(term: string, phrase: boolean): string {
+	const cleaned = cleanTermWords(term);
+	if (!cleaned) return "";
+	if (phrase || cleaned.includes(" ")) return `(${cleaned.split(" ").join(" <-> ")})`;
+	return `${cleaned}:*`;
+}
+
+/**
+ * One term as a MySQL boolean-mode AGAINST word (F53): `word*` is the prefix form FTS5
+ * uses and `"w1 w2"` the phrase. The leading `+` of an ANDed positive is added by the
+ * combiner, not here, so the same term works inside the ORed negation.
+ */
+function booleanTerm(term: string, phrase: boolean): string {
+	const cleaned = cleanTermWords(term);
+	if (!cleaned) return "";
+	if (phrase || cleaned.includes(" ")) return `"${cleaned}"`;
+	return `${cleaned}*`;
+}
+
+/** Free-text terms rendered by `render`, kept apart so negations can be applied separately. */
+function textParts(text: string, render: (term: string, phrase: boolean) => string): { positives: string[]; negatives: string[] } {
 	const positives: string[] = [];
 	const negatives: string[] = [];
 	for (const token of tokenizeSearchText(text)) {
-		const expr = ftsTerm(token.term, token.phrase);
+		const expr = render(token.term, token.phrase);
 		if (!expr) continue;
 		(token.negate ? negatives : positives).push(expr);
 	}
 	return { positives, negatives };
+}
+
+/** Free-text terms as FTS5 expressions, kept apart so negations can be applied separately. */
+function ftsTextParts(text: string): { positives: string[]; negatives: string[] } {
+	return textParts(text, ftsTerm);
 }
 
 /** FTS5 has no unary NOT, so a MATCH made only of negations is a syntax error; negations are a separate expression. */
@@ -186,4 +227,43 @@ export function buildFtsNegation(parsed: ParsedSearchQuery): string | null {
 export function buildFtsFreeTextMatch(parsed: ParsedSearchQuery): string | null {
 	const { positives } = ftsTextParts(parsed.text);
 	return combined(positives, "AND");
+}
+
+/**
+ * The same positive free-text terms as one `to_tsquery` input (PostgreSQL, F53):
+ * `a:* & (b <-> c)` — every term required, like the ANDed FTS5 expression, and with
+ * FTS5's prefix and phrase semantics. Feeding `to_tsquery` rather than `plainto_tsquery`
+ * is deliberate: it is the only parser that keeps `:*` prefixing, and the string handed
+ * to it contains nothing but cleaned words and the operators built here.
+ */
+export function buildTsQueryFreeTextMatch(parsed: ParsedSearchQuery): string | null {
+	const { positives } = textParts(parsed.text, tsQueryTerm);
+	return positives.length > 0 ? positives.join(" & ") : null;
+}
+
+/** The negated terms as one `to_tsquery` input (`a:* | b:*`), mirroring buildFtsNegation. */
+export function buildTsQueryNegation(parsed: ParsedSearchQuery): string | null {
+	const { negatives } = textParts(parsed.text, tsQueryTerm);
+	return negatives.length > 0 ? negatives.join(" | ") : null;
+}
+
+/**
+ * The positive terms as a MySQL boolean-mode AGAINST string (F53): `+a* +"b c"` — `+`
+ * makes each term required, the `*` suffix the prefix match and quoting the phrase, the
+ * same three shapes the tsquery and FTS5 expressions use.
+ */
+export function buildBooleanFreeTextMatch(parsed: ParsedSearchQuery): string | null {
+	const { positives } = textParts(parsed.text, booleanTerm);
+	return positives.length > 0 ? positives.map((expr) => `+${expr}`).join(" ") : null;
+}
+
+/**
+ * The negated terms as a MySQL boolean-mode AGAINST string (`a* "b c"`): with no `+`
+ * a row that mentions any negated term scores, and the caller excludes it with NOT IN,
+ * matching buildFtsNegation. Bare terms are used instead of the `-` operator because a
+ * query that is all `-` words matches nothing in boolean mode.
+ */
+export function buildBooleanNegation(parsed: ParsedSearchQuery): string | null {
+	const { negatives } = textParts(parsed.text, booleanTerm);
+	return negatives.length > 0 ? negatives.join(" ") : null;
 }
