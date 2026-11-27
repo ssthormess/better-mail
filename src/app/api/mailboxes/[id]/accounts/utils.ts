@@ -55,6 +55,17 @@ function readSkippedUids(cursor: string | null): number[] {
 	} catch { return []; }
 }
 
+/** POP3's equivalent of `skippedUids`: the hashed UIDLs of oversized messages the poller recorded. */
+function readSkippedUidls(cursor: string | null): string[] {
+	if (!cursor || !isSyncCursorFormat(cursor, "pop3")) return [];
+	try {
+		const value: unknown = JSON.parse(cursor);
+		if (typeof value !== "object" || value === null || Array.isArray(value)) return [];
+		const skipped = (value as { skippedUidls?: unknown }).skippedUidls;
+		return Array.isArray(skipped) && skipped.every((uidl) => typeof uidl === "string" && uidl.length > 0 && uidl.length <= 128) ? skipped : [];
+	} catch { return []; }
+}
+
 export function externalAccountView(row: ExternalAccountRow): ExternalAccountView {
 	return {
 		id: row.id,
@@ -68,6 +79,7 @@ export function externalAccountView(row: ExternalAccountRow): ExternalAccountVie
 		lastSyncedAt: row.lastSyncedAt?.toISOString() ?? null,
 		lastError: row.lastError,
 		skippedUids: readSkippedUids(row.syncCursor),
+		skippedUidls: readSkippedUidls(row.syncCursor),
 		createdAt: row.createdAt.toISOString(),
 		updatedAt: row.updatedAt.toISOString(),
 	};

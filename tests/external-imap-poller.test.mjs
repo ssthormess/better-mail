@@ -14,7 +14,7 @@ await build({
  stdin: { contents: `
   export { SqliteDatabase } from "./server/runtime/sqlite-database.ts";
   export { applyMigrations } from "./server/runtime/migrate.ts";
-  export { pollExternalImapAccounts } from "./src/lib/external-accounts/poller.ts";
+  export { pollExternalAccounts } from "./src/lib/external-accounts/poller.ts";
   export { encryptSecret } from "./src/lib/external-accounts/crypto.ts";
  `, resolveDir: root, sourcefile: "external-imap-poller-test.ts" },
  outfile: join(out, "entry.mjs"), bundle: true, platform: "node", format: "esm", target: "node24", tsconfig: join(root, "tsconfig.json"), packages: "external",
@@ -79,7 +79,7 @@ async function fixture(t, options = {}) {
   VALUES (?, 'mailbox', 'owner', ?, ?, ?, 'none', ?, ?, ?, NULL, NULL, ?, 1, 1)`).run(id, protocol, "127.0.0.1", server.port, id, sealed, enabled, cursor);
  insert();
  env.REALTIME = { getByName: () => ({ fetch: async () => { effects.realtime++; return new Response(null, { status: 204 }); } }) };
- return { env, sql, database, server, objects, effects, insert, poll: now => m.pollExternalImapAccounts(env, now) };
+ return { env, sql, database, server, objects, effects, insert, poll: now => m.pollExternalAccounts(env, now) };
 }
 
 const muteInboundLogs = t => {
@@ -240,9 +240,13 @@ test("authentication failure is sanitized and exponential backoff suppresses a r
  assert.equal(f.server.state.connections, afterSuccess + 1, "success reset the failure counter to the base one-minute delay");
 });
 
-test("disabled and non-IMAP accounts are not dialed", async t => {
+test("disabled accounts are not dialed; a POP3 account uses the POP3 fetch path and fails against an IMAP speaker", async t => {
  const f = await fixture(t); f.sql.prepare("DELETE FROM external_accounts").run(); f.insert("disabled", { enabled: 0 }); f.insert("pop", { protocol: "pop3" });
- const result = await f.poll(new Date()); assert.deepEqual(result, { accounts: 0 }); assert.equal(f.server.state.connections, 0);
+ const result = await f.poll(new Date());
+ assert.deepEqual(result, { accounts: 0 });
+ assert.equal(f.server.state.connections, 1, "only the POP3 account was attempted; the disabled row never dialed");
+ assert.equal(f.sql.prepare("SELECT count(*) AS n FROM messages").get().n, 0);
+ assert.match(f.sql.prepare("SELECT last_error FROM external_accounts WHERE id='pop'").get().last_error, /POP3 poll failed/);
 });
 
 test("overlapping scheduler ticks are skipped across a slow in-flight poll", async t => {
@@ -276,7 +280,7 @@ test("two independent Node processes acquire only one database-backed account le
  const f = await fixture(t, { databasePath, messages: new Map(), pauseExamine: true });
  const bundleUrl = pathToFileURL(join(out, "entry.mjs")).href;
  const runChild = () => new Promise((resolve, reject) => {
-  const source = `const m=await import(${JSON.stringify(bundleUrl)});const db=new m.SqliteDatabase(process.env.TEST_DB);const env={DB:db,MAILFLARE_RUNTIME:"node",EXTERNAL_FETCH_ALLOW_PRIVATE:"1",MAILFLARE_ENCRYPTION_KEY:process.env.TEST_KEY,BUCKET:{}};try{console.log(JSON.stringify(await m.pollExternalImapAccounts(env)));}catch(e){console.error(e.message);process.exitCode=1}finally{db.db.close()}`;
+  const source = `const m=await import(${JSON.stringify(bundleUrl)});const db=new m.SqliteDatabase(process.env.TEST_DB);const env={DB:db,MAILFLARE_RUNTIME:"node",EXTERNAL_FETCH_ALLOW_PRIVATE:"1",MAILFLARE_ENCRYPTION_KEY:process.env.TEST_KEY,BUCKET:{}};try{console.log(JSON.stringify(await m.pollExternalAccounts(env)));}catch(e){console.error(e.message);process.exitCode=1}finally{db.db.close()}`;
   const child = spawn(process.execPath, ["--input-type=module", "-e", source], { env: { ...process.env, TEST_DB: databasePath, TEST_KEY: KEY }, stdio: ["ignore", "pipe", "pipe"] });
   let stdout = ""; let stderr = ""; child.stdout.on("data", chunk => { stdout += chunk; }); child.stderr.on("data", chunk => { stderr += chunk; });
   child.once("error", reject); child.once("exit", code => code === 0 ? resolve(JSON.parse(stdout.trim())) : reject(new Error(stderr || `child exited ${code}`)));

@@ -114,9 +114,10 @@ test("the owner creates an account and reads it back without the password", asyn
 	assert.equal(view.lastSyncedAt, null);
 	assert.equal(view.lastError, null);
 	assert.deepEqual(view.skippedUids, []);
+	assert.deepEqual(view.skippedUidls, []);
 	// The credential is never round-tripped, and only bounded skip diagnostics are visible.
 	assert.deepEqual(Object.keys(view).sort(), [
-		"createdAt", "enabled", "host", "id", "lastError", "lastSyncedAt", "passwordSet", "port", "protocol", "skippedUids", "tlsMode", "updatedAt", "username",
+		"createdAt", "enabled", "host", "id", "lastError", "lastSyncedAt", "passwordSet", "port", "protocol", "skippedUidls", "skippedUids", "tlsMode", "updatedAt", "username",
 	]);
 
 	const [row] = f.rows();

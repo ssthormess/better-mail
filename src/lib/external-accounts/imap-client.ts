@@ -1,20 +1,13 @@
-import { lookup } from "node:dns/promises";
-import { isIP } from "node:net";
-import { connect as tcpConnect } from "node:net";
-import { checkServerIdentity, connect as tlsConnect } from "node:tls";
+import { createFetchTransport, EXTERNAL_COMMAND_TIMEOUT_MS, EXTERNAL_SESSION_TIMEOUT_MS, isSafeLoginArgument, quote } from "./transport";
 
 export const IMAP_MAX_MESSAGE_BYTES = 5 * 1024 * 1024;
 export const IMAP_MAX_MESSAGES_PER_POLL = 50;
 export const IMAP_MAX_BATCH_BYTES = 20 * 1024 * 1024;
 export const IMAP_UID_SEARCH_WINDOW = 1_000;
-const SESSION_TIMEOUT_MS = 45_000;
-const COMMAND_TIMEOUT_MS = 12_000;
-const MAX_BUFFERED_SOCKET_BYTES = 32 * 1024 * 1024;
-const MAX_LINE_BYTES = 16 * 1024;
-const MAX_RESPONSE_METADATA_BYTES = 512 * 1024;
+const SESSION_TIMEOUT_MS = EXTERNAL_SESSION_TIMEOUT_MS;
+const COMMAND_TIMEOUT_MS = EXTERNAL_COMMAND_TIMEOUT_MS;
 const MAX_SEARCH_UIDS = IMAP_UID_SEARCH_WINDOW;
 
-type Socket = import("node:net").Socket;
 type FetchedMessage = { uid: number; raw: Buffer };
 type FetchEvent = (FetchedMessage | { uid: number; outcome: "oversized" | "expunged" | "scanned" }) & { uidValidity: number };
 type ImapRecord = { lines: string[]; literal: Buffer | null; literalLength: number; hasLiteral: boolean; literalAttribute: string | null };
@@ -33,156 +26,21 @@ export async function fetchImap(
  options: { maxBatchBytes?: number; deadlineAt?: number; onMessage?: (message: FetchEvent) => Promise<boolean | void> } = {},
 ) {
  const sessionDeadline = Math.min(Date.now() + SESSION_TIMEOUT_MS, options.deadlineAt ?? Number.POSITIVE_INFINITY);
- let socket: Socket | undefined;
- const receive: Buffer[] = [];
- let bufferedBytes = 0;
- let closed = false;
- const waiters = new Set<() => void>();
- let responseMetadataBytes = 0;
- let sessionTimer: ReturnType<typeof setTimeout> | undefined;
- const wake = () => { for (const waiter of waiters) waiter(); waiters.clear(); };
- const onClosed = () => { closed = true; if (sessionTimer) clearTimeout(sessionTimer); wake(); };
- const checkDeadline = (deadline: number) => {
-  if (Date.now() >= deadline) throw new Error("timeout");
-  if (closed || !socket || socket.destroyed) throw new Error("connection_failed");
- };
- const waitForData = async (deadline: number) => {
-  checkDeadline(deadline);
-  if (bufferedBytes > 0) return;
-  await new Promise<void>((resolve, reject) => {
-   const remaining = Math.max(1, deadline - Date.now());
-   const timer = setTimeout(() => { waiters.delete(onData); socket?.destroy(); reject(new Error("timeout")); }, remaining);
-   const onData = () => { clearTimeout(timer); waiters.delete(onData); resolve(); };
-   waiters.add(onData);
-  });
-  checkDeadline(deadline);
- };
- const readBytes = async (length: number, deadline: number, collect = true): Promise<Buffer | null> => {
-  const pieces: Buffer[] = [];
-  let remaining = length;
-  while (remaining > 0) {
-   if (!bufferedBytes) await waitForData(deadline);
-   const chunk = receive[0];
-   const take = Math.min(remaining, chunk.length);
-   if (collect) pieces.push(chunk.subarray(0, take));
-   remaining -= take; bufferedBytes -= take;
-   if (take === chunk.length) receive.shift();
-   else receive[0] = chunk.subarray(take);
-  }
-  return collect ? Buffer.concat(pieces, length) : null;
- };
- const readLine = async (deadline: number): Promise<string> => {
-  const pieces: Buffer[] = [];
-  let length = 0;
-  for (;;) {
-   if (!bufferedBytes) await waitForData(deadline);
-   const chunk = receive[0];
-   const newline = chunk.indexOf(10);
-   const take = newline >= 0 ? newline + 1 : chunk.length;
-   length += take;
-   if (length > MAX_LINE_BYTES) throw new Error("response_limit");
-   pieces.push(chunk.subarray(0, take)); bufferedBytes -= take;
-   if (take === chunk.length) receive.shift();
-   else receive[0] = chunk.subarray(take);
-   if (newline >= 0) {
-    const line = Buffer.concat(pieces, length).toString("ascii");
-    if (!line.endsWith("\r\n")) throw new Error("invalid_response");
-    responseMetadataBytes += length;
-    if (responseMetadataBytes > MAX_RESPONSE_METADATA_BYTES) throw new Error("response_limit");
-    return line.slice(0, -2);
-   }
-  }
- };
- const attach = (next: Socket) => {
-  if (sessionTimer) clearTimeout(sessionTimer);
-  socket = next; closed = false;
-  sessionTimer = setTimeout(() => next.destroy(), Math.max(1, sessionDeadline - Date.now()));
-  next.on("data", (chunk: Buffer) => {
-   if (bufferedBytes + chunk.length > MAX_BUFFERED_SOCKET_BYTES) { next.destroy(); closed = true; wake(); return; }
-   receive.push(chunk); bufferedBytes += chunk.length; wake();
-  });
-  next.on("error", onClosed); next.on("end", onClosed); next.on("close", onClosed);
- };
- const dialAddresses = async () => {
-  // Resolve afresh and dial only checked numeric results, closing the DNS-rebind gap.
-  const addresses = isIP(account.host) ? [{ address: account.host }] : await withDeadline(lookup(account.host, { all: true, verbatim: true }), Math.min(sessionDeadline, Date.now() + COMMAND_TIMEOUT_MS));
-  if (!addresses.length) throw new Error("connection_failed");
-  if (!account.allowPrivate && addresses.some(({ address }) => !isPublicAddress(address))) throw new Error("egress_denied");
-  return [...new Set(addresses.map(({ address }) => address))].slice(0, 8);
- };
- const establish = async (mode: "plain" | "implicit-tls") => {
-  const addresses = await dialAddresses();
-  let lastError: unknown = new Error("connection_failed");
-  for (const address of addresses) {
-   if (Date.now() >= sessionDeadline) throw new Error("timeout");
-   let candidate: Socket | undefined;
-   try {
-    if (mode === "plain") {
-     const plain = tcpConnect({ host: address, port: account.port });
-     candidate = plain;
-     await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => { plain.destroy(); reject(new Error("timeout")); }, Math.min(COMMAND_TIMEOUT_MS, sessionDeadline - Date.now()));
-      plain.once("connect", () => { clearTimeout(timer); resolve(); });
-      plain.once("error", () => { clearTimeout(timer); reject(new Error("connection_failed")); });
-     });
-     attach(plain);
-    } else {
-     const secure = tlsConnect({ host: address, port: account.port, ...(isIP(account.host) ? {} : { servername: account.host }), rejectUnauthorized: true, checkServerIdentity: (_host, cert) => checkServerIdentity(account.host, cert) });
-     candidate = secure;
-     await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => { secure.destroy(); reject(new Error("timeout")); }, Math.min(COMMAND_TIMEOUT_MS, sessionDeadline - Date.now()));
-      secure.once("secureConnect", () => { clearTimeout(timer); resolve(); });
-      secure.once("error", () => { clearTimeout(timer); reject(new Error("tls_failed")); });
-      secure.once("end", () => { clearTimeout(timer); reject(new Error("tls_failed")); });
-      secure.once("close", () => { if (!secure.authorized) { clearTimeout(timer); reject(new Error("tls_failed")); } });
-     });
-     attach(secure);
-    }
-    await readGreeting();
-    if (account.tlsMode === "starttls") {
-     await command("STARTTLS", 0);
-     const plain = socket!;
-     plain.removeAllListeners("data"); plain.removeAllListeners("error"); plain.removeAllListeners("end"); plain.removeAllListeners("close");
-     receive.length = 0; bufferedBytes = 0; closed = false;
-     const secure = tlsConnect({ socket: plain, ...(isIP(account.host) ? {} : { servername: account.host }), rejectUnauthorized: true, checkServerIdentity: (_host, cert) => checkServerIdentity(account.host, cert) });
-     candidate = secure;
-     await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => { secure.destroy(); reject(new Error("timeout")); }, Math.min(COMMAND_TIMEOUT_MS, sessionDeadline - Date.now()));
-      secure.once("secureConnect", () => { clearTimeout(timer); resolve(); });
-      secure.once("error", () => { clearTimeout(timer); reject(new Error("tls_failed")); });
-      secure.once("end", () => { clearTimeout(timer); reject(new Error("tls_failed")); });
-      secure.once("close", () => { if (!secure.authorized) { clearTimeout(timer); reject(new Error("tls_failed")); } });
-     });
-     attach(secure);
-    }
-    return;
-   } catch (error) {
-    lastError = error;
-    candidate?.removeAllListeners("data"); candidate?.removeAllListeners("error"); candidate?.removeAllListeners("end"); candidate?.removeAllListeners("close");
-    candidate?.destroy();
-    if (socket === candidate) socket = undefined;
-    if (sessionTimer) clearTimeout(sessionTimer);
-    sessionTimer = undefined; receive.length = 0; bufferedBytes = 0; closed = false; responseMetadataBytes = 0;
-    if (Date.now() >= sessionDeadline) throw new Error("timeout");
-   }
-  }
-  throw lastError instanceof Error ? lastError : new Error("connection_failed");
- };
- const readGreeting = async () => {
-  const line = await readLine(Math.min(sessionDeadline, Date.now() + COMMAND_TIMEOUT_MS));
+ const transport = createFetchTransport(account, sessionDeadline);
+ const readGreeting = async (readLine: (deadline: number) => Promise<string>, deadline: number) => {
+  const line = await readLine(deadline);
   if (!/^\* (?:OK|PREAUTH)(?: |$)/i.test(line) || /^\* PREAUTH(?: |$)/i.test(line)) throw new Error("server_unavailable");
  };
  const command = async (text: string, literalLimit = maxBytes): Promise<ImapResponse> => {
   if (Date.now() >= sessionDeadline) throw new Error("timeout");
-  responseMetadataBytes = 0;
-  const s = socket!;
+  transport.resetResponseMetadata();
   const tag = `A${++tagNumber}`;
-  s.write(`${tag} ${text}\r\n`);
+  transport.write(`${tag} ${text}\r\n`);
   const deadline = Math.min(sessionDeadline, Date.now() + COMMAND_TIMEOUT_MS);
   const records: ImapRecord[] = [];
   let current: ImapRecord | null = null;
   for (;;) {
-   const line = await readLine(deadline);
+   const line = await transport.readLine(deadline);
    const tagged = line.match(new RegExp(`^${tag} (OK|NO|BAD)(?: |$)`, "i"));
    if (tagged) {
     if (current && isFetchRecord(current)) validateFetchRecord(current);
@@ -210,7 +68,7 @@ export async function fetchImap(
     current.literalLength = length;
     current.literalAttribute = literalAttr.name.toUpperCase();
     if (length > literalLimit) throw new Error("message_size_unverified");
-    current.literal = await readBytes(length, deadline) ?? Buffer.alloc(0);
+    current.literal = await transport.readBytes(length, deadline) ?? Buffer.alloc(0);
    }
   }
  };
@@ -234,7 +92,10 @@ export async function fetchImap(
  const messages: FetchedMessage[] = [];
  const skippedUids: number[] = [];
  try {
-  await establish(account.tlsMode === "implicit-tls" ? "implicit-tls" : "plain");
+  await transport.connect(account.tlsMode === "implicit-tls" ? "implicit-tls" : "plain", {
+   greeting: readGreeting,
+   starttls: account.tlsMode === "starttls" ? async () => { await command("STARTTLS", 0); } : undefined,
+  });
   if (!isSafeLoginArgument(account.username) || !isSafeLoginArgument(account.password)) throw new Error("credentials_unsupported");
   await command(`LOGIN ${quote(account.username)} ${quote(account.password)}`, 0);
   const selected = await command('EXAMINE "INBOX"', 0);
@@ -292,12 +153,10 @@ export async function fetchImap(
    }
   }
   await command("LOGOUT", 0).catch(() => {});
-  if (sessionTimer) clearTimeout(sessionTimer);
-  socket?.end();
+  transport.end();
   return { uidValidity: currentValidity, lastUid: Math.max(initialCursor?.uidValidity === currentValidity ? initialCursor.lastUid : 0, lastUid), messages, delivered, skippedUids };
  } catch (error) {
-  if (sessionTimer) clearTimeout(sessionTimer);
-  socket?.destroy();
+  transport.destroy();
   throw error;
  }
 }
@@ -419,42 +278,4 @@ function extractSearchUids(response: ImapResponse, startUid: number, endUid: num
   uids.push(uid);
  }
  return uids.sort((a, b) => a - b);
-}
-async function withDeadline<T>(promise: Promise<T>, deadline: number): Promise<T> {
- let timer: ReturnType<typeof setTimeout> | undefined;
- try {
-  return await Promise.race([promise, new Promise<T>((_resolve, reject) => { timer = setTimeout(() => reject(new Error("timeout")), Math.max(1, deadline - Date.now())); })]);
- } finally { if (timer) clearTimeout(timer); }
-}
-function isSafeLoginArgument(value: string) { return /^[\x20-\x7e]+$/.test(value) && !/[\r\n\0]/.test(value); }
-function quote(value: string) { return `"${value.replace(/[\\"]/g, "\\$&")}"`; }
-
-function isPublicAddress(address: string): boolean {
- if (isIP(address) === 4) {
-  const parts = address.split(".").map(Number);
-  const n = (((parts[0] * 256 + parts[1]) * 256 + parts[2]) * 256 + parts[3]) >>> 0;
-  const ranges: Array<[number, number]> = [
-   [0x00000000, 8], [0x0a000000, 8], [0x64400000, 10], [0x7f000000, 8], [0xa9fe0000, 16],
-   [0xac100000, 12], [0xc0000000, 24], [0xc0000200, 24], [0xc0586300, 24], [0xc0a80000, 16],
-   [0xc6120000, 15], [0xc6336400, 24], [0xcb007100, 24], [0xe0000000, 4], [0xf0000000, 4],
-  ];
-  return !ranges.some(([base, bits]) => (n >>> (32 - bits)) === (base >>> (32 - bits)));
- }
- if (isIP(address) !== 6) return false;
- const value = ipv6Number(address);
- const inRange = (base: bigint, bits: number) => value >> BigInt(128 - bits) === base >> BigInt(128 - bits);
- // Only global unicast is routable by default; exclude documentation, protocol-assignment and transition blocks.
- return inRange(0x20000000000000000000000000000000n, 3)
-  && !inRange(0x20010db8000000000000000000000000n, 32)
-  && !inRange(0x20010000000000000000000000000000n, 23)
-  && !inRange(0x20020000000000000000000000000000n, 16)
-  && !inRange(0x3fff0000000000000000000000000000n, 20);
-}
-function ipv6Number(address: string): bigint {
- if (address.includes(".")) return 0n;
- const halves = address.toLowerCase().split("::");
- const parse = (part: string) => part ? part.split(":").map(piece => BigInt(`0x${piece || "0"}`)) : [];
- const left = parse(halves[0]); const right = parse(halves[1] ?? "");
- const words = halves.length === 1 ? left : [...left, ...Array(8 - left.length - right.length).fill(0n), ...right];
- return words.reduce((value, word) => (value << 16n) | word, 0n);
 }

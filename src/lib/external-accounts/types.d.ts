@@ -18,8 +18,10 @@ export type ExternalAccountView = {
 	passwordSet: boolean;
 	lastSyncedAt: string | null;
 	lastError: string | null;
-	/** Most recent UIDs skipped because RFC822.SIZE exceeded the fetch limit. */
+	/** Most recent UIDs skipped because RFC822.SIZE exceeded the fetch limit (IMAP only). */
 	skippedUids: number[];
+	/** Hashed UIDLs of messages skipped because their LIST size exceeded the fetch limit (POP3 only). */
+	skippedUidls: string[];
 	createdAt: string;
 	updatedAt: string;
 };
