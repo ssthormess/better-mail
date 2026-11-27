@@ -531,6 +531,24 @@
       "statements": [
         "CREATE FULLTEXT INDEX `message_attachments_extracted_text_fts_idx` ON `message_attachments` (`extracted_text`);"
       ]
+    },
+    {
+      "name": "0042_attachment_search_text.sql",
+      "statements": [
+        "ALTER TABLE `message_attachments` ADD `search_text` text;"
+      ]
+    },
+    {
+      "name": "0043_attachment_search_text.sql",
+      "statements": [
+        "DROP INDEX `message_attachments_extracted_text_fts_idx` ON `message_attachments`;"
+      ]
+    },
+    {
+      "name": "0044_attachment_search_text.sql",
+      "statements": [
+        "CREATE FULLTEXT INDEX `message_attachments_extracted_text_fts_idx` ON `message_attachments` (`search_text`);"
+      ]
     }
   ]
 }

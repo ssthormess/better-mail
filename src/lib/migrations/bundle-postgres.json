@@ -573,6 +573,14 @@
       "statements": [
         "CREATE INDEX \"message_attachments_extracted_text_fts_idx\" ON \"message_attachments\" USING gin ((to_tsvector('simple', \"extracted_text\"))) WHERE \"extract_status\" = 'done' AND \"extracted_text\" IS NOT NULL;"
       ]
+    },
+    {
+      "name": "0042_attachment_search_text.sql",
+      "statements": [
+        "ALTER TABLE \"message_attachments\" ADD \"search_text\" text;",
+        "DROP INDEX IF EXISTS \"message_attachments_extracted_text_fts_idx\";",
+        "CREATE INDEX \"message_attachments_extracted_text_fts_idx\" ON \"message_attachments\" USING gin ((to_tsvector('simple', \"search_text\"))) WHERE \"extract_status\" = 'done' AND \"search_text\" IS NOT NULL;"
+      ]
     }
   ]
 }

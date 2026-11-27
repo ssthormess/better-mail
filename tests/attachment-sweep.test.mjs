@@ -129,20 +129,20 @@ test("one run drains a bounded batch of the oldest pending rows", async (t) => {
 	assert.equal(ATTACHMENT_EXTRACTION_SWEEP_BATCH, 5);
 
 	const first = await sweepAttachmentExtraction(env);
-	assert.deepEqual(first, { scanned: 5, done: 5, failed: 0, skipped: 0, undecided: 0, morePending: true });
+	assert.deepEqual(first, { scanned: 5, done: 5, failed: 0, skipped: 0, undecided: 0, morePending: true, normalized: 0 });
 	assert.deepEqual(Object.keys(statuses()).filter((id) => statuses()[id] === "done"), ["a1", "a2", "a3", "a4", "a5"], "oldest first");
 	assert.equal(row("a1").text, "text 1", "the extracted text is stored");
 	assert.ok(row("a1").at, "the run records when it ran");
 
-	assert.deepEqual(await sweepAttachmentExtraction(env), { scanned: 5, done: 5, failed: 0, skipped: 0, undecided: 0, morePending: true });
-	assert.deepEqual(await sweepAttachmentExtraction(env), { scanned: 2, done: 2, failed: 0, skipped: 0, undecided: 0, morePending: false });
+	assert.deepEqual(await sweepAttachmentExtraction(env), { scanned: 5, done: 5, failed: 0, skipped: 0, undecided: 0, morePending: true, normalized: 0 });
+	assert.deepEqual(await sweepAttachmentExtraction(env), { scanned: 2, done: 2, failed: 0, skipped: 0, undecided: 0, morePending: false, normalized: 0 });
 	// A drained queue costs nothing: the batch read finds no candidates.
-	assert.deepEqual(await sweepAttachmentExtraction(env), { scanned: 0, done: 0, failed: 0, skipped: 0, undecided: 0, morePending: false });
+	assert.deepEqual(await sweepAttachmentExtraction(env), { scanned: 0, done: 0, failed: 0, skipped: 0, undecided: 0, morePending: false, normalized: 0 });
 });
 
 test("a run takes the limit it is given", async (t) => {
 	const { env, statuses } = await fixture(t, pending(4));
-	assert.deepEqual(await sweepAttachmentExtraction(env, { limit: 1 }), { scanned: 1, done: 1, failed: 0, skipped: 0, undecided: 0, morePending: true });
+	assert.deepEqual(await sweepAttachmentExtraction(env, { limit: 1 }), { scanned: 1, done: 1, failed: 0, skipped: 0, undecided: 0, morePending: true, normalized: 0 });
 	assert.equal(statuses().a1, "done");
 	assert.equal(statuses().a2, "none", "the rest wait for the next run");
 });
@@ -151,7 +151,7 @@ test("a PDF is parsed by the sweep, which is the only enricher", async (t) => {
 	const { env, row } = await fixture(t, [{ id: "p1", type: "application/pdf", text: "quarterly revenue" }]);
 	assert.equal(row("p1").status, "none", "nothing extracted it on the way in");
 	const result = await sweepAttachmentExtraction(env);
-	assert.deepEqual(result, { scanned: 1, done: 1, failed: 0, skipped: 0, undecided: 0, morePending: false });
+	assert.deepEqual(result, { scanned: 1, done: 1, failed: 0, skipped: 0, undecided: 0, morePending: false, normalized: 0 });
 	assert.equal(row("p1").status, "done");
 	assert.match(row("p1").text, /quarterly revenue/);
 });
@@ -161,7 +161,7 @@ test("a failing row keeps its own status and the batch continues", async (t) => 
 	// The object for a2 is gone: the extractor records "failed" instead of throwing.
 	env.BUCKET.get = ((get) => async (key, options) => (key.includes("/a2/") ? null : get(key, options)))(env.BUCKET.get);
 	const result = await sweepAttachmentExtraction(env);
-	assert.deepEqual(result, { scanned: 4, done: 3, failed: 1, skipped: 0, undecided: 0, morePending: false });
+	assert.deepEqual(result, { scanned: 4, done: 3, failed: 1, skipped: 0, undecided: 0, morePending: false, normalized: 0 });
 	assert.deepEqual(statuses(), { a1: "done", a2: "failed", a3: "done", a4: "done" });
 });
 
@@ -171,17 +171,19 @@ test("an unsupported attachment is decided skipped without reading its object", 
 		{ id: "z2", text: "after the skip", createdAt: 2 },
 	]);
 	const result = await sweepAttachmentExtraction(env);
-	assert.deepEqual(result, { scanned: 2, done: 1, failed: 0, skipped: 1, undecided: 0, morePending: false });
+	assert.deepEqual(result, { scanned: 2, done: 1, failed: 0, skipped: 1, undecided: 0, morePending: false, normalized: 0 });
 	assert.equal(row("z1").status, "skipped");
 	assert.equal(row("z2").status, "done", "one decided row does not end the batch");
 });
 
 test("a decided row is not swept again", async (t) => {
 	const { env, database } = await fixture(t, [{ id: "a1", text: "already read", status: "done" }]);
+	// A done row with text but no stream — the pre-0117 state the backfill drain exists for.
 	database.db.prepare("UPDATE message_attachments SET extracted_text = 'stored text' WHERE id = 'a1'").run();
 	const result = await sweepAttachmentExtraction(env);
-	assert.deepEqual(result, { scanned: 0, done: 0, failed: 0, skipped: 0, undecided: 0, morePending: false });
+	assert.deepEqual(result, { scanned: 0, done: 0, failed: 0, skipped: 0, undecided: 0, morePending: false, normalized: 1 });
 	assert.equal(env.BUCKET.gets(), 0, "nothing was read");
+	assert.equal(database.db.prepare("SELECT search_text AS st FROM message_attachments WHERE id = 'a1'").get().st, "stored text", "the drain wrote the normalized stream");
 });
 
 test("a trashed attachment is extracted like any other", async (t) => {
@@ -215,6 +217,6 @@ test("a row whose outcome is not persisted is reported as undecided, not done", 
 		},
 	};
 	const result = await sweepAttachmentExtraction(poisoned);
-	assert.deepEqual(result, { scanned: 3, done: 2, failed: 0, skipped: 0, undecided: 1, morePending: false });
+	assert.deepEqual(result, { scanned: 3, done: 2, failed: 0, skipped: 0, undecided: 1, morePending: false, normalized: 0 });
 	assert.equal(statuses().a2, "none", "the undecided row is left for the next run");
 });

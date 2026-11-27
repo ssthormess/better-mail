@@ -556,6 +556,13 @@ export const messageAttachments = sqliteTable(
 		 * MAX_EXTRACTED_TEXT_BYTES and null unless `extract_status` is "done".
 		 */
 		extractedText: text("extracted_text"),
+		/**
+		 * The normalized token stream of `extracted_text` (src/lib/search/normalize.ts),
+		 * written with it and backfilled for older rows: this, not the raw text, is what
+		 * every dialect's attachment-text index sees, so the engines cannot disagree
+		 * about accents, punctuation or unindexable tokens (F53).
+		 */
+		searchText: text("search_text"),
 		/** "none" until extraction has run, and then the outcome; "none" rows extract on first use. */
 		extractStatus: text("extract_status", { enum: ["none", "done", "failed", "skipped"] })
 			.notNull()

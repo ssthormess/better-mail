@@ -1,5 +1,6 @@
 import type { ParsedSearchQuery, SearchToken } from "./types";
 import { dateFromZonedFields, normalizeTimeZone } from "@/lib/time/utils";
+import { normalizeSearchText } from "./normalize";
 
 /**
  * Gmail-style search grammar shared by the search box and the API:
@@ -109,11 +110,26 @@ function cleanTermWords(term: string): string {
 }
 
 /**
+ * The words a term contributes to an attachment-text index expression (F53 r2):
+ * the shared normalizer of ./normalize.ts, so a query asks every dialect for
+ * the same tokens its index was fed. Unlike cleanTermWords this also folds
+ * accents and drops unindexable tokens (short words, stopwords), which is why a
+ * term can legitimately clean to "" here — the clause it would have built is
+ * then simply absent, on every dialect alike.
+ */
+function cleanAttachmentWords(term: string): string {
+	return normalizeSearchText(term);
+}
+
+/** Turns a term into its indexable words; per index, not per term — see the two above. */
+type TermCleaner = (term: string) => string;
+
+/**
  * One term as an FTS5 expression. Phrases match whole words; plain terms match by prefix
  * so "inv" finds "invoice". A term that cleans to several words is matched as a phrase.
  */
-function ftsTerm(term: string, phrase: boolean): string {
-	const cleaned = cleanTermWords(term);
+function ftsTerm(term: string, phrase: boolean, clean: TermCleaner = cleanTermWords): string {
+	const cleaned = clean(term);
 	if (!cleaned) return "";
 	if (phrase || cleaned.includes(" ")) {
 		// A multi-word prefix query needs the last word starred, which FTS5 only
@@ -130,8 +146,8 @@ function ftsTerm(term: string, phrase: boolean): string {
  * carry no operators — cleanTermWords already removed them — so the composed string is
  * still a plain parameter of `to_tsquery`, never interpolated SQL.
  */
-function tsQueryTerm(term: string, phrase: boolean): string {
-	const cleaned = cleanTermWords(term);
+function tsQueryTerm(term: string, phrase: boolean, clean: TermCleaner): string {
+	const cleaned = clean(term);
 	if (!cleaned) return "";
 	if (phrase || cleaned.includes(" ")) return `(${cleaned.split(" ").join(" <-> ")})`;
 	return `${cleaned}:*`;
@@ -142,19 +158,23 @@ function tsQueryTerm(term: string, phrase: boolean): string {
  * uses and `"w1 w2"` the phrase. The leading `+` of an ANDed positive is added by the
  * combiner, not here, so the same term works inside the ORed negation.
  */
-function booleanTerm(term: string, phrase: boolean): string {
-	const cleaned = cleanTermWords(term);
+function booleanTerm(term: string, phrase: boolean, clean: TermCleaner): string {
+	const cleaned = clean(term);
 	if (!cleaned) return "";
 	if (phrase || cleaned.includes(" ")) return `"${cleaned}"`;
 	return `${cleaned}*`;
 }
 
 /** Free-text terms rendered by `render`, kept apart so negations can be applied separately. */
-function textParts(text: string, render: (term: string, phrase: boolean) => string): { positives: string[]; negatives: string[] } {
+function textParts(
+	text: string,
+	render: (term: string, phrase: boolean, clean: TermCleaner) => string,
+	clean: TermCleaner = cleanTermWords,
+): { positives: string[]; negatives: string[] } {
 	const positives: string[] = [];
 	const negatives: string[] = [];
 	for (const token of tokenizeSearchText(text)) {
-		const expr = render(token.term, token.phrase);
+		const expr = render(token.term, token.phrase, clean);
 		if (!expr) continue;
 		(token.negate ? negatives : positives).push(expr);
 	}
@@ -230,20 +250,47 @@ export function buildFtsFreeTextMatch(parsed: ParsedSearchQuery): string | null 
 }
 
 /**
- * The same positive free-text terms as one `to_tsquery` input (PostgreSQL, F53):
+ * The `buildAttachment*` functions below build the free-text expressions for the
+ * attachment-text index of each dialect (F53), all through the shared normalizer
+ * (cleanAttachmentWords): whatever the engines' tokenizers could disagree on —
+ * accents, punctuation inside a word, sub-three-character or stopword tokens —
+ * never reaches them, so every dialect answers the same term the same way.
+ * A term that normalizes to nothing contributes no clause, which is what makes a
+ * negated unindexable term permissive-equal across dialects instead of silently
+ * under-excluding on one of them (F53 gate round 1: `quick -the` on MySQL).
+ *
+ * The message index keeps its own semantics (buildFts* above): messages_fts and
+ * the LIKE scan still see the raw term, including words the attachment index
+ * never stores.
+ */
+
+/** Positive free text for `attachments_fts` (SQLite): `"a"* AND "b c"`, mirroring buildFtsFreeTextMatch. */
+export function buildAttachmentFtsMatch(parsed: ParsedSearchQuery): string | null {
+	const { positives } = textParts(parsed.text, ftsTerm, cleanAttachmentWords);
+	return combined(positives, "AND");
+}
+
+/** Negated terms for `attachments_fts` (`"a"* OR "b c"`), mirroring buildFtsNegation. */
+export function buildAttachmentFtsNegation(parsed: ParsedSearchQuery): string | null {
+	const { negatives } = textParts(parsed.text, ftsTerm, cleanAttachmentWords);
+	return combined(negatives, "OR");
+}
+
+/**
+ * The positive free-text terms as one `to_tsquery` input (PostgreSQL, F53):
  * `a:* & (b <-> c)` — every term required, like the ANDed FTS5 expression, and with
  * FTS5's prefix and phrase semantics. Feeding `to_tsquery` rather than `plainto_tsquery`
  * is deliberate: it is the only parser that keeps `:*` prefixing, and the string handed
  * to it contains nothing but cleaned words and the operators built here.
  */
-export function buildTsQueryFreeTextMatch(parsed: ParsedSearchQuery): string | null {
-	const { positives } = textParts(parsed.text, tsQueryTerm);
+export function buildAttachmentTsQueryMatch(parsed: ParsedSearchQuery): string | null {
+	const { positives } = textParts(parsed.text, tsQueryTerm, cleanAttachmentWords);
 	return positives.length > 0 ? positives.join(" & ") : null;
 }
 
-/** The negated terms as one `to_tsquery` input (`a:* | b:*`), mirroring buildFtsNegation. */
-export function buildTsQueryNegation(parsed: ParsedSearchQuery): string | null {
-	const { negatives } = textParts(parsed.text, tsQueryTerm);
+/** The negated terms as one `to_tsquery` input (`a:* | b:*`), mirroring buildAttachmentFtsNegation. */
+export function buildAttachmentTsQueryNegation(parsed: ParsedSearchQuery): string | null {
+	const { negatives } = textParts(parsed.text, tsQueryTerm, cleanAttachmentWords);
 	return negatives.length > 0 ? negatives.join(" | ") : null;
 }
 
@@ -252,18 +299,18 @@ export function buildTsQueryNegation(parsed: ParsedSearchQuery): string | null {
  * makes each term required, the `*` suffix the prefix match and quoting the phrase, the
  * same three shapes the tsquery and FTS5 expressions use.
  */
-export function buildBooleanFreeTextMatch(parsed: ParsedSearchQuery): string | null {
-	const { positives } = textParts(parsed.text, booleanTerm);
+export function buildAttachmentBooleanMatch(parsed: ParsedSearchQuery): string | null {
+	const { positives } = textParts(parsed.text, booleanTerm, cleanAttachmentWords);
 	return positives.length > 0 ? positives.map((expr) => `+${expr}`).join(" ") : null;
 }
 
 /**
  * The negated terms as a MySQL boolean-mode AGAINST string (`a* "b c"`): with no `+`
  * a row that mentions any negated term scores, and the caller excludes it with NOT IN,
- * matching buildFtsNegation. Bare terms are used instead of the `-` operator because a
- * query that is all `-` words matches nothing in boolean mode.
+ * matching buildAttachmentFtsNegation. Bare terms are used instead of the `-` operator
+ * because a query that is all `-` words matches nothing in boolean mode.
  */
-export function buildBooleanNegation(parsed: ParsedSearchQuery): string | null {
-	const { negatives } = textParts(parsed.text, booleanTerm);
+export function buildAttachmentBooleanNegation(parsed: ParsedSearchQuery): string | null {
+	const { negatives } = textParts(parsed.text, booleanTerm, cleanAttachmentWords);
 	return negatives.length > 0 ? negatives.join(" ") : null;
 }

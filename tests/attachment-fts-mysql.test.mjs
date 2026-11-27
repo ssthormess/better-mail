@@ -16,7 +16,7 @@ await build({
 			export { openExternalDatabase } from "./src/db/external.ts";
 			export { resolveDatabaseConfig } from "./src/db/dialect.ts";
 			export { buildSearchConditions } from "./src/lib/search/conditions.ts";
-			export { buildBooleanFreeTextMatch, buildBooleanNegation, parseSearchQuery } from "./src/lib/search/query-utils.ts";
+			export { buildAttachmentBooleanMatch, buildAttachmentBooleanNegation, parseSearchQuery } from "./src/lib/search/query-utils.ts";
 			export { hasAttachmentSearchIndex, clearAttachmentIndexProbe } from "./src/lib/search/attachment-index.ts";
 			export { getDb, schema } from "./src/db/index.ts";
 		`,
@@ -32,7 +32,7 @@ await build({
 	packages: "external",
 	logLevel: "silent",
 });
-const { and, openExternalDatabase, resolveDatabaseConfig, buildSearchConditions, buildBooleanFreeTextMatch, buildBooleanNegation, parseSearchQuery, hasAttachmentSearchIndex, clearAttachmentIndexProbe, getDb, schema } = await import(pathToFileURL(join(directory, "entry.mjs")).href);
+const { and, openExternalDatabase, resolveDatabaseConfig, buildSearchConditions, buildAttachmentBooleanMatch, buildAttachmentBooleanNegation, parseSearchQuery, hasAttachmentSearchIndex, clearAttachmentIndexProbe, getDb, schema } = await import(pathToFileURL(join(directory, "entry.mjs")).href);
 
 /**
  * No MySQL server here: the executor is a stub that records the statements it is asked
@@ -52,19 +52,28 @@ const compiled = (query, options = { attachmentText: true }) =>
 
 test("the positive half is a boolean-mode AGAINST over the eligible set", async () => {
 	const { sql, params } = compiled("smoketok report");
-	assert.match(sql, /match\(`message_attachments`\.`extracted_text`\) against\(\? in boolean mode\)/i, "the FULLTEXT index is queried in boolean mode");
+	assert.match(sql, /match\(`message_attachments`\.`search_text`\) against\(\? in boolean mode\)/i, "the FULLTEXT index is queried in boolean mode over the normalized stream");
 	assert.match(sql, /extract_status` = 'done'/, "the eligible set keeps the done predicate");
-	assert.match(sql, /extracted_text` is not null/i, "the eligible set keeps the nonnull predicate");
+	assert.match(sql, /search_text` is not null/i, "the eligible set is the done rows whose stream exists");
 	assert.ok(!sql.includes("smoketok"), "no term text is interpolated into the SQL");
 	assert.ok(params.includes("+smoketok* +report*"), "both terms are required in one bound AGAINST expression");
-	assert.equal(buildBooleanFreeTextMatch(parseSearchQuery('smoketok "exact phrase"', "UTC")), '+smoketok* +"exact phrase"');
+	assert.equal(buildAttachmentBooleanMatch(parseSearchQuery('smoketok "exact phrase"', "UTC")), '+smoketok* +"exact phrase"');
+});
+
+test("unindexable terms build no clause, identically to what the index cannot hold", async () => {
+	assert.equal(buildAttachmentBooleanMatch(parseSearchQuery("the", "UTC")), null, "a stock stopword contributes nothing");
+	assert.equal(buildAttachmentBooleanMatch(parseSearchQuery("ab", "UTC")), null, "a sub-three-character token contributes nothing");
+	assert.equal(buildAttachmentBooleanMatch(parseSearchQuery("quarterw -the", "UTC")), "+quarterw*", "the negated stopword vanishes while the positive stays");
+	assert.equal(buildAttachmentBooleanNegation(parseSearchQuery("quarterw -the -x", "UTC")), null, "both unindexable negations drop");
+	assert.equal(buildAttachmentBooleanMatch(parseSearchQuery("résumé", "UTC")), "+resume*", "the query term is accent-folded like the stream");
+	assert.equal(buildAttachmentBooleanMatch(parseSearchQuery("me@example.com", "UTC")), "+example*", "punctuation splits; 'me' is too short and 'com' a stopword, both drop");
 });
 
 test("a negated term is rejected by a NOT IN against the same index", async () => {
 	const { sql, params } = compiled("quarterly -confidential -\"two words\"");
 	assert.match(sql, /not `messages`\.id in \(select .*match\(.*against\(\? in boolean mode\)/is, "the negation is its own NOT IN subquery");
 	assert.ok(params.includes("confidential* \"two words\""), "negated terms are ORed inside one bound expression");
-	assert.equal(buildBooleanNegation(parseSearchQuery("a -confidential", "UTC")), "confidential*");
+	assert.equal(buildAttachmentBooleanNegation(parseSearchQuery("a -confidential", "UTC")), "confidential*");
 });
 
 test("without the index the conditions stay the plain LIKE scan", async () => {
@@ -79,6 +88,7 @@ test("the probe answers from information_schema and caches per connection", asyn
 		calls += 1;
 		assert.match(text, /information_schema\.statistics/i, "the probe reads the index catalog");
 		assert.match(text, /message_attachments_extracted_text_fts_idx/, "the probe names the FULLTEXT index");
+		assert.match(text, /column_name = 'search_text'/, "the probe requires the index on the normalized column, not the r1 one");
 		return { rows: [{ n: 1 }], affectedRows: 0 };
 	};
 	assert.equal(await hasAttachmentSearchIndex({ DB }), true);

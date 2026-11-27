@@ -2,6 +2,7 @@ import { asc, eq } from "drizzle-orm";
 import { getDb } from "@/db";
 import { messageAttachments } from "@/db/schema";
 import { getAttachmentText } from "@/lib/email/attachment-text";
+import { backfillAttachmentSearchText } from "@/lib/search/index-admin";
 
 /**
  * The enrichment job for attachment text (F52). Nothing parses a PDF on a request
@@ -55,6 +56,13 @@ export type AttachmentSweepResult = {
 	 * extra index entry on the same seek, never a count(*) over the whole backlog.
 	 */
 	morePending: boolean;
+	/**
+	 * Rows this run filled `search_text` for (F53 r2). Extraction writes the normalized
+	 * stream with the text, but rows extracted before the column existed — or restored
+	 * without it — keep a NULL sidecar until this drain reaches them, invisible to
+	 * attachment search exactly like a pending row is until extraction reaches it.
+	 */
+	normalized: number;
 };
 
 /**
@@ -81,7 +89,7 @@ export async function sweepAttachmentExtraction(
 ): Promise<AttachmentSweepResult> {
 	const db = getDb(env);
 	const limit = options.limit ?? ATTACHMENT_EXTRACTION_SWEEP_BATCH;
-	const result: AttachmentSweepResult = { scanned: 0, done: 0, failed: 0, skipped: 0, undecided: 0, morePending: false };
+	const result: AttachmentSweepResult = { scanned: 0, done: 0, failed: 0, skipped: 0, undecided: 0, morePending: false, normalized: 0 };
 
 	// Oldest first, which `message_attachments_extract_status_idx` serves in index
 	// order: the status filter and the sort are both satisfied by the same scan, so
@@ -118,6 +126,13 @@ export async function sweepAttachmentExtraction(
 			console.error(`Attachment extraction sweep failed for ${row.id}`, error);
 		}
 	}
+
+	// The second drain: rows with extracted text but no normalized `search_text` —
+	// written before the column existed or restored without it. No engine can fill
+	// it (accent folding is not portable SQL), so this run does it app-side, one
+	// bounded batch per tick; on a database that has not applied the column's
+	// migration the call is a cheap no-op.
+	result.normalized = await backfillAttachmentSearchText(db);
 
 	return result;
 }

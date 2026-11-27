@@ -17,8 +17,10 @@ await build({
 			export { resolveDatabaseConfig } from "./src/db/dialect.ts";
 			export { applyPendingMigrations } from "./src/lib/migrations/service.ts";
 			export { buildSearchConditions } from "./src/lib/search/conditions.ts";
-			export { buildTsQueryFreeTextMatch, buildTsQueryNegation, parseSearchQuery } from "./src/lib/search/query-utils.ts";
+			export { buildAttachmentTsQueryMatch, buildAttachmentTsQueryNegation, parseSearchQuery } from "./src/lib/search/query-utils.ts";
+			export { normalizeSearchText } from "./src/lib/search/normalize.ts";
 			export { hasAttachmentSearchIndex, clearAttachmentIndexProbe } from "./src/lib/search/attachment-index.ts";
+			export { backfillAttachmentSearchText } from "./src/lib/search/index-admin.ts";
 			export { getDb, schema } from "./src/db/index.ts";
 		`,
 		resolveDir: root,
@@ -33,12 +35,15 @@ await build({
 	packages: "external",
 	logLevel: "silent",
 });
-const { and, openExternalDatabase, resolveDatabaseConfig, applyPendingMigrations, buildSearchConditions, buildTsQueryFreeTextMatch, buildTsQueryNegation, parseSearchQuery, hasAttachmentSearchIndex, clearAttachmentIndexProbe, getDb, schema } = await import(pathToFileURL(join(directory, "entry.mjs")).href);
+const { and, openExternalDatabase, resolveDatabaseConfig, applyPendingMigrations, buildSearchConditions, buildAttachmentTsQueryMatch, buildAttachmentTsQueryNegation, parseSearchQuery, normalizeSearchText, hasAttachmentSearchIndex, clearAttachmentIndexProbe, backfillAttachmentSearchText, getDb, schema } = await import(pathToFileURL(join(directory, "entry.mjs")).href);
 
 /**
- * A real PostgreSQL (PGlite) with the migration chain applied: 0041 creates the partial
- * GIN index the queries here must answer. The rows only need the searchable columns;
- * session_replication_role=replica keeps triggers and foreign keys out of the fixture.
+ * A real PostgreSQL (PGlite) with the migration chain applied: 0042 keeps the partial
+ * GIN index, now over the normalized `search_text` stream the extraction write
+ * produces. The fixture mirrors that write — `searchText: normalizeSearchText(text)`
+ * — the way attachment-text.ts stores it, and leaves one row un-normalized for the
+ * backfill test. session_replication_role=replica keeps triggers and foreign keys
+ * out of the fixture.
  */
 const DB = openExternalDatabase(resolveDatabaseConfig({ DATABASE_URL: "pglite://memory" }), true);
 await applyPendingMigrations(DB);
@@ -50,12 +55,20 @@ await db.insert(schema.messages).values([
 	{ ...message, id: "m_att", subject: "nothing here", textBody: "nothing relevant" },
 	{ ...message, id: "m_pending", subject: "nothing here", textBody: "nothing relevant" },
 	{ ...message, id: "m_mixed", subject: "nothing here", textBody: "the message says secretterm" },
+	{ ...message, id: "m_norm", subject: "nothing here", textBody: "nothing relevant" },
+	{ ...message, id: "m_backfill", subject: "nothing here", textBody: "nothing relevant" },
 ]);
-const attachment = { contentType: "text/plain", size: 10, disposition: "attachment" };
+const attach = (id, messageId, filename, status, text) => ({
+	id, messageId, filename, contentType: "text/plain", size: 10, disposition: "attachment", r2Key: `r/${id}`,
+	extractStatus: status, extractedText: text, searchText: text == null ? null : normalizeSearchText(text),
+});
 await db.insert(schema.messageAttachments).values([
-	{ ...attachment, id: "a_done", messageId: "m_att", filename: "statement.txt", r2Key: "r/a_done", extractStatus: "done", extractedText: "quarterword revenue statement" },
-	{ ...attachment, id: "a_pending", messageId: "m_pending", filename: "draft.txt", r2Key: "r/a_pending", extractStatus: "none", extractedText: "pendingword text" },
-	{ ...attachment, id: "a_mixed", messageId: "m_mixed", filename: "notes.txt", r2Key: "r/a_mixed", extractStatus: "done", extractedText: "bothword in attachment" },
+	attach("a_done", "m_att", "statement.txt", "done", "quarterword revenue statement"),
+	attach("a_pending", "m_pending", "draft.txt", "none", "pendingword text"),
+	attach("a_mixed", "m_mixed", "notes.txt", "done", "bothword in attachment"),
+	attach("a_norm", "m_norm", "cv.txt", "done", "résumé for the me@example.com"),
+	// A done row whose stream was never written — the pre-0042 state.
+	{ ...attach("a_backfill", "m_backfill", "old.txt", "done", "legacyword text"), searchText: null },
 ]);
 
 const attachmentText = await hasAttachmentSearchIndex({ DB });
@@ -65,13 +78,13 @@ const ids = async (query, options = { attachmentText }) =>
 const compiled = (query, options = { attachmentText }) =>
 	db.select({ id: schema.messages.id }).from(schema.messages).where(and(...buildSearchConditions(query, "UTC", options))).toSQL();
 
-test("the migration creates the partial GIN index the probe looks for", async () => {
+test("the migration creates the partial GIN index over search_text the probe looks for", async () => {
 	assert.equal(attachmentText, true);
 	const found = await DB.prepare(
 		"SELECT indexdef FROM pg_indexes WHERE schemaname = current_schema() AND indexname = 'message_attachments_extracted_text_fts_idx'",
 	).first();
-	assert.match(found.indexdef, /USING gin \(to_tsvector\('simple'::regconfig, extracted_text\)\)/i, "the index is a GIN over the tsvector expression");
-	assert.match(found.indexdef, /WHERE.*extract_status = 'done'.*extracted_text IS NOT NULL/i, "the index is partial over the eligible set");
+	assert.match(found.indexdef, /USING gin \(to_tsvector\('simple'::regconfig, search_text\)\)/i, "the index is a GIN over the normalized stream's tsvector");
+	assert.match(found.indexdef, /WHERE.*extract_status = 'done'.*search_text IS NOT NULL/i, "the index is partial over the eligible set");
 });
 
 test("free text matches the message or one of its eligible attachments", async () => {
@@ -83,25 +96,41 @@ test("free text matches the message or one of its eligible attachments", async (
 	assert.deepEqual(await ids("from:x quarterword"), ["m_att"], "a from: filter is satisfied by the message while text hits its attachment");
 });
 
-test("the eligible set is the done+nonnull rows the SQLite view selects", async () => {
+test("the normalized stream makes every tokenizer read the same words", async () => {
+	assert.deepEqual(await ids("resume"), ["m_norm"], "the accent-folded form finds 'résumé'");
+	assert.deepEqual(await ids("résumé"), ["m_norm"], "the accented query folds to the same token");
+	assert.deepEqual(await ids("me@example.com"), ["m_norm"], "punctuation splits the email into the same surviving tokens");
+	assert.deepEqual(await ids("of"), [], "a stopword tokenizes to nothing on every dialect");
+	assert.deepEqual(await ids("quarterword -the"), ["m_att", "m_body"], "a negated unindexable term excludes nothing, identically everywhere");
+});
+
+test("the eligible set is the done rows whose normalized stream exists", async () => {
 	assert.deepEqual(await ids("pendingword"), [], "a 'none' row is invisible even though it carries text");
-	assert.deepEqual(await ids("statement"), ["m_att"], "a done row with text is indexed");
+	assert.deepEqual(await ids("statement"), ["m_att"], "a done row with its stream is indexed");
+	assert.deepEqual(await ids("legacyword"), [], "a done row without its stream is invisible until backfilled");
+});
+
+test("the backfill writes the stream and the row becomes searchable", async () => {
+	assert.equal(await backfillAttachmentSearchText(db), 1, "the only un-normalized done row");
+	assert.deepEqual(await ids("legacyword"), ["m_backfill"], "the backfilled row is now eligible");
+	assert.equal(await backfillAttachmentSearchText(db), 0, "a second pass has nothing to do");
 });
 
 test("a negated term is rejected against the message and its attachments", async () => {
-	assert.deepEqual(await ids("-quarterword"), ["m_mixed", "m_pending"], "both the body hit and the attachment hit are excluded");
+	assert.deepEqual(await ids("-quarterword"), ["m_backfill", "m_mixed", "m_norm", "m_pending"], "both the body hit and the attachment hit are excluded");
 	assert.deepEqual(await ids("bothword -secretterm"), [], "the negation on the message side is not excused by the attachment hit");
 	assert.deepEqual(await ids("quarterword -revenue"), ["m_body"], "the attachment matching revenue is rejected");
 });
 
 test("the tsquery expression is bound as a parameter, not interpolated", async () => {
 	const { sql, params } = await compiled('quarterw "revenue statement" -badterm');
-	assert.match(sql, /to_tsvector\('simple', "message_attachments"\."extracted_text"\) @@ to_tsquery\('simple', \$[0-9]+\)/, "the match is a parameterized tsquery");
+	assert.match(sql, /to_tsvector\('simple', "message_attachments"\."search_text"\) @@ to_tsquery\('simple', \$[0-9]+\)/, "the match is a parameterized tsquery over the stream");
 	assert.ok(!sql.includes("quarterw") && !sql.includes("badterm"), "no term text appears in the SQL itself");
 	assert.ok(params.includes("quarterw:* & (revenue <-> statement)"), "the ANDed positive expression is a bound parameter");
 	assert.ok(params.includes("badterm:*"), "the negated term is a bound parameter");
-	assert.equal(buildTsQueryFreeTextMatch(parseSearchQuery('quarterw "revenue statement"', "UTC")), "quarterw:* & (revenue <-> statement)");
-	assert.equal(buildTsQueryNegation(parseSearchQuery("x -badterm -\"two words\"", "UTC")), "badterm:* | (two <-> words)");
+	assert.equal(buildAttachmentTsQueryMatch(parseSearchQuery('quarterw "revenue statement"', "UTC")), "quarterw:* & (revenue <-> statement)");
+	assert.equal(buildAttachmentTsQueryNegation(parseSearchQuery("x -badterm -\"two words\"", "UTC")), "badterm:* | (two <-> words)");
+	assert.equal(buildAttachmentTsQueryMatch(parseSearchQuery("the", "UTC")), null, "an unindexable term builds no clause");
 });
 
 test("without the index the search degrades to the message-only LIKE scan", async () => {

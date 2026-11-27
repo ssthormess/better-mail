@@ -5,6 +5,15 @@ import type { DatabaseDialect } from "@/db/dialect";
  * The name the attachment-text index goes by on each dialect (F52/F53): the FTS5 table
  * on SQLite, the partial GIN expression index on PostgreSQL, the FULLTEXT index on
  * MySQL. conditions.ts answers attachment matches through whichever one exists.
+ *
+ * The SQL search runs against `search_text` (the normalized stream, F53 r2), so on
+ * PostgreSQL and MySQL "exists" means the index *on that column* — not just the name.
+ * A database can legitimately sit at the r1 migration, where the same index name
+ * covers raw `extracted_text`: probing the name alone would then report true and the
+ * search would fail on a missing column instead of degrading. On SQLite this does not
+ * arise — the FTS5 table reads its source view, and the pre-r2 view on `extracted_text`
+ * still answers normalized queries correctly (unicode61 folds accents and splits
+ * punctuation the same way), so the table's existence stays the right probe there.
  */
 const INDEX_OBJECT: Record<DatabaseDialect, string> = {
 	sqlite: "attachments_fts",
@@ -76,11 +85,19 @@ export function clearAttachmentIndexProbe(connection?: object): void {
 	probes.delete(connection);
 }
 
-/** The catalog lookup for the dialect's index object; each is one row off the catalog. */
+/**
+ * The catalog lookup for the dialect's index object; each is one row off the catalog.
+ * PostgreSQL's reports the index definition so the caller can tell an index on
+ * `search_text` (r2) from one on raw `extracted_text` (r1); MySQL's counts the
+ * FULLTEXT index entry on the `search_text` column specifically — between the
+ * add-column and create-index migrations the name alone would lie.
+ */
 function probeSql(dialect: DatabaseDialect): string {
-	if (dialect === "postgres") return `SELECT to_regclass('${INDEX_OBJECT.postgres}') AS name`;
+	if (dialect === "postgres") {
+		return `SELECT CASE WHEN to_regclass('${INDEX_OBJECT.postgres}') IS NULL THEN NULL ELSE pg_get_indexdef(to_regclass('${INDEX_OBJECT.postgres}')) END AS def`;
+	}
 	if (dialect === "mysql") {
-		return `SELECT COUNT(*) AS n FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = 'message_attachments' AND index_name = '${INDEX_OBJECT.mysql}' AND index_type = 'FULLTEXT'`;
+		return `SELECT COUNT(*) AS n FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = 'message_attachments' AND index_name = '${INDEX_OBJECT.mysql}' AND column_name = 'search_text' AND index_type = 'FULLTEXT'`;
 	}
 	return "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'attachments_fts'";
 }
@@ -95,8 +112,9 @@ export async function hasAttachmentSearchIndex(env: ProbeEnv): Promise<boolean> 
 	// restamp state that was just reset.
 	const map = probes;
 	const startedAt = generation;
-	const found = await connection.prepare(probeSql(dialect)).first<{ name?: string | null; n?: number }>();
-	const available = dialect === "mysql" ? Number(found?.n ?? 0) > 0 : !!found?.name;
+	const found = await connection.prepare(probeSql(dialect)).first<{ name?: string | null; def?: string | null; n?: number }>();
+	const available =
+		dialect === "mysql" ? Number(found?.n ?? 0) > 0 : dialect === "postgres" ? !!found?.def?.includes("search_text") : !!found?.name;
 	if (map === probes && startedAt === generation) map.set(connection, { available, checkedAt: Date.now() });
 	return available;
 }

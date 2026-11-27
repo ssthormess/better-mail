@@ -17,9 +17,10 @@ await build({
 			export { getDb } from "./src/db/index.ts";
 			export { messages } from "./src/db/schema/index.ts";
 			export { buildSearchConditions } from "./src/lib/search/conditions.ts";
+			export { normalizeSearchText } from "./src/lib/search/normalize.ts";
 			export { hasAttachmentSearchIndex, clearAttachmentIndexProbe } from "./src/lib/search/attachment-index.ts";
 			export { applyPendingMigrations } from "./src/lib/migrations/service.ts";
-			export { rebuildSearchIndex } from "./src/lib/search/index-admin.ts";
+			export { rebuildSearchIndex, backfillAttachmentSearchText } from "./src/lib/search/index-admin.ts";
 		`,
 		resolveDir: root,
 		sourcefile: "attachment-fts-entry.ts",
@@ -55,9 +56,11 @@ async function fixture(t) {
 	/** Search results as sorted message ids, with the attachment index as F52 leaves it. */
 	const ids = async (query) =>
 		(await db.select({ id: m.messages.id }).from(m.messages).where(...m.buildSearchConditions(query, "UTC", { attachmentText: true }))).map((row) => row.id).sort();
-	/** Mark an attachment extracted, the way the extraction writer does. */
+	/** Mark an attachment extracted, the way the extraction writer does: text and its normalized stream together. */
 	const extracted = (id, text, status = "done") =>
-		database.db.prepare("UPDATE message_attachments SET extracted_text = ?, extract_status = ?, extracted_at = 3 WHERE id = ?").run(text, status, id);
+		database.db
+			.prepare("UPDATE message_attachments SET extracted_text = ?, search_text = ?, extract_status = ?, extracted_at = 3 WHERE id = ?")
+			.run(text, text == null ? null : m.normalizeSearchText(text), status, id);
 	/** Rowids the attachment index currently matches: the index only, not the content table. */
 	const matched = (expression) => database.db.prepare("SELECT rowid FROM attachments_fts WHERE attachments_fts MATCH ?").all(expression).map((row) => row.rowid);
 	return { database, env, db, ids, extracted, matched };
@@ -89,8 +92,8 @@ test("only a done attachment is indexed", async (t) => {
 	// A row inserted already decided is indexed by the insert trigger, and the others
 	// (inserted at "none") stay out of the index.
 	database.db.exec(`
-		INSERT INTO message_attachments (id, message_id, filename, content_type, size, r2_key, extract_status, extracted_text, created_at)
-			VALUES ('a3', 'm2', 'ready.txt', 'text/plain', 10, 'attachments/m2/a3/ready.txt', 'done', 'ready statement', 3);
+		INSERT INTO message_attachments (id, message_id, filename, content_type, size, r2_key, extract_status, extracted_text, search_text, created_at)
+			VALUES ('a3', 'm2', 'ready.txt', 'text/plain', 10, 'attachments/m2/a3/ready.txt', 'done', 'ready statement', 'ready statement', 3);
 	`);
 	assert.deepEqual(await ids("statement"), ["m2"]);
 	assert.deepEqual(matched('"pending"*'), [], "the skipped and failed rows added nothing");
@@ -192,9 +195,9 @@ test("a rebuild indexes only eligible rows, so neither delete leaves an orphan p
 	// A done row that exists when the rebuild runs: deleting it afterwards must remove
 	// its posting, whichever way the row leaves. This is the gate's orphan case.
 	database.db.exec(`
-		INSERT INTO message_attachments (id, message_id, filename, content_type, size, r2_key, extract_status, extracted_text, created_at)
-			VALUES ('a3', 'm1', 'later.txt', 'text/plain', 10, 'attachments/m1/a3/later.txt', 'done', 'later wording', 3),
-			('a4', 'm1', 'pending.txt', 'text/plain', 10, 'attachments/m1/a4/pending.txt', 'none', NULL, 4);
+		INSERT INTO message_attachments (id, message_id, filename, content_type, size, r2_key, extract_status, extracted_text, search_text, created_at)
+			VALUES ('a3', 'm1', 'later.txt', 'text/plain', 10, 'attachments/m1/a3/later.txt', 'done', 'later wording', 'later wording', 3),
+			('a4', 'm1', 'pending.txt', 'text/plain', 10, 'attachments/m1/a4/pending.txt', 'none', NULL, NULL, 4);
 	`);
 	await m.rebuildSearchIndex(env);
 	assert.equal(matched('"later"*').length, 1, "the eligible row is indexed");
@@ -214,13 +217,16 @@ test("a rebuild indexes only eligible rows, so neither delete leaves an orphan p
 test("search stays message-only until the attachment index migration is applied", async (t) => {
 	const database = new m.SqliteDatabase(":memory:");
 	t.after(() => database.db.close());
-	// The deployment window docs/deployment.md describes: the application is live, 0109 is
-	// not applied yet. Naming attachments_fts there fails the whole statement.
+	// The deployment window docs/deployment.md describes: the application is live, the
+	// attachment index's migrations (0109 and the normalized-stream 0117) are not
+	// applied yet. Naming attachments_fts there fails the whole statement.
 	const beforeIndex = mkdtempSync(join(root, "node_modules", "mailflare-attachment-fts-before-"));
 	t.after(() => rmSync(beforeIndex, { recursive: true, force: true }));
 	cpSync(join(root, "drizzle/migrations"), beforeIndex, { recursive: true });
 	rmSync(join(beforeIndex, "0109_attachment_search_index.sql"));
+	rmSync(join(beforeIndex, "0117_attachment_search_text.sql"));
 	await m.applyMigrations(database, beforeIndex);
+	// A done row extracted before `search_text` existed: text, no stream — the pre-0117 state.
 	database.db.exec(`
 		INSERT INTO users (id, email, password_hash, name, role, is_primary_admin, created_at) VALUES ('u', 'o@one.test', 'h', 'O', 'admin', 1, 1);
 		INSERT INTO messages (id, user_id, direction, from_addr, to_addr, subject, text_body, status, created_at) VALUES
@@ -241,11 +247,17 @@ test("search stays message-only until the attachment index migration is applied"
 	assert.deepEqual(await ids("quarterly"), [], "attachment text is not searchable yet");
 	assert.deepEqual(await ids("-quarterly"), ["m1", "m2"], "the negative path degrades too");
 
-	// The admin "Update database" path, which clears the cached miss itself.
+	// The admin "Update database" path, which clears the cached miss itself. The index
+	// stack lands through 0117, which recreates the view, the FTS5 table and the
+	// triggers with IF EXISTS guards precisely so a database at pre-0109 reaches the
+	// same state in one step. The row keeps a NULL stream until the backfill the sweep
+	// runs every five minutes writes it — invisible until then, like a pending row.
 	const applied = await m.applyPendingMigrations(database);
-	assert.ok(applied.applied.includes("0109_attachment_search_index.sql"));
+	assert.ok(applied.applied.includes("0109_attachment_search_index.sql") || applied.applied.includes("0117_attachment_search_text.sql"));
 	assert.equal(await m.hasAttachmentSearchIndex({ DB: database }), true, "applying the migration invalidates the cached probe");
-	assert.deepEqual(await ids("quarterly"), ["m1"], "the applied migration makes attachment text searchable");
+	assert.deepEqual(await ids("quarterly"), [], "still invisible: the column exists but the stream was never written");
+	assert.equal(await m.backfillAttachmentSearchText(db), 1, "the backfill writes the missing stream");
+	assert.deepEqual(await ids("quarterly"), ["m1"], "then the applied migration makes attachment text searchable");
 	assert.deepEqual(await ids("quarterly -absentterm"), ["m1"], "and the negative path uses both indexes again");
 });
 
@@ -263,18 +275,20 @@ test("a probe cached on one D1 session never makes a lagging session emit attach
 	t.after(() => rmSync(beforeIndex, { recursive: true, force: true }));
 	cpSync(join(root, "drizzle/migrations"), beforeIndex, { recursive: true });
 	rmSync(join(beforeIndex, "0109_attachment_search_index.sql"));
+	rmSync(join(beforeIndex, "0117_attachment_search_text.sql"));
 	await m.applyMigrations(lagging, beforeIndex);
 	await m.applyMigrations(current, join(root, "drizzle/migrations"));
+	// `lagging` has no `search_text` column yet, so its seed is the pre-0117 row shape.
 	for (const database of [current, lagging]) {
 		database.db.exec(`
 			INSERT INTO users (id, email, password_hash, name, role, is_primary_admin, created_at) VALUES ('u', 'o@one.test', 'h', 'O', 'admin', 1, 1);
 			INSERT INTO messages (id, user_id, direction, from_addr, to_addr, subject, text_body, status, created_at) VALUES
 				('m1', 'u', 'inbound', 'maya@acme.test', 'o@one.test', 'weekly status', 'confidential planning', 'received', 1),
 				('m2', 'u', 'inbound', 'sam@other.test', 'o@one.test', 'another note', 'invoice in body', 'received', 2);
-			INSERT INTO message_attachments (id, message_id, filename, content_type, size, r2_key, extract_status, extracted_text, created_at) VALUES
-				('a1', 'm1', 'q3.pdf', 'application/pdf', 10, 'attachments/m1/a1/q3.pdf', 'done', 'quarterly invoice', 1);
 		`);
 	}
+	current.db.exec("INSERT INTO message_attachments (id, message_id, filename, content_type, size, r2_key, extract_status, extracted_text, search_text, created_at) VALUES ('a1', 'm1', 'q3.pdf', 'application/pdf', 10, 'attachments/m1/a1/q3.pdf', 'done', 'quarterly invoice', 'quarterly invoice', 1)");
+	lagging.db.exec("INSERT INTO message_attachments (id, message_id, filename, content_type, size, r2_key, extract_status, extracted_text, created_at) VALUES ('a1', 'm1', 'q3.pdf', 'application/pdf', 10, 'attachments/m1/a1/q3.pdf', 'done', 'quarterly invoice', 1)");
 	// The raw binding both sessions were opened from: the positive cache key under the round-1
 	// design, deliberately still passed so the test would fail if it became the key again.
 	const rawBinding = {};

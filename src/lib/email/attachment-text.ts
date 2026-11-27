@@ -2,6 +2,8 @@ import { and, eq } from "drizzle-orm";
 import { getDb } from "@/db";
 import { messageAttachments } from "@/db/schema";
 import { truncateUtf8 } from "@/lib/email/inbound-limits";
+import { isMissingColumnError } from "@/lib/database-errors";
+import { normalizeSearchText } from "@/lib/search/normalize";
 
 /**
  * Text pulled out of attachments so search can index it later (F52).
@@ -166,11 +168,29 @@ type PersistOutcome = "written" | "already-recorded" | "not-recorded";
  */
 async function recordExtraction(env: CloudflareEnv, attachmentId: string, extraction: AttachmentExtraction): Promise<PersistOutcome> {
 	const db = getDb(env);
-	const written = await db
-		.update(messageAttachments)
-		.set({ extractedText: extraction.text, extractStatus: extraction.status, extractedAt: new Date() })
-		.where(and(eq(messageAttachments.id, attachmentId), eq(messageAttachments.extractStatus, "none")))
-		.returning({ id: messageAttachments.id });
+	const columns = {
+		extractedText: extraction.text,
+		extractStatus: extraction.status,
+		extractedAt: new Date(),
+	};
+	const where = and(eq(messageAttachments.id, attachmentId), eq(messageAttachments.extractStatus, "none"));
+	let written;
+	try {
+		written = await db
+			.update(messageAttachments)
+			// The stream every dialect's attachment index is fed (F53 r2): normalized here,
+			// at the same write, so a row never exists with text but without its token
+			// stream. NULL when there is no text; "" when the text holds nothing indexable.
+			.set({ ...columns, searchText: extraction.text == null ? null : normalizeSearchText(extraction.text) })
+			.where(where)
+			.returning({ id: messageAttachments.id });
+	} catch (error) {
+		// The application deploys before its migrations: a database still waiting for
+		// `search_text` takes the pre-r2 write, and the backfill fills the column in
+		// once the migration lands (index-admin.ts).
+		if (!isMissingColumnError(error)) throw error;
+		written = await db.update(messageAttachments).set(columns).where(where).returning({ id: messageAttachments.id });
+	}
 	return written.length > 0 ? "written" : "already-recorded";
 }
 

@@ -80,7 +80,8 @@ Also kept on every dialect: foreign keys and cascades, the JMAP change log, mail
 | Area | SQLite / D1 | PostgreSQL | MySQL / MariaDB |
 | --- | --- | --- | --- |
 | Message search | FTS5 index, prefix and column matching | `ILIKE`-style substring scan of subject, addresses and body; accelerated by `pg_trgm` indexes when the extension can be created | Substring `LIKE` scan |
-| Search index page (Admin) | Rebuild available | Not applicable (always "indexed") | Not applicable |
+| Attachment text search | FTS5 over the normalized `search_text` stream (via the `attachments_fts_source` view) | Partial GIN index on `to_tsvector('simple', search_text)` | FULLTEXT index on `search_text` |
+| Search index page (Admin) | Rebuild available; backfills `search_text` first on every dialect | Backfill only (engine indexes cannot drift) | Backfill only |
 | `agent_send_approvals` duplicate-delivery guard | Partial unique index | Partial unique index | Plain index (MySQL has no partial indexes); the status claim still prevents double sends |
 | Wide covering indexes on `messages` | Full | Full | Trimmed to fit InnoDB's 3072-byte key limit; expression keys (`coalesce(thread_id, id)`) dropped; the trailing `id` tie-breaker of `messages_category_page_idx` is dropped too. Conversation view is slower on very large mailboxes |
 | One agent job per mailbox | Atomic in the claim statement | Atomic | Checked just before the claim (small race window) |
@@ -88,6 +89,10 @@ Also kept on every dialect: foreign keys and cascades, the JMAP change log, mail
 | `neon` (HTTP) | n/a | Batches run as separate statements (the HTTP protocol has no interactive transaction); use `node-postgres` for atomic batches | n/a |
 
 Why search is the main difference: FTS5 is an SQLite extension, PostgreSQL's equivalent (`tsvector`) and MySQL's `FULLTEXT` have different grammars and ranking, and the search syntax (`from:`, `subject:`, quoted phrases, `-term`) is translated into plain predicates on those dialects instead. That is correct but unindexed, so searches scan the messages of the mailbox being searched. For large mailboxes, D1/SQLite, or PostgreSQL with `pg_trgm`, searches faster.
+
+Attachment text is the exception to that scan: it is indexed on every dialect, but the three engines tokenize differently, so they do not index the attachment's text directly. `message_attachments.search_text` holds a normalized copy of the extracted text — lower-case, accent-folded, punctuation treated as spaces, and every token a stock InnoDB index could not keep dropped (under 3 or over 84 characters, or on MySQL's built-in stopword list — `src/lib/search/normalize.ts`). Query terms pass through the same normalizer before the `to_tsquery` / `AGAINST` / `MATCH` expression is built, so all three engines index and answer the identical token stream and return identical result sets. Two consequences of that contract: a word the stream drops (`the`, `of`, `me`, two-letter words) matches no attachment on any dialect — including inside a negation, where a `-the` clause simply does not apply — and a quoted phrase means "these surviving tokens adjacent", so `revenue for statement` matches `"revenue statement"` because `for` vanished from the stream before indexing.
+
+MySQL operators: the FULLTEXT index assumes the stock InnoDB full-text configuration — `innodb_ft_min_token_size` = 3, `innodb_ft_max_token_size` = 84, and the built-in stopword list (`information_schema.INNODB_FT_DEFAULT_STOPWORD`). Lowering the minimum token size or trimming the stopword list is safe (the index can only keep *more* of the stream than needed); raising the minimum or installing a custom stopword table that adds words the stream contains would make MySQL under-match relative to the other dialects. Keep the stock configuration for full parity. Changing these settings after the fact requires `OPTIMIZE TABLE message_attachments` (or a drop/recreate of `message_attachments_extracted_text_fts_idx`) to re-index.
 
 Other things to know:
 

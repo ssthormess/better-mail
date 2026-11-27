@@ -1,0 +1,11 @@
+-- The FULLTEXT index on `search_text`, the shared normalized token stream (F53
+-- gate round 1; see drizzle/migrations/0117 and src/lib/search/normalize.ts).
+-- MySQL has no partial indexes, so the query's WHERE — extract_status = 'done'
+-- AND search_text IS NOT NULL — keeps the eligible set identical to the SQLite
+-- FTS5 source view and the partial GIN index.
+--
+-- On the normalized stream InnoDB's stock tokenizer can no longer diverge from
+-- the other engines: every token it sees is already 3-84 characters and outside
+-- the built-in stopword list (the bounds normalize.ts enforces), so tokens it
+-- would have dropped simply never reach it.
+CREATE FULLTEXT INDEX `message_attachments_extracted_text_fts_idx` ON `message_attachments` (`search_text`);

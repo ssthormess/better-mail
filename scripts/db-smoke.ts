@@ -11,6 +11,7 @@ import { openExternalDatabase } from "@/db/external";
 import { applyPendingMigrations, getMigrationStatus } from "@/lib/migrations/service";
 import { buildSearchConditions } from "@/lib/search/conditions";
 import { hasAttachmentSearchIndex } from "@/lib/search/attachment-index";
+import { normalizeSearchText } from "@/lib/search/normalize";
 import { createBookedCalendarEvents } from "@/lib/booking/create";
 import { importCalendarGroups } from "@/lib/calendar/import-store";
 import { importContacts } from "@/lib/contacts/import-store";
@@ -118,10 +119,17 @@ for (const [query, expected] of [["quarterly", 1], ["subject:report", 1], ["from
 
 // Attachment text is part of a free-text search on every dialect (F52/F53): the message
 // is a hit when its own columns miss but an extracted attachment's text matches, and a
-// negated term rejects it whichever side would have matched.
+// negated term rejects it whichever side would have matched. What the indexes see is
+// `search_text`, the shared normalized stream the extraction write produces — mirrored
+// here through the same normalizer so every engine tokenizes the identical words.
+const attach = (id: string, messageId: string, status: "done" | "none", text: string | null) => ({
+	id, messageId, filename: "note.txt", contentType: "text/plain", size: 10, r2Key: `${id}/${stamp}`,
+	extractStatus: status, extractedText: text, searchText: text == null ? null : normalizeSearchText(text),
+});
 await db.insert(messageAttachments).values([
-	{ id: `att_${stamp}`, messageId: `msg_${stamp}`, filename: "note.txt", contentType: "text/plain", size: 10, r2Key: `a/${stamp}`, extractStatus: "done", extractedText: "smoketoken agreement" },
-	{ id: `att2_${stamp}`, messageId: `msg_${stamp}`, filename: "pending.txt", contentType: "text/plain", size: 10, r2Key: `b/${stamp}`, extractStatus: "none", extractedText: "pendingtoken" },
+	attach(`att_${stamp}`, `msg_${stamp}`, "done", "smoketoken agreement"),
+	attach(`att2_${stamp}`, `msg_${stamp}`, "none", "pendingtoken"),
+	attach(`att3_${stamp}`, `msg_${stamp}`, "done", "résumé of the me@example.com"),
 ] as never[]);
 const attachmentSearch = async (query: string) =>
 	(await db.select({ id: messages.id }).from(messages).where(and(eq(messages.mailboxId, `mbx_${stamp}`), ...buildSearchConditions(query, "UTC", searchOptions)))).length;
@@ -130,6 +138,12 @@ check("search hits attachment text by prefix", (await attachmentSearch("smoketok
 check("search hits attachment phrase", (await attachmentSearch('"smoketoken agreement"')) === 1);
 check("negated attachment term excludes", (await attachmentSearch("quarterly -smoketoken")) === 0);
 check("pending attachment is not indexed", (await attachmentSearch("pendingtoken")) === 0);
+// Normalized-stream parity (F53 r2): accents fold, punctuation splits, and tokens no
+// stock index could keep — "of", "the", two-letter words — match nowhere, identically.
+check("attachment search folds accents", (await attachmentSearch("resume")) === 1);
+check("attachment search splits punctuation", (await attachmentSearch("me@example.com")) === 1);
+check("attachment search drops unindexable positives", (await attachmentSearch("of")) === 0);
+check("negated unindexable term is permissive-equal", (await attachmentSearch("quarterly -the")) === 1);
 
 const env = { DB: d1 } as unknown as CloudflareEnv;
 const event = { hostIds: [userId], name: "Intro", location: "Zoom", color: "blue", timeZone: "UTC" } as never;
