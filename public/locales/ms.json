@@ -2982,5 +2982,15 @@
 	"domains.forceRemoveConfirm": "{reason}\n\nTetap mahu alih keluar {host} secara paksa? Mailflare akan cuba mengalih keluar rekod DNS _mta-sts dan _smtp._tls, kemudian memadam domain, semua peti mel di dalamnya dan semua mesejnya, walaupun pengalihan rekod gagal. Pelayan mel mungkin terus menggunakan dasar MTA-STS yang disimpan dalam cache untuk seketika. Selepas itu anda akan menerima senarai rekod DNS yang perlu dialih keluar secara manual.\n\nTaip {host} untuk mengesahkan.",
 	"domains.forceRemoved": "{host} telah dialih keluar",
 	"domains.forceRemovedRecords": "Alih keluar sendiri rekod DNS ini:",
-	"domains.forceRemovedCache": "Pelayan mel mungkin terus menggunakan dasar MTA-STS lama sehingga {date}."
+	"domains.forceRemovedCache": "Pelayan mel mungkin terus menggunakan dasar MTA-STS lama sehingga {date}.",
+	"navigation.folderRetention": "Retention",
+	"navigation.folderRetentionToggle": "Auto-delete old mail",
+	"navigation.folderRetentionDeleteAfter": "Delete messages after",
+	"navigation.folderRetentionDays": "days",
+	"navigation.folderRetentionInvalid": "Enter a whole number of days between 1 and 365.",
+	"navigation.folderRetentionRuleHelp": "Permanently deletes received and archived mail older than this. The age counts from each message's own Date header, so mail imported with an old date can be removed on the next scheduled cleanup. Drafts and sent mail are never auto-deleted.",
+	"navigation.folderRetentionInheritHelp": "Mail in this folder is kept. Trash and Spam still follow the account's clean-up setting.",
+	"navigation.folderRetentionLoadFailed": "Could not load retention settings.",
+	"navigation.folderRetentionUpdateFailed": "Could not update retention settings.",
+	"navigation.folderRetentionNeedAccess": "You need full access to change this."
 }

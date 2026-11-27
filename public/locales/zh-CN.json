@@ -2968,5 +2968,15 @@
 	"domains.forceRemoveConfirm": "{reason}\n\n仍要强制删除 {host} 吗？Mailflare 会先尝试移除其 _mta-sts 和 _smtp._tls DNS 记录，然后删除该域名、其所有邮箱和其中的全部邮件，即使记录移除失败也会继续。邮件服务器可能在一段时间内继续应用已缓存的 MTA-STS 策略。完成后，您会得到需要手动移除的 DNS 记录列表。\n\n请输入 {host} 以确认。",
 	"domains.forceRemoved": "已删除 {host}",
 	"domains.forceRemovedRecords": "请自行移除以下 DNS 记录：",
-	"domains.forceRemovedCache": "邮件服务器可能在 {date} 之前继续应用旧的 MTA-STS 策略。"
+	"domains.forceRemovedCache": "邮件服务器可能在 {date} 之前继续应用旧的 MTA-STS 策略。",
+	"navigation.folderRetention": "Retention",
+	"navigation.folderRetentionToggle": "Auto-delete old mail",
+	"navigation.folderRetentionDeleteAfter": "Delete messages after",
+	"navigation.folderRetentionDays": "days",
+	"navigation.folderRetentionInvalid": "Enter a whole number of days between 1 and 365.",
+	"navigation.folderRetentionRuleHelp": "Permanently deletes received and archived mail older than this. The age counts from each message's own Date header, so mail imported with an old date can be removed on the next scheduled cleanup. Drafts and sent mail are never auto-deleted.",
+	"navigation.folderRetentionInheritHelp": "Mail in this folder is kept. Trash and Spam still follow the account's clean-up setting.",
+	"navigation.folderRetentionLoadFailed": "Could not load retention settings.",
+	"navigation.folderRetentionUpdateFailed": "Could not update retention settings.",
+	"navigation.folderRetentionNeedAccess": "You need full access to change this."
 }

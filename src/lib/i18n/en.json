@@ -2991,5 +2991,15 @@
 	"domains.forceRemoveConfirm": "{reason}\n\nForce remove {host} anyway? Mailflare will try to remove its _mta-sts and _smtp._tls DNS records, then delete the domain, all its mailboxes and all their messages, even if that fails. Mail servers may keep applying the cached MTA-STS policy for a while. Afterwards you get the DNS records to remove by hand.\n\nType {host} to confirm.",
 	"domains.forceRemoved": "{host} removed",
 	"domains.forceRemovedRecords": "Remove these DNS records yourself:",
-	"domains.forceRemovedCache": "Mail servers may keep applying the old MTA-STS policy until {date}."
+	"domains.forceRemovedCache": "Mail servers may keep applying the old MTA-STS policy until {date}.",
+	"navigation.folderRetention": "Retention",
+	"navigation.folderRetentionToggle": "Auto-delete old mail",
+	"navigation.folderRetentionDeleteAfter": "Delete messages after",
+	"navigation.folderRetentionDays": "days",
+	"navigation.folderRetentionInvalid": "Enter a whole number of days between 1 and 365.",
+	"navigation.folderRetentionRuleHelp": "Permanently deletes received and archived mail older than this. The age counts from each message's own Date header, so mail imported with an old date can be removed on the next scheduled cleanup. Drafts and sent mail are never auto-deleted.",
+	"navigation.folderRetentionInheritHelp": "Mail in this folder is kept. Trash and Spam still follow the account's clean-up setting.",
+	"navigation.folderRetentionLoadFailed": "Could not load retention settings.",
+	"navigation.folderRetentionUpdateFailed": "Could not update retention settings.",
+	"navigation.folderRetentionNeedAccess": "You need full access to change this."
 }

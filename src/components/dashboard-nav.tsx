@@ -43,7 +43,6 @@ import {
   FOLDER_COLOR_OPTIONS,
 } from "@/lib/folders/colors";
 import type { FolderColor } from "@/lib/folders/types";
-import { cn } from "@/lib/utils";
 import { NavItem } from "./components-nav";
 import type { NavLink } from "./components-nav-types";
 import type { CustomFolder } from "./dashboard-nav-types";
@@ -52,6 +51,12 @@ import {
   moveMessagesToCustomFolder,
   moveMessagesToSystemFolder,
 } from "./dashboard-nav-utils";
+import { FolderRetentionSection } from "./folder-retention-section";
+import {
+  canEditFolderRetention,
+  saveFolderRetentionDraft,
+  type FolderRetentionDraft,
+} from "./folder-retention-utils";
 import { NavSectionHeader, useSectionOpen } from "./nav-section-header";
 import { ReorderableList } from "./reorderable-list";
 import { readStorage, writeStorage } from "./reorderable-list-utils";
@@ -131,6 +136,7 @@ export function DashboardNav({ className }: { className?: string }) {
   const [folderDialogOpen, setFolderDialogOpen] = useState(false);
   const [folderError, setFolderError] = useState<string | null>(null);
   const [editingFolderId, setEditingFolderId] = useState<string | null>(null);
+  const [retentionDraft, setRetentionDraft] = useState<FolderRetentionDraft | null>(null);
   const promotionsOn = hasActivePromotions(counts.promotionModes);
   const linksWithCounts: NavLink[] = links.filter((link) => (link.href !== "/scheduled" || counts.folders.scheduled.total > 0) && (link.href !== "/promotions" || promotionsOn) && (link.href !== "/subscriptions" || promotionsOn)).map(({ labelKey, ...rest }): NavLink => {
     const link = { ...rest, label: t(labelKey) };
@@ -228,6 +234,7 @@ export function DashboardNav({ className }: { className?: string }) {
     setNewFolderName(folder?.name ?? "");
     setNewFolderColor(FOLDER_COLOR_OPTIONS.find((option) => option.value === folder?.color)?.value ?? DEFAULT_FOLDER_COLOR);
     setFolderError(null);
+    setRetentionDraft(null);
     setFolderDialogOpen(true);
   }
 
@@ -238,6 +245,11 @@ export function DashboardNav({ className }: { className?: string }) {
     setAddingFolder(true);
     setFolderError(null);
     try {
+      // A retention draft the API would reject blocks the whole save, not just the rule.
+      if (retentionDraft && !retentionDraft.valid) {
+        setFolderError(t("navigation.folderRetentionInvalid"));
+        return;
+      }
       const response = await authFetch("/api/folders", {
         method: editingFolderId ? "PATCH" : "POST",
         headers: { "Content-Type": "application/json" },
@@ -254,11 +266,25 @@ export function DashboardNav({ className }: { className?: string }) {
         return;
       }
       const folder = (await response.json()) as CustomFolder;
+      // Retention saves on the same Save, only when the draft changed the rule. The folder edit
+      // already went through, so a failure here updates the list and keeps the dialog open.
+      let retentionError: string | null = null;
+      if (editingFolderId) {
+        try {
+          await saveFolderRetentionDraft(editingFolderId, retentionDraft, selectedMailbox.permission);
+        } catch (error) {
+          retentionError = error instanceof Error ? error.message : t("navigation.folderRetentionUpdateFailed");
+        }
+      }
       invalidateFolderCache();
       setFolders((items) =>
         [...items.filter((item) => item.id !== folder.id), folder].sort((a, b) => a.name.localeCompare(b.name)),
       );
       window.dispatchEvent(new Event("mailflare:folders-changed"));
+      if (retentionError) {
+        setFolderError(retentionError);
+        return;
+      }
       setNewFolderName("");
       setNewFolderColor(DEFAULT_FOLDER_COLOR);
       setFolderDialogOpen(false);
@@ -344,6 +370,15 @@ export function DashboardNav({ className }: { className?: string }) {
                       ))}
                     </div>
                   </div>
+                  {editingFolderId && (
+                    <FolderRetentionSection
+                      key={editingFolderId}
+                      folderId={editingFolderId}
+                      canManage={canEditFolderRetention(selectedMailbox.permission)}
+                      disabled={addingFolder}
+                      onChange={setRetentionDraft}
+                    />
+                  )}
                   {folderError && <p role="alert" className="text-sm text-red-600">{folderError}</p>}
                   <Button
                     type="submit"
