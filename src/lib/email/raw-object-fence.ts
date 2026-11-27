@@ -1,12 +1,16 @@
-import { eq, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { createDb, getDb } from "@/db";
 import { isExternalDatabase } from "@/db/external";
 import { appSettings, rawSweepPendingDeletes, schema } from "@/db/schema";
 
 const RAW_SWEEP_SETTINGS_ID = "default";
 const PENDING_RETRY_MS = 5_000;
+const PENDING_POLL_MS = 50;
+/** A claim this old cannot still have a `BUCKET.delete` in flight; its marker may be released. */
+export const STALE_PENDING_DELETE_MS = 60 * 60 * 1000;
 
 type AppDb = ReturnType<typeof getDb>;
+type PendingDelete = typeof rawSweepPendingDeletes.$inferSelect;
 type TransactionalBinding = D1Database & {
 	supportsTransaction?: () => boolean;
 	transaction?: <T>(work: (tx: D1Database) => Promise<T>) => Promise<T>;
@@ -37,19 +41,36 @@ export async function withRawSweepTransaction<T>(env: CloudflareEnv, work: (tx: 
 	return { supported: false };
 }
 
-function isSweepInProgress(error: unknown): boolean {
-	return error instanceof Error && error.message.includes("raw_sweep_in_progress");
+/**
+ * Trigger aborts arrive wrapped in `DrizzleQueryError` ("Failed query: …"), whose message never
+ * contains the trigger text; the real error hangs off `.cause`. Walk the chain for our marker string.
+ */
+export function isRawSweepAbort(error: unknown, reason: "raw_sweep_in_progress" | "raw_sweep_referenced"): boolean {
+	for (let current: unknown = error; current instanceof Error; current = current.cause) {
+		if (current.message.includes(reason)) return true;
+	}
+	return false;
 }
 
-async function waitForSweepToFinish(db: AppDb, rawR2Key: string, deadlineAt?: number): Promise<void> {
-	const until = Math.min(deadlineAt ?? Number.POSITIVE_INFINITY, Date.now() + PENDING_RETRY_MS);
-	while (Date.now() < until) {
-		const [pending] = await db.select({ key: rawSweepPendingDeletes.rawR2Key }).from(rawSweepPendingDeletes)
-			.where(eq(rawSweepPendingDeletes.rawR2Key, rawR2Key)).limit(1);
-		if (!pending) return;
-		await new Promise((resolve) => setTimeout(resolve, 50));
+/**
+ * Releases a stale, never-completed claim after confirming the object lookup succeeds: a present object
+ * means the delete never ran (the orphan can be reclaimed again), a missing one means it effectively
+ * ran (the marker is equivalent to a completed delete). A failed lookup leaves the state unknown, so
+ * the marker is kept for a later pass.
+ */
+export async function releaseStalePendingDelete(env: CloudflareEnv, db: AppDb, marker: PendingDelete): Promise<boolean> {
+	try {
+		await env.BUCKET.get(marker.rawR2Key);
+	} catch {
+		return false;
 	}
-	throw new Error("Raw object cleanup is in progress; inbound processing should retry");
+	const [released] = await db.delete(rawSweepPendingDeletes).where(and(
+		eq(rawSweepPendingDeletes.rawR2Key, marker.rawR2Key),
+		eq(rawSweepPendingDeletes.claimToken, marker.claimToken),
+		eq(rawSweepPendingDeletes.claimedAt, marker.claimedAt),
+		eq(rawSweepPendingDeletes.deleteComplete, false),
+	)).returning({ rawR2Key: rawSweepPendingDeletes.rawR2Key });
+	return !!released;
 }
 
 /**
@@ -82,16 +103,40 @@ export async function insertWithRawObjectFence<T>(
 	}
 
 	const retryUntil = Math.min(deadlineAt ?? Number.POSITIVE_INFINITY, Date.now() + PENDING_RETRY_MS);
+	const put = () => awaitOperation(env.BUCKET.put(rawR2Key, rawBytes, { httpMetadata: { contentType: "message/rfc822" } }));
 	while (true) {
-		if (!await awaitOperation(env.BUCKET.get(rawR2Key))) {
-			await awaitOperation(env.BUCKET.put(rawR2Key, rawBytes, { httpMetadata: { contentType: "message/rfc822" } }));
-		}
+		if (!await awaitOperation(env.BUCKET.get(rawR2Key))) await put();
 		try {
 			return await insert(db);
 		} catch (error) {
-			if (!isSweepInProgress(error)) throw error;
-			await waitForSweepToFinish(db, rawR2Key, retryUntil);
+			if (!isRawSweepAbort(error, "raw_sweep_in_progress")) throw error;
+		}
+		// The insert hit a pending-delete marker: an object deletion happened or is in flight for this
+		// key, so the bytes seen/stored above may be stale. Resolve the marker, then retry the whole
+		// store + insert so the row commits against the generation that survives.
+		while (true) {
+			const [marker] = await db.select().from(rawSweepPendingDeletes)
+				.where(eq(rawSweepPendingDeletes.rawR2Key, rawR2Key)).limit(1);
+			if (!marker) break;
 			if (Date.now() >= retryUntil) throw new Error("Raw object cleanup is in progress; inbound processing should retry");
+			if (marker.deleteComplete) {
+				// The recorded delete already ran; while the marker row exists no new claim can start,
+				// so the re-stored bytes stay live until the insert commits. Consume the marker with
+				// a guarded delete so a changed marker is re-read instead of lost.
+				await put();
+				const [consumed] = await db.delete(rawSweepPendingDeletes).where(and(
+					eq(rawSweepPendingDeletes.rawR2Key, rawR2Key),
+					eq(rawSweepPendingDeletes.claimToken, marker.claimToken),
+					eq(rawSweepPendingDeletes.deleteComplete, true),
+				)).returning({ rawR2Key: rawSweepPendingDeletes.rawR2Key });
+				if (consumed) break;
+				continue;
+			}
+			if (Date.now() - marker.claimedAt.getTime() >= STALE_PENDING_DELETE_MS) {
+				if (await releaseStalePendingDelete(env, db, marker)) break;
+				continue;
+			}
+			await new Promise((resolve) => setTimeout(resolve, PENDING_POLL_MS));
 		}
 	}
 }

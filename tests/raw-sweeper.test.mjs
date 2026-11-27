@@ -64,12 +64,10 @@ test("orphaned raw sweep resumes beyond 2,000 retained keys and resets for the n
 test("completed pending deletes recover without issuing a second late object-store delete", async (t) => {
 	const { env, sqlite } = await newDatabase(t);
 	const database = env.DB;
-	let failMarkerCleanup = true;
+	// The D1 binding surface only: prepare/batch, no interactive transaction, so the sweeper takes the
+	// trigger/marker path.
 	env.DB = {
-		prepare: query => {
-			if (failMarkerCleanup && /delete from ["`]?raw_sweep_pending_deletes/i.test(query)) throw new Error("simulated crash after completed object deletion");
-			return database.prepare(query);
-		},
+		prepare: query => database.prepare(query),
 		batch: statements => database.batch(statements),
 	};
 	const now = new Date("2027-01-02T00:00:00Z");
@@ -82,11 +80,66 @@ test("completed pending deletes recover without issuing a second late object-sto
 			: { objects: [], truncated: false },
 		delete: async () => { objectDeletes++; exists = false; },
 	};
-	await assert.rejects(app.sweepOrphanedRawMail(env, now), /simulated crash/);
-	assert.equal(sqlite.prepare("SELECT delete_complete FROM raw_sweep_pending_deletes WHERE raw_r2_key = ?").get(key).delete_complete, 1);
-	failMarkerCleanup = false;
+	assert.equal(await app.sweepOrphanedRawMail(env, now), 1);
+	assert.equal(sqlite.prepare("SELECT delete_complete FROM raw_sweep_pending_deletes WHERE raw_r2_key = ?").get(key).delete_complete, 1,
+		"the completed marker is retained so a racing intake insert aborts instead of committing dangling");
 	assert.equal(await app.sweepOrphanedRawMail(env, new Date(now.getTime() + 2 * 60 * 60 * 1000)), 0);
 	assert.equal(objectDeletes, 1, "recovery only clears a durably completed claim; it never replays DELETE");
+	assert.equal(sqlite.prepare("SELECT count(*) AS n FROM raw_sweep_pending_deletes").get().n, 0);
+});
+
+test("a stale never-completed claim is released so its orphan is reclaimed and its intake unblocked", async (t) => {
+	const { env, sqlite } = await newDatabase(t);
+	const database = env.DB;
+	env.DB = {
+		prepare: query => database.prepare(query),
+		batch: statements => database.batch(statements),
+	};
+	const now = new Date("2027-01-02T00:00:00Z");
+	const key = "inbound/stale-claim";
+	const objects = new Map([[key, new Uint8Array([7])]]);
+	env.BUCKET = {
+		get: async objectKey => (objects.has(objectKey) ? { arrayBuffer: async () => objects.get(objectKey).buffer } : null),
+		put: async (objectKey, value) => { objects.set(objectKey, value instanceof ArrayBuffer ? new Uint8Array(value) : value); },
+		delete: async objectKey => { objects.delete(objectKey); },
+		list: async ({ prefix, cursor, limit }) => {
+			const keys = [...objects.keys()].filter(objectKey => objectKey.startsWith(prefix)).sort();
+			const start = cursor === undefined ? 0 : Math.max(0, keys.findIndex(objectKey => objectKey > cursor));
+			const page = keys.slice(start, start + limit);
+			const truncated = start + page.length < keys.length;
+			return { objects: page.map(objectKey => ({ key: objectKey, uploaded: new Date(now.getTime() - 25 * 60 * 60 * 1000) })), truncated, cursor: truncated ? page.at(-1) : undefined };
+		},
+	};
+	// Worker died between the claim and recording completion: an unfinished marker persisted.
+	sqlite.prepare("INSERT INTO raw_sweep_pending_deletes (raw_r2_key, claim_token, claimed_at, delete_complete) VALUES (?, 'dead', ?, 0)")
+		.run(key, Math.floor(new Date("2027-01-01T00:00:00Z").getTime() / 1000));
+	// Same invocation: recovery releases the stale claim and the pass reclaims the orphan itself.
+	assert.equal(await app.sweepOrphanedRawMail(env, now), 1);
+	assert.equal(objects.has(key), false);
+	// The reclaim's own completed marker is retained until the next recovery clears it.
+	assert.equal(sqlite.prepare("SELECT delete_complete FROM raw_sweep_pending_deletes WHERE raw_r2_key = ?").get(key).delete_complete, 1);
+	assert.equal(await app.sweepOrphanedRawMail(env, new Date(now.getTime() + 2 * 60 * 60 * 1000)), 0);
+	assert.equal(sqlite.prepare("SELECT count(*) AS n FROM raw_sweep_pending_deletes").get().n, 0);
+});
+
+test("a stale claim over an already-deleted object is released without an extra delete", async (t) => {
+	const { env, sqlite } = await newDatabase(t);
+	const database = env.DB;
+	env.DB = {
+		prepare: query => database.prepare(query),
+		batch: statements => database.batch(statements),
+	};
+	const now = new Date("2027-01-02T00:00:00Z");
+	let objectDeletes = 0;
+	env.BUCKET = {
+		get: async () => null,
+		list: async () => ({ objects: [], truncated: false }),
+		delete: async () => { objectDeletes++; },
+	};
+	sqlite.prepare("INSERT INTO raw_sweep_pending_deletes (raw_r2_key, claim_token, claimed_at, delete_complete) VALUES ('inbound/gone', 'dead', ?, 0)")
+		.run(Math.floor(new Date("2027-01-01T00:00:00Z").getTime() / 1000));
+	assert.equal(await app.sweepOrphanedRawMail(env, now), 0);
+	assert.equal(objectDeletes, 0, "recovery releases the marker; it never retries the delete");
 	assert.equal(sqlite.prepare("SELECT count(*) AS n FROM raw_sweep_pending_deletes").get().n, 0);
 });
 

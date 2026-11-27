@@ -3,7 +3,7 @@ import { getDb } from "@/db";
 import { appSettings, messages, rawSweepPendingDeletes } from "@/db/schema";
 import { isExternalDatabase } from "@/db/external";
 import { newId } from "@/lib/ids";
-import { lockRawSweepFence, withRawSweepTransaction } from "@/lib/email/raw-object-fence";
+import { isRawSweepAbort, lockRawSweepFence, releaseStalePendingDelete, STALE_PENDING_DELETE_MS, withRawSweepTransaction } from "@/lib/email/raw-object-fence";
 import { INBOUND_SIGNATURE_MAX_AGE_SECONDS } from "@/lib/email/intake-signature";
 import { SNS_MAX_AGE_MS } from "@/lib/aws/sns-signature";
 import { UPLOAD_PREFIX } from "@/lib/jmap/blobs";
@@ -30,7 +30,6 @@ const STALE_PREFIXES: Array<{ prefix: string; maxAgeMs: number }> = [
 ];
 /** D1 allows 100 bound parameters per statement. */
 const SWEEP_CURSOR_SETTINGS_ID = "default";
-const STALE_PENDING_DELETE_MS = 60 * 60 * 1000;
 const PENDING_RECOVERY_LIMIT = 100;
 
 async function readSweepCursor(db: ReturnType<typeof getDb>): Promise<string | null> {
@@ -72,13 +71,18 @@ async function deleteCandidate(env: CloudflareEnv, db: ReturnType<typeof getDb>,
 	// across the object-store delete. D1 uses a SQLite trigger/marker to make this two-phase path safe.
 	if (isExternalDatabase(env.DB)) return false;
 
+	// Referenced keys are the common case on a populated mailbox, so they get a cheap read instead of
+	// the claim insert; the insert trigger still guards the read→claim gap atomically, and its abort
+	// arrives wrapped in DrizzleQueryError, so it is matched through the error's cause chain.
+	const [reference] = await db.select({ id: messages.id }).from(messages).where(eq(messages.rawR2Key, key)).limit(1);
+	if (reference) return false;
 	const claimToken = newId();
 	let claim: { rawR2Key: string } | undefined;
 	try {
 		[claim] = await db.insert(rawSweepPendingDeletes).values({ rawR2Key: key, claimToken, claimedAt: now })
 			.onConflictDoNothing().returning({ rawR2Key: rawSweepPendingDeletes.rawR2Key });
 	} catch (error) {
-		if (error instanceof Error && error.message.includes("raw_sweep_referenced")) return false;
+		if (isRawSweepAbort(error, "raw_sweep_referenced")) return false;
 		throw error;
 	}
 	if (!claim) return false;
@@ -87,26 +91,30 @@ async function deleteCandidate(env: CloudflareEnv, db: ReturnType<typeof getDb>,
 		eq(rawSweepPendingDeletes.rawR2Key, key), eq(rawSweepPendingDeletes.claimToken, claimToken),
 	)).returning({ rawR2Key: rawSweepPendingDeletes.rawR2Key });
 	if (!completed) throw new Error("Raw object delete claim changed before completion was recorded");
-	await db.delete(rawSweepPendingDeletes).where(and(
-		eq(rawSweepPendingDeletes.rawR2Key, key), eq(rawSweepPendingDeletes.claimToken, claimToken),
-	));
+	// The completed marker stays: it still fences a racing intake's insert until that intake consumes
+	// it, and the next sweep's recovery clears it.
 	return true;
 }
 
 async function recoverStalePendingDeletes(env: CloudflareEnv, db: ReturnType<typeof getDb>, now: Date): Promise<void> {
 	if (isExternalDatabase(env.DB)) return;
 	const cutoff = new Date(now.getTime() - STALE_PENDING_DELETE_MS);
-	// An unfinished marker may still have an R2 DELETE in flight after its worker died. Never retry that
-	// delete or release the marker: only markers whose successful delete was durably recorded are safe to clear.
-	const stale = await db.select().from(rawSweepPendingDeletes).where(and(
-		lt(rawSweepPendingDeletes.claimedAt, cutoff), eq(rawSweepPendingDeletes.deleteComplete, true),
-	)).limit(PENDING_RECOVERY_LIMIT);
+	// A marker this old cannot still have a `BUCKET.delete` in flight. Completed markers only need their
+	// row cleared; unfinished ones get a guarded release so the orphan can be claimed again instead of
+	// wedging the key forever.
+	const stale = await db.select().from(rawSweepPendingDeletes).where(
+		lt(rawSweepPendingDeletes.claimedAt, cutoff),
+	).limit(PENDING_RECOVERY_LIMIT);
 	for (const row of stale) {
-		await db.delete(rawSweepPendingDeletes).where(and(
-			eq(rawSweepPendingDeletes.rawR2Key, row.rawR2Key),
-			eq(rawSweepPendingDeletes.claimToken, row.claimToken),
-			eq(rawSweepPendingDeletes.deleteComplete, true),
-		));
+		if (row.deleteComplete) {
+			await db.delete(rawSweepPendingDeletes).where(and(
+				eq(rawSweepPendingDeletes.rawR2Key, row.rawR2Key),
+				eq(rawSweepPendingDeletes.claimToken, row.claimToken),
+				eq(rawSweepPendingDeletes.deleteComplete, true),
+			));
+		} else {
+			await releaseStalePendingDelete(env, db, row);
+		}
 	}
 }
 

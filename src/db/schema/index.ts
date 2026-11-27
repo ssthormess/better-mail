@@ -1655,8 +1655,9 @@ export const appSettings = sqliteTable("app_settings", {
 
 /**
  * Transient D1 fallback claims for the interval between claiming and deleting a raw object.
- * The message/raw-key triggers fence inserts against these claims; never backup this state. An uncertain
- * delete remains claimed indefinitely; only a durably recorded successful delete may be recovered.
+ * The message/raw-key triggers fence inserts against these claims; never backup this state. A completed
+ * delete keeps its marker until an intake consumes it or the next sweep's recovery clears it; a claim old
+ * enough that no delete can still be in flight is released after an object check so the key is not wedged.
  */
 export const rawSweepPendingDeletes = sqliteTable("raw_sweep_pending_deletes", {
 	rawR2Key: text("raw_r2_key").primaryKey(),
