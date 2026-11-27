@@ -51,6 +51,16 @@ store `VAPID_PRIVATE_KEY` as a Worker secret. Configure `VAPID_PUBLIC_KEY` and
 public HTTPS URL of the installation. The same VAPID key pair should be kept
 across deployments so existing browser subscriptions remain valid.
 
+### Optional external account encryption key
+
+`MAILFLARE_ENCRYPTION_KEY` seals the passwords of external IMAP/POP3 accounts a
+mailbox fetches from. Without it no account can be added — the app refuses to
+store a password unencrypted. Generate it once with
+`npx wrangler secret put MAILFLARE_ENCRYPTION_KEY` (a `openssl rand -base64 32`
+value or any string of 32+ characters). Polling itself only runs on the
+self-hosted Node deployment, so on Workers this only lets accounts be stored;
+see [External accounts](external-accounts.md).
+
 ## Step 3: Complete mailflare setup
 
 1. Open the URL of the deployed `mailflare` Worker.

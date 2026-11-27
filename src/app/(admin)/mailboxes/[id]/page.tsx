@@ -36,6 +36,8 @@ import {
 } from "./utils";
 import { getMailboxesBase } from "../utils";
 import MailboxAvatarForm from "./MailboxAvatarForm";
+import { ExternalAccountsCard } from "./ExternalAccountsCard";
+import { canManageExternalAccounts } from "./external-accounts-utils";
 
 export default function MailboxSettingsPage() {
   const { t } = useLanguage();
@@ -388,6 +390,10 @@ export default function MailboxSettingsPage() {
           )}
         </CardContent>
       </Card>
+
+      {canManageExternalAccounts(mailbox.data) && (
+        <ExternalAccountsCard mailboxId={mailboxId} />
+      )}
 
       {mailbox.data?.canManageSharing && (
         <Card className="rounded-3xl border-0 bg-white p-6">

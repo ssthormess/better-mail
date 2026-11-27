@@ -137,6 +137,7 @@ A schema change needs a migration for each database type. See [Databases](docs/d
 - [API and integrations](docs/api.md)
 - [Email assistant and MCP](docs/email-assistant-and-mcp.md)
 - [Importing from Google Takeout](docs/import.md)
+- [Fetching external IMAP/POP3 accounts](docs/external-accounts.md)
 - [Adding a language](docs/localization.md)
 - [Troubleshooting](docs/troubleshooting.md)
 
